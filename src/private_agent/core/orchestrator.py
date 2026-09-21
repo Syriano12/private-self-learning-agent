@@ -2,45 +2,11 @@ from __future__ import annotations
 
 import re
 import uuid
-from dataclasses import dataclass, field
 from typing import Any
 
-from private_agent.storage import KnowledgeItem, Store, now
+from private_agent.core.planner import PlanStep, Planner, TaskPlan
+from private_agent.storage import KnowledgeItem, Store
 from private_agent.tools.research import ToolRegistry
-
-
-@dataclass
-class PlanStep:
-    id: str
-    objective: str
-    tool: str
-    status: str = "pending"
-    output: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class TaskPlan:
-    goal: str
-    steps: list[PlanStep]
-    rationale: str
-
-
-class Planner:
-    """General planner: derives steps from goal signals and available tools, not example-specific workflow."""
-    def create(self, goal: str, tools: ToolRegistry, prior_knowledge: list[dict[str, Any]]) -> TaskPlan:
-        lower = goal.lower()
-        steps: list[PlanStep] = []
-        if any(word in lower for word in ("ابحث", "research", "قارن", "compare", "مصادر", "sources")):
-            steps.append(PlanStep(str(uuid.uuid4()), "اكتشاف مصادر متعددة للهدف", "web_research"))
-            steps.append(PlanStep(str(uuid.uuid4()), "جلب محتوى المصادر المرشحة واستخراج الأدلة", "web_research"))
-            steps.append(PlanStep(str(uuid.uuid4()), "التحقق من التغطية والتعارضات وتلخيص النتيجة", "knowledge_verify"))
-        else:
-            steps.append(PlanStep(str(uuid.uuid4()), "تفكيك الهدف إلى معلومات أو أفعال قابلة للتحقق", "knowledge_verify"))
-        if prior_knowledge:
-            rationale = f"استُرجعت {len(prior_knowledge)} عناصر معرفة سابقة وستؤثر في ترتيب التنفيذ."
-        else:
-            rationale = "لا توجد معرفة سابقة مطابقة؛ ستبدأ الخطة بالاستكشاف والتحقق."
-        return TaskPlan(goal, steps, rationale)
 
 
 class Verifier:
@@ -53,9 +19,15 @@ class Verifier:
 
 
 class Orchestrator:
-    def __init__(self, store: Store, tools: ToolRegistry, max_attempts: int = 2) -> None:
+    def __init__(
+        self,
+        store: Store,
+        tools: ToolRegistry,
+        max_attempts: int = 2,
+        planner: Planner | None = None,
+    ) -> None:
         self.store, self.tools, self.max_attempts = store, tools, max_attempts
-        self.planner, self.verifier = Planner(), Verifier()
+        self.planner, self.verifier = planner or Planner(), Verifier()
 
     def run(self, goal: str) -> dict[str, Any]:
         task_id = str(uuid.uuid4())
@@ -74,16 +46,19 @@ class Orchestrator:
                 sources = found.sources
                 observations.append({"attempt": attempts, "action": "search", "source_count": len(sources), "errors": found.errors})
                 if not sources:
-                    plan.steps[0].status = "failed"
-                    plan.steps[0].output = {"errors": found.errors}
+                    if plan.steps:
+                        plan.steps[0].status = "failed"
+                        plan.steps[0].output = {"errors": found.errors}
                     continue
                 fetched = []
                 for source in sources[:5]:
                     page = self.tools.get("web_research").fetch(source["url"])
                     fetched.append({**source, **page})
                 sources = fetched
-                plan.steps[0].status = "completed"
-                plan.steps[1].status = "completed"
+                if plan.steps:
+                    plan.steps[0].status = "completed"
+                if len(plan.steps) > 1:
+                    plan.steps[1].status = "completed"
                 break
             except Exception as exc:
                 errors.append(f"attempt_{attempts}: {type(exc).__name__}: {exc}")

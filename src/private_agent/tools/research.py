@@ -21,6 +21,20 @@ class WebResearchTool:
     risk_level = "low"
     permission_level = "public_read"
 
+    def input_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+
+    def description(self) -> str:
+        return "Search public web sources and return candidate URLs and snippets."
+
     def __init__(self, timeout: float = 15.0) -> None:
         self.timeout = timeout
 
@@ -71,6 +85,21 @@ class ToolRegistry:
 
     def available(self) -> list[dict[str, str]]:
         return [{"name": name, "risk_level": getattr(tool, "risk_level", "unknown"), "permission_level": getattr(tool, "permission_level", "unknown")} for name, tool in self._tools.items()]
+
+    def describe(self) -> list[dict[str, Any]]:
+        return [
+            {
+                **metadata,
+                "description": getattr(tool, "description", lambda: "")(),
+                "input_schema": getattr(tool, "input_schema", lambda: {})(),
+            }
+            for name, tool in self._tools.items()
+            for metadata in [{
+                "name": name,
+                "risk_level": getattr(tool, "risk_level", "unknown"),
+                "permission_level": getattr(tool, "permission_level", "unknown"),
+            }]
+        ]
 
     def get(self, name: str) -> Any:
         return self._tools[name]
