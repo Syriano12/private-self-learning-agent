@@ -186,5 +186,9 @@ class Store:
         row = self.db.execute("SELECT * FROM experiences WHERE task_id = ?", (task_id,)).fetchone()
         return dict(row) if row else None
 
+    def all_experiences(self) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM experiences ORDER BY created_at DESC").fetchall()
+        return [dict(row) for row in rows]
+
     def close(self) -> None:
         self.db.close()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from private_agent.core.diagnosis import FailureDiagnosis
@@ -23,6 +23,7 @@ class ReplanRequest:
     executed_history: list[dict[str, Any]]
     constraints: dict[str, Any]
     permissions: dict[str, str]
+    retrieved_experiences: list[dict[str, Any]] = field(default_factory=list)
 
 
 class Replanner:
@@ -84,6 +85,7 @@ class Replanner:
             "available_tools": tools.describe(),
             "constraints": request.constraints,
             "permissions": request.permissions,
+            "retrieved_experiences": request.retrieved_experiences,
         }
         response = self.provider.generate_json(
             system_prompt=(

@@ -83,6 +83,7 @@ class Planner:
         *,
         constraints: dict[str, Any] | None = None,
         permissions: dict[str, str] | None = None,
+        retrieved_experiences: list[dict[str, Any]] | None = None,
     ) -> TaskPlan:
         if not goal.strip():
             raise PlanValidationError(["goal_required"])
@@ -93,6 +94,7 @@ class Planner:
             "goal": goal,
             "available_tools": tools.describe(),
             "relevant_memory": prior_knowledge,
+            "relevant_experiences": retrieved_experiences or [],
             "constraints": constraints or {"max_steps": self.max_steps},
             "permissions": permissions or {},
         }

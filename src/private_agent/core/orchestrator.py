@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import uuid
+import inspect
 from typing import Any
 
 from private_agent.core.diagnosis import FailureDiagnoser, FailureDiagnosis
 from private_agent.core.execution import ExecutionContext, GenericExecutor, StepResult
 from private_agent.core.experience import ExperienceAction, ExperienceRecord
+from private_agent.core.memory import ExperienceMemory, ExperienceQuery, SQLiteExperienceMemory
 from private_agent.core.observation import Observation, StepOutcome
 from private_agent.core.planner import PlanStep, Planner, TaskPlan
 from private_agent.core.recovery import RecoveryDecision, RecoveryManager
@@ -30,6 +32,7 @@ class Orchestrator:
         max_recovery_attempts: int | None = None,
         max_attempts_per_step: int = 2,
         approved_permissions: set[str] | None = None,
+        experience_memory: ExperienceMemory | None = None,
     ) -> None:
         self.store, self.tools, self.max_attempts = store, tools, max_attempts
         self.approved_permissions = approved_permissions or {"public_read"}
@@ -42,17 +45,20 @@ class Orchestrator:
             max_attempts_per_step=max_attempts_per_step,
         )
         self.replanner = replanner or Replanner(getattr(self.planner, "provider", None))
+        self.experience_memory = experience_memory or SQLiteExperienceMemory(store)
 
     def run(self, goal: str) -> dict[str, Any]:
         task_id = str(uuid.uuid4())
         self.recovery.attempts.clear()
         prior = self.store.search_knowledge(goal)
-        initial_plan = self.planner.create(goal, self.tools, prior)
+        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal))
+        retrieved_payload = [item.to_dict() for item in retrieved]
+        initial_plan = self._create_plan(goal, prior, retrieved_payload)
         current_plan = initial_plan
         experience = ExperienceRecord(
             task_id=task_id,
             goal=goal,
-            context={"prior_knowledge_used": prior},
+            context={"prior_knowledge_used": prior, "retrieved_experiences": retrieved_payload},
             initial_plan=self._plan_payload(initial_plan),
         )
         all_step_results: list[StepResult] = []
@@ -204,9 +210,23 @@ class Orchestrator:
             f"عدد محاولات الاسترداد: {len(self.recovery.attempts)}",
         ]
         self.store.save_episode(str(uuid.uuid4()), task_id, goal, storage_status, lessons, result["experience"]["actions"])
-        self.store.save_experience(experience)
         self._persist_knowledge(result["sources"], goal, verification_payload)
+        self.experience_memory.store(experience)
         return result
+
+    def _create_plan(
+        self,
+        goal: str,
+        prior: list[dict[str, Any]],
+        retrieved: list[dict[str, Any]],
+    ) -> TaskPlan:
+        parameters = inspect.signature(self.planner.create).parameters
+        kwargs: dict[str, Any] = {}
+        if "permissions" in parameters:
+            kwargs["permissions"] = self._permissions()
+        if "retrieved_experiences" in parameters:
+            kwargs["retrieved_experiences"] = retrieved
+        return self.planner.create(goal, self.tools, prior, **kwargs)
 
     def _observe_verify_diagnose(
         self,
@@ -258,7 +278,31 @@ class Orchestrator:
         experience: ExperienceRecord,
     ) -> TaskPlan:
         permissions = self._permissions()
-        if decision.strategy == "CHANGE_TOOL":
+        recovery_retrieved = [
+            item.to_dict()
+            for item in self.experience_memory.retrieve(
+                ExperienceQuery(
+                    goal=current_plan.goal,
+                    tools=[step.tool],
+                    failure_type=diagnosis.failure_type,
+                    recovery_strategy=decision.strategy,
+                )
+            )
+        ]
+        experience.context.setdefault("recovery_retrieved_experiences", []).extend(recovery_retrieved)
+        failure_observation = Observation(**experience.actions[-1].observation)
+        replan_request = ReplanRequest(
+            current_plan=current_plan,
+            failure_observation=failure_observation,
+            diagnosis=diagnosis,
+            executed_history=[action.to_dict() for action in experience.actions],
+            constraints={"max_steps": self.planner.max_steps},
+            permissions=permissions,
+            retrieved_experiences=recovery_retrieved,
+        )
+        if self.replanner.provider is not None:
+            next_plan = self.replanner.replan(replan_request, self.tools, replacement_tool=decision.replacement_tool)
+        elif decision.strategy == "CHANGE_TOOL":
             next_plan = self.replanner.replan_step(
                 current_plan,
                 step_id=step.id,
@@ -278,15 +322,7 @@ class Orchestrator:
                 permissions=permissions,
             )
         elif decision.strategy == "REPLAN":
-            request = ReplanRequest(
-                current_plan=current_plan,
-                failure_observation=experience.actions[-1] and Observation(**experience.actions[-1].observation),
-                diagnosis=diagnosis,
-                executed_history=[action.to_dict() for action in experience.actions],
-                constraints={"max_steps": self.planner.max_steps},
-                permissions=permissions,
-            )
-            next_plan = self.replanner.replan(request, self.tools, replacement_tool=decision.replacement_tool)
+            next_plan = self.replanner.replan(replan_request, self.tools, replacement_tool=decision.replacement_tool)
         else:
             raise ReplanError(f"unsupported_recovery_strategy:{decision.strategy}")
         self.store.save_event(
