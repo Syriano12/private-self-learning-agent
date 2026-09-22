@@ -25,6 +25,8 @@ class PlanStep:
     input: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     depends_on: list[str] = field(default_factory=list)
+    verifier: str = ""
+    success_criteria: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
     output: dict[str, Any] = field(default_factory=dict)
 
@@ -53,6 +55,8 @@ PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
                     "reason": {"type": "string"},
                     "depends_on": {"type": "array", "items": {"type": "string"}},
                     "permission_level": {"type": "string"},
+                    "verifier": {"type": "string"},
+                    "success_criteria": {"type": "object"},
                 },
                 "required": ["id", "objective", "tool", "input", "reason", "depends_on"],
                 "additionalProperties": False,
@@ -140,7 +144,17 @@ class Planner:
             if not isinstance(raw_step, dict):
                 errors.append(f"step_{index}_must_be_object")
                 continue
-            allowed_step_keys = {"id", "objective", "tool", "input", "reason", "depends_on", "permission_level"}
+            allowed_step_keys = {
+                "id",
+                "objective",
+                "tool",
+                "input",
+                "reason",
+                "depends_on",
+                "permission_level",
+                "verifier",
+                "success_criteria",
+            }
             errors.extend(f"unknown_step_field:{index}.{key}" for key in raw_step if key not in allowed_step_keys)
             step_id = raw_step.get("id")
             objective = raw_step.get("objective")
@@ -148,6 +162,8 @@ class Planner:
             step_input = raw_step.get("input")
             reason = raw_step.get("reason")
             depends_on = raw_step.get("depends_on")
+            verifier = raw_step.get("verifier", "")
+            success_criteria = raw_step.get("success_criteria", {})
 
             if not isinstance(step_id, str) or not step_id.strip():
                 errors.append(f"step_{index}_id_required")
@@ -170,6 +186,12 @@ class Planner:
             if not isinstance(depends_on, list) or not all(isinstance(dep, str) for dep in depends_on):
                 errors.append(f"step_{step_id}_depends_on_must_be_string_array")
                 depends_on = []
+            if not isinstance(verifier, str):
+                errors.append(f"step_{step_id}_verifier_must_be_string")
+                verifier = ""
+            if not isinstance(success_criteria, dict):
+                errors.append(f"step_{step_id}_success_criteria_must_be_object")
+                success_criteria = {}
 
             if tool_name:
                 try:
@@ -196,6 +218,8 @@ class Planner:
                     input=step_input,
                     reason=reason,
                     depends_on=depends_on,
+                    verifier=verifier,
+                    success_criteria=success_criteria,
                 )
             )
 

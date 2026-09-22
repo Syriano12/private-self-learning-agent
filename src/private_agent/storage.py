@@ -70,6 +70,21 @@ class Store:
           enabled INTEGER NOT NULL, source_knowledge TEXT NOT NULL, tests_json TEXT NOT NULL,
           updated_at TEXT NOT NULL, PRIMARY KEY(name, version)
         );
+        CREATE TABLE IF NOT EXISTS observations (
+          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, step_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL, execution_status TEXT NOT NULL,
+          observation_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS verifications (
+          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, step_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL, status TEXT NOT NULL,
+          verification_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS execution_events (
+          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, step_id TEXT,
+          event_type TEXT NOT NULL, event_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         """)
         self.db.commit()
 
@@ -102,6 +117,58 @@ class Store:
 
     def recent_episodes(self, limit: int = 10) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM episodes ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()]
+
+    def save_observation(self, observation: Any) -> None:
+        payload = observation.to_dict() if hasattr(observation, "to_dict") else observation
+        self.db.execute(
+            "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?)",
+            (
+                f"{payload['task_id']}:{payload['step_id']}:{payload['timestamp']}",
+                payload["task_id"],
+                payload["step_id"],
+                payload["tool_name"],
+                payload["execution_status"],
+                json.dumps(payload, ensure_ascii=False),
+                payload["timestamp"],
+            ),
+        )
+        self.db.commit()
+
+    def save_verification(self, task_id: str, step_id: str, tool_name: str, verification: Any) -> None:
+        payload = verification.to_dict() if hasattr(verification, "to_dict") else verification
+        self.db.execute(
+            "INSERT OR REPLACE INTO verifications VALUES (?,?,?,?,?,?,?)",
+            (
+                f"{task_id}:{step_id}:{payload.get('verifier_type', 'unknown')}:{payload.get('status')}",
+                task_id,
+                step_id,
+                tool_name,
+                payload["status"],
+                json.dumps(payload, ensure_ascii=False),
+                now(),
+            ),
+        )
+        self.db.commit()
+
+    def save_event(self, task_id: str, event_type: str, event: dict[str, Any], *, step_id: str | None = None) -> None:
+        stamp = now()
+        self.db.execute(
+            "INSERT OR REPLACE INTO execution_events VALUES (?,?,?,?,?,?)",
+            (f"{task_id}:{event_type}:{stamp}", task_id, step_id, event_type, json.dumps(event, ensure_ascii=False), stamp),
+        )
+        self.db.commit()
+
+    def observations_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM observations WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def verifications_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM verifications WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def events_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM execution_events WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         self.db.close()

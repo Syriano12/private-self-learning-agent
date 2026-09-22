@@ -1,0 +1,185 @@
+تقرير التقدم حتى الآن
+======================
+
+تاريخ التقرير: 2026-09-22
+المشروع: private-self-learning-agent
+المستودع: https://github.com/Syriano12/private-self-learning-agent
+
+الحالة الحالية
+--------------
+
+المشروع موجود في المسار المحلي:
+/tmp/private-self-learning-agent-audit
+
+تم التحقق قبل بدء Phase 3 من أن:
+
+- HEAD يساوي:
+  9bd7478314483aac9c5c2539e5134cab18658fc5
+- origin/main يساوي نفس الـcommit.
+- working tree كان نظيفًا قبل بدء تعديلات Phase 3.
+- آخر commit هو:
+  feat: add dynamic tool contracts and generic executor
+- لا يوجد اختلاف بين HEAD وorigin/main قبل التعديلات:
+  git rev-list --left-right --count origin/main...HEAD
+  0  0
+
+ما تم إنجازه قبل Phase 3
+------------------------
+
+Phase 1 — LLM Core
+
+تم تنفيذها ورفعها إلى GitHub في commit:
+0cd2258d21e4a12815e028fc08a3df7b3827be2a
+
+وتتضمن:
+
+- Provider-neutral LLM abstraction.
+- Gemini REST provider.
+- LLMConfig وLLMResponse.
+- Structured JSON output.
+- Retry/backoff.
+- معالجة HTTP 429 وRetry-After.
+- معالجة أخطاء HTTP 5xx.
+- إخفاء API keys من رسائل الأخطاء.
+- Planner مدفوع بـLLM عند توفر GEMINI_API_KEY.
+- Plan schema validation.
+- Compatibility fallback واضح عند عدم توفر مفتاح Gemini.
+
+Phase 2 — Dynamic Tool Contracts + Generic Executor
+
+تم تنفيذها ورفعها إلى GitHub في commit:
+9bd7478314483aac9c5c2539e5134cab18658fc5
+
+وتتضمن:
+
+- Tool contracts صريحة.
+- ToolRegistry كمصدر اكتشاف الأدوات.
+- input_schema وoutput_schema.
+- ToolResult موحد بحالات success وfailed وblocked.
+- ToolError منظم.
+- GenericExecutor مستقل عن أسماء الأدوات.
+- ExecutionContext.
+- تنفيذ dependencies بالترتيب.
+- منع تنفيذ step تعتمد على dependency فاشلة.
+- فحص permissions.
+- فحص inputs قبل التنفيذ.
+- معالجة unknown tool وtool exception وmalformed result.
+- منع arbitrary shell/Python execution.
+- ربط Orchestrator بالـGenericExecutor بدل الاستدعاء المباشر لـWebResearchTool.
+- اختبارات Phase 1 وPhase 2 ناجحة.
+
+نتيجة الاختبارات بعد Phase 2:
+
+- python -m compileall -f src tests: ناجح.
+- git diff --check: ناجح.
+- python -m pytest -q: 27 passed.
+
+ما بدأناه في Phase 3
+---------------------
+
+هدف Phase 3 هو بناء:
+
+ToolResult
+→ Observation
+→ VerificationResult
+→ Step Outcome
+
+بدون تنفيذ Recovery أو Re-planning.
+
+تم حتى الآن إنشاء الملف:
+
+src/private_agent/core/observation.py
+
+ويحتوي على:
+
+1. Observation
+
+نموذج موحد يحتوي على:
+
+- task_id
+- step_id
+- tool_name
+- execution_status
+- observed_output
+- observed_error
+- metadata
+- timestamp
+
+كما يحتوي على factory method:
+
+Observation.from_step_result(...)
+
+لتحويل StepResult القادم من Executor إلى Observation منظمة.
+
+2. StepOutcome
+
+نموذج يربط بين:
+
+- execution_status
+- verification_status
+- Observation
+- verification details
+
+وذلك بهدف الفصل بين نجاح تنفيذ الأداة ونجاح المهمة فعليًا.
+
+ما لم يُنفذ بعد
+---------------
+
+Phase 3 لم تكتمل بعد. لم يتم حتى الآن تنفيذ أو تعديل العناصر التالية:
+
+- VerificationResult مستقل.
+- Verifier abstraction قابلة للتوسع.
+- ResearchVerifier حتمي لـWebResearch.
+- التمييز الرسمي بين:
+  verified
+  failed
+  insufficient
+  blocked
+- تمرير Orchestrator من Executor إلى Observation ثم Verification.
+- تخزين Observation وVerification في SQLite.
+- اختبارات Phase 3.
+- إعادة تشغيل الاختبارات الشاملة بعد اكتمال التعديلات.
+- إنشاء commit Phase 3.
+- push إلى origin/main.
+- التحقق النهائي من remote/main.
+
+ما لم نبدأه عمدًا
+-----------------
+
+لم يتم تنفيذ أي جزء من Phase 4 أو الميزات الممنوعة في تعليمات Phase 3، ومنها:
+
+- Failure diagnosis.
+- Automatic recovery.
+- Re-planning.
+- Observation-driven planning.
+- Self-learning متقدم.
+- Skill learning.
+- Checkpoints.
+- Resume.
+- Web UI.
+- WhatsApp.
+- Arbitrary shell execution.
+- Arbitrary Python execution.
+
+الحالة الدقيقة
+--------------
+
+STATUS: IN PROGRESS
+
+Phase 3 بدأت، وتم إنشاء Observation model فقط حتى الآن.
+لم يتم الادعاء بأن Phase 3 مكتملة أو verified.
+
+الخطوات التالية ضمن Phase 3 فقط
+-------------------------------
+
+1. إنشاء VerificationResult.
+2. إنشاء Verifier abstraction وResearchVerifier.
+3. تعديل Orchestrator لربط:
+   Executor → Observation → Verification → Step Outcome
+4. إضافة persistence بسيطة للـObservations والنتائج.
+5. إضافة اختبارات Phase 3.
+6. تشغيل compileall وgit diff --check وpytest.
+7. إنشاء commit واضح.
+8. push إلى origin/main.
+9. التحقق من نظافة Git ومطابقة remote/main.
+10. التوقف وعدم بدء Phase 4.
