@@ -8,6 +8,8 @@ from urllib.parse import parse_qs, quote, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+from private_agent.tools.contracts import LegacyToolAdapter, ToolResult, contract_errors
+
 
 @dataclass
 class ResearchResult:
@@ -34,6 +36,18 @@ class WebResearchTool:
 
     def description(self) -> str:
         return "Search public web sources and return candidate URLs and snippets."
+
+    def output_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "sources": {"type": "array"},
+                "errors": {"type": "array"},
+            },
+            "required": ["query", "sources", "errors"],
+            "additionalProperties": False,
+        }
 
     def __init__(self, timeout: float = 15.0) -> None:
         self.timeout = timeout
@@ -75,13 +89,46 @@ class WebResearchTool:
         except Exception as exc:
             return {"url": url, "status": "error", "error": f"fetch_failed: {type(exc).__name__}: {exc}"}
 
+    def execute(self, inputs: dict[str, Any], context: Any) -> ToolResult:
+        query = inputs["query"]
+        limit = inputs.get("limit", 5)
+        found = self.search(query, limit=limit)
+        errors = list(found.errors)
+        if not found.sources:
+            return ToolResult.failed(
+                "no_sources",
+                "Web research returned no sources",
+                output={"query": query, "sources": [], "errors": errors},
+            )
+
+        fetched: list[dict[str, Any]] = []
+        for source in found.sources[:limit]:
+            url = source.get("url")
+            if not url:
+                errors.append("source_missing_url")
+                continue
+            fetched.append({**source, **self.fetch(url)})
+        return ToolResult.success(
+            {"query": query, "sources": fetched, "errors": errors},
+            metadata={"source_count": len(fetched)},
+        )
+
 
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Any] = {}
 
     def register(self, tool: Any) -> None:
-        self._tools[tool.name] = tool
+        candidate = tool
+        if contract_errors(candidate):
+            if callable(getattr(tool, "search", None)) and callable(getattr(tool, "fetch", None)):
+                candidate = LegacyToolAdapter(tool)
+            else:
+                raise ValueError(f"Tool does not satisfy contract: {contract_errors(tool)}")
+        remaining = contract_errors(candidate)
+        if remaining:
+            raise ValueError(f"Tool does not satisfy contract: {remaining}")
+        self._tools[candidate.name] = candidate
 
     def available(self) -> list[dict[str, str]]:
         return [{"name": name, "risk_level": getattr(tool, "risk_level", "unknown"), "permission_level": getattr(tool, "permission_level", "unknown")} for name, tool in self._tools.items()]
@@ -92,6 +139,7 @@ class ToolRegistry:
                 **metadata,
                 "description": getattr(tool, "description", lambda: "")(),
                 "input_schema": getattr(tool, "input_schema", lambda: {})(),
+                "output_schema": getattr(tool, "output_schema", lambda: {})(),
             }
             for name, tool in self._tools.items()
             for metadata in [{
