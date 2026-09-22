@@ -85,6 +85,10 @@ class Store:
           event_type TEXT NOT NULL, event_json TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS experiences (
+          task_id TEXT PRIMARY KEY, goal TEXT NOT NULL,
+          experience_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         """)
         self.db.commit()
 
@@ -169,6 +173,18 @@ class Store:
     def events_for_task(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM execution_events WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
         return [dict(row) for row in rows]
+
+    def save_experience(self, experience: Any) -> None:
+        payload = experience.to_dict() if hasattr(experience, "to_dict") else experience
+        self.db.execute(
+            "INSERT OR REPLACE INTO experiences VALUES (?,?,?,?)",
+            (payload["task_id"], payload["goal"], json.dumps(payload, ensure_ascii=False), payload.get("created_at", now())),
+        )
+        self.db.commit()
+
+    def get_experience(self, task_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM experiences WHERE task_id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
 
     def close(self) -> None:
         self.db.close()
