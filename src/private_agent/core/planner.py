@@ -84,6 +84,7 @@ class Planner:
         constraints: dict[str, Any] | None = None,
         permissions: dict[str, str] | None = None,
         retrieved_experiences: list[dict[str, Any]] | None = None,
+        reflection_insights: list[dict[str, Any]] | None = None,
     ) -> TaskPlan:
         if not goal.strip():
             raise PlanValidationError(["goal_required"])
@@ -95,6 +96,7 @@ class Planner:
             "available_tools": tools.describe(),
             "relevant_memory": prior_knowledge,
             "relevant_experiences": retrieved_experiences or [],
+            "reflection_insights": reflection_insights or [],
             "constraints": constraints or {"max_steps": self.max_steps},
             "permissions": permissions or {},
         }
@@ -208,7 +210,7 @@ class Planner:
                     requested_permission = raw_step.get("permission_level", declared_permission)
                     if requested_permission != declared_permission:
                         errors.append(f"permission_mismatch:{tool_name}")
-                    if permissions and permissions.get(tool_name) != declared_permission:
+                    if permissions is not None and permissions.get(tool_name) != declared_permission:
                         errors.append(f"permission_not_granted:{tool_name}")
 
             dependencies[step_id] = depends_on

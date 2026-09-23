@@ -24,6 +24,7 @@ class ReplanRequest:
     constraints: dict[str, Any]
     permissions: dict[str, str]
     retrieved_experiences: list[dict[str, Any]] = field(default_factory=list)
+    reflection_insights: list[dict[str, Any]] = field(default_factory=list)
 
 
 class Replanner:
@@ -86,6 +87,7 @@ class Replanner:
             "constraints": request.constraints,
             "permissions": request.permissions,
             "retrieved_experiences": request.retrieved_experiences,
+            "reflection_insights": request.reflection_insights,
         }
         response = self.provider.generate_json(
             system_prompt=(

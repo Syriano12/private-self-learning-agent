@@ -12,6 +12,7 @@ from private_agent.core.observation import Observation, StepOutcome
 from private_agent.core.planner import PlanStep, Planner, TaskPlan
 from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
+from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
 from private_agent.core.verification import VerificationResult, VerifierRegistry
 from private_agent.storage import KnowledgeItem, Store
 from private_agent.tools.research import ToolRegistry
@@ -33,6 +34,8 @@ class Orchestrator:
         max_attempts_per_step: int = 2,
         approved_permissions: set[str] | None = None,
         experience_memory: ExperienceMemory | None = None,
+        reflection_memory: ReflectionMemory | None = None,
+        reflection_engine: ReflectionEngine | None = None,
     ) -> None:
         self.store, self.tools, self.max_attempts = store, tools, max_attempts
         self.approved_permissions = approved_permissions or {"public_read"}
@@ -46,6 +49,8 @@ class Orchestrator:
         )
         self.replanner = replanner or Replanner(getattr(self.planner, "provider", None))
         self.experience_memory = experience_memory or SQLiteExperienceMemory(store)
+        self.reflection_memory = reflection_memory or SQLiteReflectionMemory(store)
+        self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
 
     def run(self, goal: str) -> dict[str, Any]:
         task_id = str(uuid.uuid4())
@@ -53,12 +58,20 @@ class Orchestrator:
         prior = self.store.search_knowledge(goal)
         retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal))
         retrieved_payload = [item.to_dict() for item in retrieved]
-        initial_plan = self._create_plan(goal, prior, retrieved_payload)
+        reflection_context = [
+            insight.to_dict()
+            for insight in self.reflection_memory.list_relevant({"goal": goal}, limit=5)
+        ]
+        initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context)
         current_plan = initial_plan
         experience = ExperienceRecord(
             task_id=task_id,
             goal=goal,
-            context={"prior_knowledge_used": prior, "retrieved_experiences": retrieved_payload},
+            context={
+                "prior_knowledge_used": prior,
+                "retrieved_experiences": retrieved_payload,
+                "reflection_insights_used": reflection_context,
+            },
             initial_plan=self._plan_payload(initial_plan),
         )
         all_step_results: list[StepResult] = []
@@ -191,6 +204,9 @@ class Orchestrator:
             "experience": experience.to_dict(),
             "final_status": terminal_status,
         }
+        self.experience_memory.store(experience)
+        reflection_insights = self.reflection_engine.reflect_for_experience(experience)
+        result["reflection_insights"] = [insight.to_dict() for insight in reflection_insights]
         storage_status = {
             "COMPLETED": "completed",
             "BLOCKED": "blocked",
@@ -211,7 +227,6 @@ class Orchestrator:
         ]
         self.store.save_episode(str(uuid.uuid4()), task_id, goal, storage_status, lessons, result["experience"]["actions"])
         self._persist_knowledge(result["sources"], goal, verification_payload)
-        self.experience_memory.store(experience)
         return result
 
     def _create_plan(
@@ -219,6 +234,7 @@ class Orchestrator:
         goal: str,
         prior: list[dict[str, Any]],
         retrieved: list[dict[str, Any]],
+        reflection_insights: list[dict[str, Any]],
     ) -> TaskPlan:
         parameters = inspect.signature(self.planner.create).parameters
         kwargs: dict[str, Any] = {}
@@ -226,6 +242,8 @@ class Orchestrator:
             kwargs["permissions"] = self._permissions()
         if "retrieved_experiences" in parameters:
             kwargs["retrieved_experiences"] = retrieved
+        if "reflection_insights" in parameters:
+            kwargs["reflection_insights"] = reflection_insights
         return self.planner.create(goal, self.tools, prior, **kwargs)
 
     def _observe_verify_diagnose(
@@ -289,7 +307,21 @@ class Orchestrator:
                 )
             )
         ]
+        recovery_reflections = [
+            insight.to_dict()
+            for insight in self.reflection_memory.list_relevant(
+                {
+                    "goal": current_plan.goal,
+                    "task_type": "general",
+                    "tools": [step.tool],
+                    "failure_types": [diagnosis.failure_type],
+                    "recovery_strategies": [decision.strategy],
+                },
+                limit=5,
+            )
+        ]
         experience.context.setdefault("recovery_retrieved_experiences", []).extend(recovery_retrieved)
+        experience.context.setdefault("recovery_reflection_insights", []).extend(recovery_reflections)
         failure_observation = Observation(**experience.actions[-1].observation)
         replan_request = ReplanRequest(
             current_plan=current_plan,
@@ -299,6 +331,7 @@ class Orchestrator:
             constraints={"max_steps": self.planner.max_steps},
             permissions=permissions,
             retrieved_experiences=recovery_retrieved,
+            reflection_insights=recovery_reflections,
         )
         if self.replanner.provider is not None:
             next_plan = self.replanner.replan(replan_request, self.tools, replacement_tool=decision.replacement_tool)

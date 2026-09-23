@@ -89,6 +89,11 @@ class Store:
           task_id TEXT PRIMARY KEY, goal TEXT NOT NULL,
           experience_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS reflection_insights (
+          insight_id TEXT PRIMARY KEY, pattern TEXT NOT NULL,
+          confidence REAL NOT NULL, insight_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         """)
         self.db.commit()
 
@@ -188,6 +193,28 @@ class Store:
 
     def all_experiences(self) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM experiences ORDER BY created_at DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def save_reflection(self, insight: Any) -> None:
+        payload = insight.to_dict() if hasattr(insight, "to_dict") else insight
+        self.db.execute(
+            "INSERT OR REPLACE INTO reflection_insights VALUES (?,?,?,?,?)",
+            (
+                payload["insight_id"],
+                payload.get("pattern", ""),
+                float(payload.get("confidence", 0.0)),
+                json.dumps(payload, ensure_ascii=False),
+                payload.get("created_at", now()),
+            ),
+        )
+        self.db.commit()
+
+    def get_reflection(self, insight_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM reflection_insights WHERE insight_id = ?", (insight_id,)).fetchone()
+        return dict(row) if row else None
+
+    def all_reflections(self) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM reflection_insights ORDER BY confidence DESC, insight_id ASC").fetchall()
         return [dict(row) for row in rows]
 
     def close(self) -> None:
