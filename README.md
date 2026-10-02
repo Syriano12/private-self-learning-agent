@@ -68,10 +68,101 @@ Candidate
 
 في بيئة Sandbox الحالية تتوفر حدود العملية، timeout، resource limits، وتنظيف البيئة، بينما لا تتوفر عزل قوي أو قيود مستقلة على filesystem/network. لذلك تُوضع المهارات التي تعلن network أو filesystem capability في `QUARANTINED` بدلاً من تشغيلها بثقة زائفة.
 
+## Phase 9 — Security, Human Approval & Permission Policy Hardening
+
+تمت إضافة طبقة تحكم أمنية حتمية حول التنفيذ، مع إبقاء الـLLM والـPlanner في دور الاقتراح فقط:
+
+```text
+Goal
+→ Planner / LLM Proposal
+→ Policy Evaluation
+→ Risk Classification
+→ Approval Decision
+→ Execution-Boundary Policy Check
+→ Executor
+→ Observation
+→ Verification
+→ Audit
+```
+
+### Policy model
+
+يستخدم `PolicyEngine` قدرات صريحة قابلة للتوسعة، منها:
+
+```text
+READ_WORKSPACE
+WRITE_WORKSPACE
+NETWORK_ACCESS
+EXTERNAL_API
+DATABASE_READ
+DATABASE_WRITE
+SENSITIVE_DATA_ACCESS
+SYSTEM_COMMAND
+LONG_RUNNING_TASK
+SKILL_ACTIVATION
+SKILL_UPDATE
+```
+
+ويصنف الخطر deterministic إلى:
+
+```text
+LOW → MEDIUM → HIGH → CRITICAL
+```
+
+ويُرجع قراراً منظماً فقط:
+
+```text
+ALLOW | DENY | REQUIRE_APPROVAL | QUARANTINE
+```
+
+لا يمكن لنص LLM مثل `permission approved` أن يغير القرار، ولا تمنح Phase 8 `APPROVED` للمهارة صلاحيات invocation تلقائياً.
+
+يُنشئ التطبيق `SecurityController` افتراضياً. وبما أن `WebResearchTool` ينفذ HTTP خارجياً، فهو يعلن `NETWORK_ACCESS` ويُصنف `HIGH`؛ لذلك يعيد التشغيل طلب موافقة بدلاً من تنفيذ الشبكة تلقائياً. هذا السلوك مقصود، ويمكن لطبقة تكامل موثوقة استدعاء `ApprovalGate.approve()` بعد عرض payload الكامل للمستخدم.
+
+### Human approval model
+
+`ApprovalGate` يفرض موافقة صريحة مرتبطة بالضبط بـ:
+
+- `task_id`
+- `action_id`
+- `tool_or_skill`
+- capabilities
+- input fingerprint
+- risk level
+- policy version
+
+الموافقات تمر بالحالات:
+
+```text
+PENDING → APPROVED
+PENDING → DENIED
+PENDING → CANCELLED
+PENDING / APPROVED → EXPIRED
+```
+
+ولا تُعتبر الموافقة القديمة صالحة إذا تغيرت هوية الإجراء أو capabilities أو policy version. لا يتم تفسير الصمت أو timeout أو موافقة مهمة أخرى على أنها موافقة.
+
+### Execution boundary and audit
+
+يُعاد فحص السياسة عند الحد التنفيذي الفعلي داخل `GenericExecutor`، وليس في Planner فقط. كما يتم إعادة فحص استدعاء المهارة داخل `SkillLifecycleManager`، وتخضع أدوات recovery/replanning لنفس البوابة.
+
+يحفظ SQLite:
+
+```text
+security_policies
+approval_requests
+security_decisions
+audit_events
+```
+
+ويتضمن سجل التدقيق قرارات السياسة، طلبات الموافقة، المنع، التنفيذ، التفعيل، quarantine، rollback، وتغيير policy version، مع تمرير metadata عبر sanitization قبل الحفظ.
+
+لا يثبت ذلك mathematically proven security أو perfect sandbox؛ العزل القوي للشبكة والملفات غير متاح في Sandbox الحالية، ولذلك تبقى القدرات التي لا يمكن عزلها تحت `QUARANTINE` أو `REQUIRE_APPROVAL` وفق السياسة.
+
 ## الاختبارات
 
 ```bash
 pytest -q
 ```
 
-تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.
+تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، Phase 9 capability/risk/policy/approval binding/expiry/denial/cancellation/execution-boundary/audit/sanitization/planner-bypass/recovery-security/learning-security/Phase 8 integration، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.

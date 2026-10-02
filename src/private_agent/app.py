@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from private_agent.core.llm import build_provider
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import Planner
+from private_agent.security import SecurityController
 from private_agent.storage import Store
 from private_agent.tools.research import ToolRegistry, WebResearchTool
 
@@ -24,6 +25,7 @@ def build_orchestrator() -> Orchestrator:
         registry,
         max_attempts=int(os.getenv("AGENT_MAX_ATTEMPTS", "2")),
         planner=planner,
+        security_controller=SecurityController(store=store),
     )
 
 

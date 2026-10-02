@@ -120,6 +120,30 @@ class Store:
           id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, event_type TEXT NOT NULL,
           event_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS security_policies (
+          policy_version INTEGER PRIMARY KEY, policy_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS approval_requests (
+          approval_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, action_id TEXT NOT NULL,
+          tool_or_skill TEXT NOT NULL, requested_capabilities_json TEXT NOT NULL,
+          risk_level TEXT NOT NULL, reason TEXT NOT NULL, planned_effect TEXT NOT NULL,
+          input_fingerprint TEXT NOT NULL, policy_version INTEGER NOT NULL,
+          requested_at TEXT NOT NULL, expires_at TEXT NOT NULL, status TEXT NOT NULL,
+          decided_at TEXT NOT NULL, actor TEXT NOT NULL, approval_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS security_decisions (
+          decision_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, action_id TEXT NOT NULL,
+          decision_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS audit_events (
+          event_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, event_type TEXT NOT NULL,
+          task_id TEXT NOT NULL, action_id TEXT NOT NULL, actor TEXT NOT NULL,
+          tool_or_skill TEXT NOT NULL, capabilities_json TEXT NOT NULL,
+          risk_level TEXT NOT NULL, policy_version INTEGER NOT NULL,
+          approval_id TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
+          event_json TEXT NOT NULL
+        );
         """)
         self.db.commit()
 
@@ -378,6 +402,148 @@ class Store:
             (skill_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def save_security_policy(self, payload: dict[str, Any]) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO security_policies VALUES (?,?,?)",
+            (int(payload["policy_version"]), json.dumps(payload, ensure_ascii=False), now()),
+        )
+        self.db.commit()
+
+    def get_security_policy(self, policy_version: int) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM security_policies WHERE policy_version = ?",
+            (int(policy_version),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_approval_request(self, payload: dict[str, Any]) -> None:
+        self.db.execute(
+            """INSERT OR REPLACE INTO approval_requests
+            (approval_id, task_id, action_id, tool_or_skill, requested_capabilities_json,
+             risk_level, reason, planned_effect, input_fingerprint, policy_version,
+             requested_at, expires_at, status, decided_at, actor, approval_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                payload["approval_id"],
+                payload["task_id"],
+                payload["action_id"],
+                payload["tool_or_skill"],
+                json.dumps(payload.get("requested_capabilities", []), ensure_ascii=False),
+                payload["risk_level"],
+                payload["reason"],
+                payload["planned_effect"],
+                payload["input_fingerprint"],
+                int(payload["policy_version"]),
+                payload["requested_at"],
+                payload["expires_at"],
+                payload["status"],
+                payload.get("decided_at", ""),
+                payload.get("actor", "system"),
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
+        self.db.commit()
+
+    def get_approval_request(self, approval_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT approval_json FROM approval_requests WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["approval_json"])
+        except (TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def all_approval_requests(self) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT approval_json FROM approval_requests ORDER BY requested_at"
+        ).fetchall()
+        requests: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["approval_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                requests.append(payload)
+        return requests
+
+    def save_security_decision(self, payload: dict[str, Any]) -> None:
+        decision_id = f"{payload['task_id']}:{payload['action_id']}:{payload['evaluated_at']}"
+        self.db.execute(
+            "INSERT OR REPLACE INTO security_decisions VALUES (?,?,?,?,?)",
+            (
+                decision_id,
+                payload["task_id"],
+                payload["action_id"],
+                json.dumps(payload, ensure_ascii=False),
+                payload.get("evaluated_at", now()),
+            ),
+        )
+        self.db.commit()
+
+    def security_decisions_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT decision_json FROM security_decisions WHERE task_id = ? ORDER BY created_at",
+            (task_id,),
+        ).fetchall()
+        decisions: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["decision_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                decisions.append(payload)
+        return decisions
+
+    def save_audit_event(self, payload: dict[str, Any]) -> None:
+        self.db.execute(
+            """INSERT OR REPLACE INTO audit_events
+            (event_id, timestamp, event_type, task_id, action_id, actor,
+             tool_or_skill, capabilities_json, risk_level, policy_version,
+             approval_id, decision, reason, event_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                payload["event_id"],
+                payload["timestamp"],
+                payload["event_type"],
+                payload["task_id"],
+                payload["action_id"],
+                payload["actor"],
+                payload["tool_or_skill"],
+                json.dumps(payload.get("capabilities", []), ensure_ascii=False),
+                payload["risk_level"],
+                int(payload["policy_version"]),
+                payload.get("approval_id", ""),
+                payload["decision"],
+                payload["reason"],
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
+        self.db.commit()
+
+    def all_audit_events(self, *, task_id: str | None = None) -> list[dict[str, Any]]:
+        if task_id is None:
+            rows = self.db.execute("SELECT event_json FROM audit_events ORDER BY timestamp").fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT event_json FROM audit_events WHERE task_id = ? ORDER BY timestamp",
+                (task_id,),
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["event_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events
 
     def close(self) -> None:
         self.db.close()

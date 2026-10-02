@@ -134,6 +134,11 @@ class LegacyToolAdapter:
         self.name = legacy_tool.name
         self.risk_level = getattr(legacy_tool, "risk_level", "unknown")
         self.permission_level = getattr(legacy_tool, "permission_level", "unknown")
+        self.required_capabilities = list(getattr(legacy_tool, "required_capabilities", []) or [])
+        self.declared_capabilities = list(getattr(legacy_tool, "declared_capabilities", self.required_capabilities) or [])
+        self.network_required = bool(getattr(legacy_tool, "network_required", False))
+        self.filesystem_required = bool(getattr(legacy_tool, "filesystem_required", False))
+        self.planned_effect = getattr(legacy_tool, "planned_effect", "Legacy tool execution")
 
     def description(self) -> str:
         return f"Legacy adapter for {self.name}"

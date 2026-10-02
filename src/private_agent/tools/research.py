@@ -20,8 +20,12 @@ class ResearchResult:
 
 class WebResearchTool:
     name = "web_research"
-    risk_level = "low"
+    risk_level = "high"
     permission_level = "public_read"
+    required_capabilities = ["NETWORK_ACCESS"]
+    declared_capabilities = ["NETWORK_ACCESS"]
+    network_required = True
+    planned_effect = "Read public web sources through external HTTP requests"
 
     def input_schema(self) -> dict[str, Any]:
         return {

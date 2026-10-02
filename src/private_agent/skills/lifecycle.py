@@ -17,6 +17,7 @@ from private_agent.core.experience import ExperienceAction, ExperienceRecord, sa
 from private_agent.core.learning import LearningEngine
 from private_agent.core.memory import ExperienceMemory
 from private_agent.core.reflection import ReflectionEngine
+from private_agent.security import SecurityController
 from private_agent.tools.contracts import validate_schema_value
 from private_agent.skills.registry import SkillRegistry
 
@@ -878,6 +879,7 @@ class SkillLifecycleManager:
         experience_memory: ExperienceMemory | None = None,
         reflection_engine: ReflectionEngine | None = None,
         learning_engine: LearningEngine | None = None,
+        security_controller: SecurityController | None = None,
     ) -> None:
         self.registry = registry
         self.analyzer = analyzer or SkillStaticAnalyzer()
@@ -891,6 +893,7 @@ class SkillLifecycleManager:
         self.experience_memory = experience_memory
         self.reflection_engine = reflection_engine
         self.learning_engine = learning_engine
+        self.security = security_controller
         self._candidates: dict[str, SkillCandidate] = {}
         self._contracts: dict[str, SkillContract] = {}
         self._implementations: dict[str, Callable[[dict[str, Any]], Any]] = {}
@@ -960,6 +963,7 @@ class SkillLifecycleManager:
         mutation = self.mutation_engine.run(candidate, mutation_test_runner)
         if not mutation.passed:
             candidate.status = "QUARANTINED"
+            self._audit_skill_event(candidate, "SKILL_QUARANTINED", "mutation_threshold_not_met")
             sandbox = SandboxResult("QUARANTINED", error="mutation_threshold_not_met", capabilities=self.sandbox.capabilities.to_dict())
             runtime = RuntimeVerificationReport(False, sandbox.status, [sandbox.error])
             cross = CrossVerificationReport(False, ["mutation_threshold_not_met"])
@@ -996,9 +1000,20 @@ class SkillLifecycleManager:
         if approval.approved:
             candidate.status = "ACTIVE"
             self.registry.activate(candidate, approval=approval)
+            self._audit_skill_event(candidate, "SKILL_ACTIVATED", "Phase 8 approval and activation boundary passed")
+        elif candidate.status == "QUARANTINED":
+            self._audit_skill_event(candidate, "SKILL_QUARANTINED", "; ".join(approval.reasons))
         return LifecycleResult(candidate, contract_report, analysis, mutation, sandbox, runtime, cross, approval)
 
-    def execute_active(self, name: str, inputs: dict[str, Any]) -> ActiveExecutionResult:
+    def execute_active(
+        self,
+        name: str,
+        inputs: dict[str, Any],
+        *,
+        task_id: str | None = None,
+        action_id: str | None = None,
+        approval_id: str = "",
+    ) -> ActiveExecutionResult:
         record = self.registry.active(name)
         if record is None:
             return ActiveExecutionResult("QUARANTINED", "", 0, SandboxResult("QUARANTINED", error="active_skill_not_found"), RuntimeVerificationReport(False, "QUARANTINED", ["active_skill_not_found"]), CrossVerificationReport(False, ["active_skill_not_found"]), {})
@@ -1007,10 +1022,36 @@ class SkillLifecycleManager:
         if candidate is None:
             candidate = SkillCandidate.from_dict(record["candidate"])
         contract = self._contracts.get(skill_id) or SkillContract.from_candidate(candidate)
+        security_action = None
+        if self.security is not None:
+            security_action = self.security.action_for_skill(
+                task_id or f"skill-runtime:{candidate.name}:{candidate.version}",
+                action_id or f"invoke:{candidate.name}:{candidate.version}",
+                candidate,
+                inputs,
+            )
+            security_decision = self.security.authorize(
+                security_action,
+                approval_id=approval_id,
+                boundary=True,
+            )
+            if not security_decision.allowed:
+                sandbox = SandboxResult("BLOCKED", error=f"security_policy_blocked:{security_decision.decision}")
+                runtime = self.runtime_verifier.verify(candidate, contract, inputs, sandbox)
+                cross = CrossVerificationReport(False, ["security_policy_blocked"])
+                metrics = self.registry.record_runtime(
+                    candidate,
+                    success=False,
+                    verification_failed=True,
+                    contract_violation=False,
+                )
+                return ActiveExecutionResult("BLOCKED", candidate.skill_id, candidate.version, sandbox, runtime, cross, metrics)
         sandbox = self.sandbox.execute(candidate, contract, inputs)
         runtime = self.runtime_verifier.verify(candidate, contract, inputs, sandbox)
         cross = self.cross_verifier.verify(candidate, sandbox.output) if runtime.passed else CrossVerificationReport(False, ["runtime_verification_failed"])
         success = runtime.passed and cross.passed
+        if security_action is not None:
+            self.security.record_execution(security_action, success=success, metadata={"verification": runtime.status})
         metrics = self.registry.record_runtime(
             candidate,
             success=success,
@@ -1027,6 +1068,7 @@ class SkillLifecycleManager:
             if previous is not None:
                 rollback = previous
                 self.registry.record_rollback(candidate)
+                self._audit_skill_event(candidate, "SKILL_ROLLED_BACK", "runtime_degradation")
                 experience_id = self._record_rollback_experience(candidate, sandbox, runtime, metrics)
         return ActiveExecutionResult(status, candidate.skill_id, candidate.version, sandbox, runtime, cross, metrics, rollback, experience_id)
 
@@ -1064,6 +1106,24 @@ class SkillLifecycleManager:
             if self.learning_engine is not None:
                 self.learning_engine.learn(insights)
         return experience_id
+
+    def _audit_skill_event(self, candidate: SkillCandidate, event_type: str, reason: str) -> None:
+        if self.security is None:
+            return
+        action = self.security.action_for_skill(
+            "skill-lifecycle",
+            f"{event_type}:{candidate.name}:{candidate.version}",
+            candidate,
+            {},
+        )
+        self.security.audit.record(
+            event_type,
+            action,
+            decision=candidate.status,
+            reason=reason,
+            risk_level=self.security.policy_engine.evaluate(action).risk_level,
+            policy_version=self.security.policy_engine.policy.policy_version,
+        )
 
 
 def _dotted_name(node: ast.AST) -> str:

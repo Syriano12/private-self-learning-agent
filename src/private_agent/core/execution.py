@@ -16,6 +16,8 @@ class ExecutionContext:
     approved_permissions: set[str] = field(default_factory=lambda: {"public_read"})
     limits: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    security_controller: Any | None = None
+    approval_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -144,8 +146,43 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             )
 
+        security_action = None
+        if execution_context.security_controller is not None:
+            security_action = execution_context.security_controller.action_for_tool(
+                execution_context.task_id,
+                step.id,
+                tool,
+                step.input,
+            )
+            security_decision = execution_context.security_controller.authorize(
+                security_action,
+                approval_id=execution_context.approval_ids.get(step.id, "")
+                or execution_context.approval_ids.get(step.tool, ""),
+                boundary=True,
+            )
+            if not security_decision.allowed:
+                security_code = (
+                    "permission_not_approved"
+                    if security_decision.decision == "REQUIRE_APPROVAL"
+                    else "security_policy_blocked"
+                )
+                return StepResult.blocked(
+                    step.id,
+                    step.tool,
+                    security_code,
+                    f"Security policy blocked execution: {security_decision.decision}",
+                    details=security_decision.to_dict(),
+                    metadata=self._timed({**base_metadata, "security_decision": security_decision.to_dict()}, started),
+                )
+
         permission = getattr(tool, "permission_level", "unknown")
         if permission not in execution_context.approved_permissions:
+            if security_action is not None:
+                execution_context.security_controller.record_blocked(
+                    security_action,
+                    reason=f"Existing permission set does not include {permission}",
+                    metadata={"required_permission": permission},
+                )
             return StepResult.blocked(
                 step.id,
                 step.tool,
@@ -169,6 +206,12 @@ class GenericExecutor:
         try:
             tool_result = tool.execute(step.input, execution_context)
         except Exception as exc:
+            if security_action is not None:
+                execution_context.security_controller.record_execution(
+                    security_action,
+                    success=False,
+                    metadata={"exception_type": type(exc).__name__},
+                )
             return StepResult.failed(
                 step.id,
                 step.tool,
@@ -179,6 +222,12 @@ class GenericExecutor:
             )
 
         if not isinstance(tool_result, ToolResult) or tool_result.status not in {"success", "failed", "blocked"}:
+            if security_action is not None:
+                execution_context.security_controller.record_execution(
+                    security_action,
+                    success=False,
+                    metadata={"error": "malformed_tool_result"},
+                )
             return StepResult.failed(
                 step.id,
                 step.tool,
@@ -190,6 +239,12 @@ class GenericExecutor:
         if tool_result.status == "success":
             output_errors = validate_schema_value(tool_result.output, tool.output_schema(), path="output")
             if output_errors:
+                if security_action is not None:
+                    execution_context.security_controller.record_execution(
+                        security_action,
+                        success=False,
+                        metadata={"error": "malformed_tool_result", "details": output_errors},
+                    )
                 return StepResult.failed(
                     step.id,
                     step.tool,
@@ -198,6 +253,12 @@ class GenericExecutor:
                     details={"errors": output_errors},
                     metadata=self._timed(base_metadata, started),
                 )
+            if security_action is not None:
+                execution_context.security_controller.record_execution(
+                    security_action,
+                    success=True,
+                    metadata={"tool_status": "success"},
+                )
             return StepResult.success(
                 step.id,
                 step.tool,
@@ -205,6 +266,12 @@ class GenericExecutor:
                 metadata={**tool_result.metadata, **self._timed(base_metadata, started)},
             )
 
+        if security_action is not None:
+            execution_context.security_controller.record_execution(
+                security_action,
+                success=tool_result.status == "success",
+                metadata={"tool_status": tool_result.status},
+            )
         return StepResult(
             step_id=step.id,
             tool_name=step.tool,

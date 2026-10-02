@@ -16,6 +16,7 @@ from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
 from private_agent.core.verification import VerificationResult, VerifierRegistry
 from private_agent.storage import KnowledgeItem, Store
+from private_agent.security import PolicyDecision, SecurityController
 from private_agent.tools.research import ToolRegistry
 
 
@@ -39,6 +40,7 @@ class Orchestrator:
         reflection_engine: ReflectionEngine | None = None,
         learning_memory: LearningMemory | None = None,
         learning_engine: LearningEngine | None = None,
+        security_controller: SecurityController | None = None,
     ) -> None:
         self.store, self.tools, self.max_attempts = store, tools, max_attempts
         self.approved_permissions = approved_permissions or {"public_read"}
@@ -56,9 +58,17 @@ class Orchestrator:
         self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
         self.learning_memory = learning_memory or SQLiteLearningMemory(store)
         self.learning_engine = learning_engine or LearningEngine(self.learning_memory)
+        self.security = security_controller
 
-    def run(self, goal: str) -> dict[str, Any]:
-        task_id = str(uuid.uuid4())
+    def run(
+        self,
+        goal: str,
+        *,
+        task_id: str | None = None,
+        approval_ids: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        task_id = task_id or str(uuid.uuid4())
+        approval_ids = approval_ids or {}
         self.recovery.attempts.clear()
         prior = self.store.search_knowledge(goal)
         retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal))
@@ -80,6 +90,29 @@ class Orchestrator:
         ]
         initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
         current_plan = initial_plan
+        security_decisions: list[PolicyDecision] = []
+        if self.security is not None:
+            security_decisions = self.security.preflight_plan(
+                task_id,
+                initial_plan,
+                self.tools,
+                approval_ids=approval_ids,
+            )
+            self.store.save_event(
+                task_id,
+                "security_preflight",
+                {"decisions": [decision.to_dict() for decision in security_decisions]},
+            )
+            blocked = [decision for decision in security_decisions if not decision.allowed]
+            if blocked:
+                return self._security_blocked_result(
+                    task_id,
+                    goal,
+                    initial_plan,
+                    prior,
+                    learned_context,
+                    blocked,
+                )
         experience = ExperienceRecord(
             task_id=task_id,
             goal=goal,
@@ -118,6 +151,8 @@ class Orchestrator:
                     task_id=task_id,
                     approved_permissions=set(self.approved_permissions),
                     metadata={"attempt": rounds},
+                    security_controller=self.security,
+                    approval_ids=approval_ids,
                 ),
             )
             all_step_results.extend(execution_results)
@@ -219,6 +254,7 @@ class Orchestrator:
             "diagnoses": diagnoses,
             "recovery_attempts": [attempt.to_dict() for attempt in self.recovery.attempts],
             "learned_strategies_used": learned_context,
+            "security_decisions": [decision.to_dict() for decision in security_decisions],
             "experience": experience.to_dict(),
             "final_status": terminal_status,
         }
@@ -247,6 +283,62 @@ class Orchestrator:
         ]
         self.store.save_episode(str(uuid.uuid4()), task_id, goal, storage_status, lessons, result["experience"]["actions"])
         self._persist_knowledge(result["sources"], goal, verification_payload)
+        return result
+
+    def _security_blocked_result(
+        self,
+        task_id: str,
+        goal: str,
+        plan: TaskPlan,
+        prior: list[dict[str, Any]],
+        learned_context: list[dict[str, Any]],
+        decisions: list[PolicyDecision],
+    ) -> dict[str, Any]:
+        approval_requests = []
+        if self.security is not None:
+            for decision in decisions:
+                if decision.approval_id:
+                    request = self.security.approval_gate.get(decision.approval_id)
+                    if request is not None:
+                        approval_requests.append(request.to_dict())
+        experience = ExperienceRecord(
+            task_id=task_id,
+            goal=goal,
+            context={
+                "prior_knowledge_used": prior,
+                "learned_strategies_used": learned_context,
+                "security_decisions": [decision.to_dict() for decision in decisions],
+            },
+            initial_plan=self._plan_payload(plan),
+            final_outcome="BLOCKED",
+        )
+        self.experience_memory.store(experience)
+        result = {
+            "task_id": task_id,
+            "goal": goal,
+            "sources": [],
+            "errors": ["security_policy_blocked"],
+            "prior_knowledge_used": prior,
+            "attempts": 0,
+            "step_results": [],
+            "observations": [],
+            "step_outcomes": [],
+            "final_step_outcomes": [],
+            "verification": self._task_verification([]),
+            "diagnoses": [],
+            "recovery_attempts": [],
+            "learned_strategies_used": learned_context,
+            "security_decisions": [decision.to_dict() for decision in decisions],
+            "approval_requests": approval_requests,
+            "experience": experience.to_dict(),
+            "final_status": "BLOCKED",
+        }
+        self.store.save_event(
+            task_id,
+            "security_action_blocked",
+            {"decisions": result["security_decisions"], "approval_requests": approval_requests},
+        )
+        self.store.save_task(task_id, goal, "blocked", self._plan_payload(plan), result, 0)
         return result
 
     def _create_plan(
