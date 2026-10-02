@@ -99,6 +99,27 @@ class Store:
           confidence REAL NOT NULL, strategy_json TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS skill_candidates (
+          skill_id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL,
+          parent_version INTEGER, status TEXT NOT NULL, candidate_json TEXT NOT NULL,
+          contract_json TEXT NOT NULL, analysis_json TEXT NOT NULL,
+          mutation_json TEXT NOT NULL, runtime_json TEXT NOT NULL,
+          cross_verification_json TEXT NOT NULL, approval_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(name, version)
+        );
+        CREATE TABLE IF NOT EXISTS skill_runtime_metrics (
+          skill_id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL,
+          executions INTEGER NOT NULL, successes INTEGER NOT NULL,
+          failures INTEGER NOT NULL, verification_failures INTEGER NOT NULL,
+          timeouts INTEGER NOT NULL, contract_violations INTEGER NOT NULL,
+          rollback_count INTEGER NOT NULL, success_rate REAL NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS skill_lifecycle_events (
+          id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, event_type TEXT NOT NULL,
+          event_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         """)
         self.db.commit()
 
@@ -243,6 +264,118 @@ class Store:
     def all_learned_strategies(self) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT * FROM learned_strategies ORDER BY confidence DESC, strategy_id ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_skill_candidate(self, payload: dict[str, Any]) -> None:
+        stamp = now()
+        self.db.execute(
+            """INSERT OR REPLACE INTO skill_candidates
+            (skill_id, name, version, parent_version, status, candidate_json,
+             contract_json, analysis_json, mutation_json, runtime_json,
+             cross_verification_json, approval_json, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                payload["skill_id"],
+                payload["name"],
+                int(payload["version"]),
+                payload.get("parent_version"),
+                payload.get("status", "CANDIDATE"),
+                json.dumps(payload.get("candidate", {}), ensure_ascii=False),
+                json.dumps(payload.get("contract", {}), ensure_ascii=False),
+                json.dumps(payload.get("analysis", {}), ensure_ascii=False),
+                json.dumps(payload.get("mutation", {}), ensure_ascii=False),
+                json.dumps(payload.get("runtime", {}), ensure_ascii=False),
+                json.dumps(payload.get("cross_verification", {}), ensure_ascii=False),
+                json.dumps(payload.get("approval", {}), ensure_ascii=False),
+                payload.get("created_at", stamp),
+                stamp,
+            ),
+        )
+        self.db.commit()
+
+    def get_skill_candidate(self, skill_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM skill_candidates WHERE skill_id = ?", (skill_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_skill_version(self, name: str, version: int) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM skill_candidates WHERE name = ? AND version = ?",
+            (name, version),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def all_skill_candidates(self, name: str | None = None) -> list[dict[str, Any]]:
+        if name is None:
+            rows = self.db.execute("SELECT * FROM skill_candidates ORDER BY name, version").fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT * FROM skill_candidates WHERE name = ? ORDER BY version",
+                (name,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_skill_status(self, skill_id: str, status: str) -> None:
+        row = self.db.execute(
+            "SELECT candidate_json FROM skill_candidates WHERE skill_id = ?",
+            (skill_id,),
+        ).fetchone()
+        candidate_json = row["candidate_json"] if row else "{}"
+        try:
+            candidate_payload = json.loads(candidate_json)
+        except (TypeError, ValueError):
+            candidate_payload = {}
+        candidate_payload["status"] = status
+        self.db.execute(
+            "UPDATE skill_candidates SET status = ?, candidate_json = ?, updated_at = ? WHERE skill_id = ?",
+            (status, json.dumps(candidate_payload, ensure_ascii=False), now(), skill_id),
+        )
+        self.db.commit()
+
+    def save_skill_metrics(self, payload: dict[str, Any]) -> None:
+        self.db.execute(
+            """INSERT OR REPLACE INTO skill_runtime_metrics
+            (skill_id, name, version, executions, successes, failures,
+             verification_failures, timeouts, contract_violations, rollback_count,
+             success_rate, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                payload["skill_id"],
+                payload["name"],
+                int(payload["version"]),
+                int(payload.get("executions", 0)),
+                int(payload.get("successes", 0)),
+                int(payload.get("failures", 0)),
+                int(payload.get("verification_failures", 0)),
+                int(payload.get("timeouts", 0)),
+                int(payload.get("contract_violations", 0)),
+                int(payload.get("rollback_count", 0)),
+                float(payload.get("success_rate", 0.0)),
+                payload.get("updated_at", now()),
+            ),
+        )
+        self.db.commit()
+
+    def get_skill_metrics(self, skill_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM skill_runtime_metrics WHERE skill_id = ?",
+            (skill_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_skill_event(self, skill_id: str, event_type: str, event: dict[str, Any]) -> None:
+        stamp = now()
+        event_id = f"{skill_id}:{event_type}:{stamp}"
+        self.db.execute(
+            "INSERT OR REPLACE INTO skill_lifecycle_events VALUES (?,?,?,?,?)",
+            (event_id, skill_id, event_type, json.dumps(event, ensure_ascii=False), stamp),
+        )
+        self.db.commit()
+
+    def skill_events(self, skill_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM skill_lifecycle_events WHERE skill_id = ? ORDER BY created_at",
+            (skill_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 

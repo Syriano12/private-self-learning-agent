@@ -43,10 +43,35 @@ Experience → ReflectionInsight → LearnedStrategy → Future Planner Decision
 
 `LearnedStrategy` هي بيانات منظمة فقط، وتحتوي على الشرط، والفعل المفضل، والفعل المتجنب، والأدلة، ومعرفات الخبرات والـInsights، والثقة، والحالة. تحفظ الاستراتيجيات في SQLite عبر abstraction مستقلة هي `LearningMemory`، ولا تنفذ أدوات أو Python أو Shell ولا تغير الصلاحيات. الاستراتيجيات منخفضة الثقة أو المتعارضة لا تدخل التخطيط النشط.
 
+## Phase 8 — Safe Skill Learning وZero-Trust Skill Lifecycle
+
+تمت إضافة دورة حياة المهارات التالية:
+
+```text
+Candidate
+→ Contract Validation
+→ AST Static Analysis
+→ Bounded Mutation Testing
+→ Capability-Aware Sandbox
+→ Runtime Verification
+→ Cross-Verification
+→ Approval / Quarantine
+→ Versioned Registry
+→ Runtime Monitoring
+→ Degradation Detection
+→ Rollback
+→ Experience
+→ Reflection / Learning
+```
+
+المهارات المتعلمة تعامل ككود غير موثوق. لا يوجد ادعاء بإثبات رياضي للصحة؛ حالة `APPROVED` تعني فقط أن الفحوص المحددة في السياسة نجحت. Mutation testing يقيس قدرة الاختبارات على قتل mutations المحددة ولا يثبت غياب جميع الأخطاء.
+
+في بيئة Sandbox الحالية تتوفر حدود العملية، timeout، resource limits، وتنظيف البيئة، بينما لا تتوفر عزل قوي أو قيود مستقلة على filesystem/network. لذلك تُوضع المهارات التي تعلن network أو filesystem capability في `QUARANTINED` بدلاً من تشغيلها بثقة زائفة.
+
 ## الاختبارات
 
 ```bash
 pytest -q
 ```
 
-تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، الاستمرارية عبر إعادة التشغيل، الإثبات السلوكي قبل/بعد، وحماية الأسرار.
+تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.
