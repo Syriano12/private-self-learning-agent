@@ -147,7 +147,19 @@ class RecoveryManager:
                 step.id,
                 step.tool,
                 details={"failure_type": diagnosis.failure_type},
-            )
+                )
+
+        if preferred == "RETRY":
+            replacement = self._find_alternative(step.tool, available_tools, step_attempts)
+            if replacement:
+                return RecoveryDecision(
+                    "CHANGE_TOOL",
+                    "Switch to an unused registered tool after the retry strategy was exhausted",
+                    step.id,
+                    step.tool,
+                    replacement_tool=replacement,
+                    details={"failure_type": diagnosis.failure_type},
+                )
 
         if alternative_plan and alternative_plan.tool != step.tool:
             return RecoveryDecision(

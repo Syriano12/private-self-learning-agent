@@ -193,10 +193,18 @@ class ReflectionEngine:
             conflicts = [
                 candidate
                 for candidate in candidates
-                if candidate.outcome != "COMPLETED"
-                and candidate.strategy_used
+                if candidate.strategy_used
                 and candidate.strategy_used[0] == failed_tool
-                and set(failures).intersection(candidate.failure_diagnosis)
+                and (
+                    (
+                        candidate.outcome != "COMPLETED"
+                        and (
+                            set(failures).intersection(candidate.failure_diagnosis)
+                            or alternative_tool in candidate.strategy_used
+                        )
+                    )
+                    or (candidate.outcome == "COMPLETED" and len(candidate.strategy_used) == 1)
+                )
             ]
             ids = _ids(supporting)
             insights.append(

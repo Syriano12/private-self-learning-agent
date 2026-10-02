@@ -71,9 +71,16 @@ PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
 class Planner:
     """Generate plans through an injected LLM provider and validate them deterministically."""
 
-    def __init__(self, provider: LLMProvider | None = None, *, max_steps: int = 12) -> None:
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        *,
+        max_steps: int = 12,
+        learned_strategy_threshold: float = 0.70,
+    ) -> None:
         self.provider = provider
         self.max_steps = max_steps
+        self.learned_strategy_threshold = max(0.0, min(1.0, float(learned_strategy_threshold)))
 
     def create(
         self,
@@ -85,11 +92,34 @@ class Planner:
         permissions: dict[str, str] | None = None,
         retrieved_experiences: list[dict[str, Any]] | None = None,
         reflection_insights: list[dict[str, Any]] | None = None,
+        learned_strategies: list[dict[str, Any]] | None = None,
     ) -> TaskPlan:
         if not goal.strip():
             raise PlanValidationError(["goal_required"])
         if self.provider is None:
-            return self._unavailable_fallback(goal, tools, prior_knowledge)
+            fallback = self._unavailable_fallback(goal, tools, prior_knowledge, learned_strategies or [])
+            return self.validate(
+                {
+                    "goal": fallback.goal,
+                    "rationale": fallback.rationale,
+                    "steps": [
+                        {
+                            "id": step.id,
+                            "objective": step.objective,
+                            "tool": step.tool,
+                            "input": step.input,
+                            "reason": step.reason,
+                            "depends_on": step.depends_on,
+                            "verifier": step.verifier,
+                            "success_criteria": step.success_criteria,
+                        }
+                        for step in fallback.steps
+                    ],
+                },
+                goal=goal,
+                tools=tools,
+                permissions=permissions,
+            )
 
         context = {
             "goal": goal,
@@ -97,6 +127,7 @@ class Planner:
             "relevant_memory": prior_knowledge,
             "relevant_experiences": retrieved_experiences or [],
             "reflection_insights": reflection_insights or [],
+            "learned_strategies": learned_strategies or [],
             "constraints": constraints or {"max_steps": self.max_steps},
             "permissions": permissions or {},
         }
@@ -285,16 +316,23 @@ class Planner:
 
         return any(visit(node) for node in dependencies)
 
-    @staticmethod
     def _unavailable_fallback(
+        self,
         goal: str,
         tools: ToolRegistry,
         prior_knowledge: list[dict[str, Any]],
+        learned_strategies: list[dict[str, Any]],
     ) -> TaskPlan:
         available = tools.available()
         if not available:
             raise PlanValidationError(["no_tools_registered", "llm_provider_unavailable"])
-        first_tool = tools.get(available[0]["name"])
+        available_names = [metadata["name"] for metadata in available]
+        selected_name = _learned_preferred_tool(learned_strategies, available_names, self.learned_strategy_threshold)
+        avoided_names = _learned_avoided_tools(learned_strategies, self.learned_strategy_threshold)
+        if not selected_name and available_names and available_names[0] in avoided_names:
+            selected_name = next((name for name in available_names if name not in avoided_names), available_names[0])
+        selected_name = selected_name or available_names[0]
+        first_tool = tools.get(selected_name)
         input_values: dict[str, Any] = {}
         schema = getattr(first_tool, "input_schema", lambda: {})()
         properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
@@ -302,20 +340,59 @@ class Planner:
             input_values["query"] = goal
         if "limit" in properties:
             input_values["limit"] = 6
+        success_criteria: dict[str, Any] = {}
+        output_schema = getattr(first_tool, "output_schema", lambda: {})()
+        if isinstance(output_schema, dict) and output_schema.get("required"):
+            success_criteria = {"required_fields": list(output_schema["required"])}
+        learned_note = ""
+        if selected_name != available_names[0] or learned_strategies:
+            learned_note = f" Learned guidance considered: selected {selected_name}."
         return TaskPlan(
             goal=goal,
             steps=[
                 PlanStep(
                     id=str(uuid.uuid4()),
                     objective="Execute the first registered safe tool as a compatibility fallback",
-                    tool=available[0]["name"],
+                    tool=selected_name,
                     input=input_values,
-                    reason="LLM provider is not configured; this fallback is not dynamic planning.",
+                    reason=(
+                        "LLM provider is not configured; this fallback is deterministic. "
+                        "Learned guidance is advisory and remains subject to plan validation."
+                    ),
+                    success_criteria=success_criteria,
                 )
             ],
             rationale=(
                 f"استُرجعت {len(prior_knowledge)} عناصر معرفة سابقة. "
                 "LLM planner unavailable; "
                 "The compatibility fallback is not an LLM-generated plan."
+                + learned_note
             ),
         )
+
+
+def _learned_preferred_tool(strategies: list[dict[str, Any]], available_names: list[str], threshold: float) -> str:
+    eligible = [
+        strategy
+        for strategy in strategies
+        if strategy.get("status") == "active" and float(strategy.get("confidence", 0.0)) >= threshold
+    ]
+    eligible.sort(key=lambda item: (-float(item.get("confidence", 0.0)), str(item.get("strategy_id", ""))))
+    for strategy in eligible:
+        action = strategy.get("preferred_action", {})
+        if isinstance(action, dict) and action.get("type") == "prefer_tool":
+            tool = str(action.get("tool", ""))
+            if tool in available_names:
+                return tool
+    return ""
+
+
+def _learned_avoided_tools(strategies: list[dict[str, Any]], threshold: float) -> set[str]:
+    avoided: set[str] = set()
+    for strategy in strategies:
+        if strategy.get("status") != "active" or float(strategy.get("confidence", 0.0)) < threshold:
+            continue
+        action = strategy.get("avoided_action", {})
+        if isinstance(action, dict) and action.get("tool"):
+            avoided.add(str(action["tool"]))
+    return avoided

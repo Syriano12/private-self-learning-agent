@@ -94,6 +94,11 @@ class Store:
           confidence REAL NOT NULL, insight_json TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS learned_strategies (
+          strategy_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+          confidence REAL NOT NULL, strategy_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         """)
         self.db.commit()
 
@@ -215,6 +220,30 @@ class Store:
 
     def all_reflections(self) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM reflection_insights ORDER BY confidence DESC, insight_id ASC").fetchall()
+        return [dict(row) for row in rows]
+
+    def save_learned_strategy(self, strategy: Any) -> None:
+        payload = strategy.to_dict() if hasattr(strategy, "to_dict") else strategy
+        self.db.execute(
+            "INSERT OR REPLACE INTO learned_strategies VALUES (?,?,?,?,?)",
+            (
+                payload["strategy_id"],
+                payload.get("status", "uncertain"),
+                float(payload.get("confidence", 0.0)),
+                json.dumps(payload, ensure_ascii=False),
+                payload.get("created_at", now()),
+            ),
+        )
+        self.db.commit()
+
+    def get_learned_strategy(self, strategy_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM learned_strategies WHERE strategy_id = ?", (strategy_id,)).fetchone()
+        return dict(row) if row else None
+
+    def all_learned_strategies(self) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM learned_strategies ORDER BY confidence DESC, strategy_id ASC"
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def close(self) -> None:
