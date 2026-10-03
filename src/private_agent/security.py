@@ -35,12 +35,23 @@ AUDIT_EVENTS = {
     "APPROVAL_DENIED",
     "APPROVAL_EXPIRED",
     "APPROVAL_CANCELLED",
+    "APPROVAL_INVALIDATED",
     "ACTION_BLOCKED",
     "ACTION_EXECUTED",
     "SKILL_ACTIVATED",
     "SKILL_QUARANTINED",
     "SKILL_ROLLED_BACK",
     "POLICY_CHANGED",
+    "TASK_CREATED",
+    "CHECKPOINT_SAVED",
+    "TASK_RESUMED",
+    "RESUME_BLOCKED",
+    "EXECUTION_UNKNOWN",
+    "RECOVERY_REQUIRED",
+    "APPROVAL_REVALIDATED",
+    "STATE_MIGRATION",
+    "TASK_COMPLETED",
+    "TASK_FAILED",
 }
 
 
@@ -143,8 +154,15 @@ class PolicyEngine:
     """Deterministic policy authority; it never consumes free-form LLM approval text."""
 
     def __init__(self, policy: SecurityPolicy | None = None, *, store: Any | None = None) -> None:
-        self.policy = policy or SecurityPolicy()
         self.store = store
+        if policy is None and store is not None and hasattr(store, "get_latest_security_policy"):
+            row = store.get_latest_security_policy()
+            if row and row.get("policy_json"):
+                try:
+                    policy = SecurityPolicy.from_dict(json.loads(row["policy_json"]))
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise ValueError("corrupted_security_policy") from exc
+        self.policy = policy or SecurityPolicy()
         self._persist_policy()
 
     def evaluate(self, action: ActionRequest) -> PolicyDecision:
@@ -341,7 +359,17 @@ class ApprovalGate:
         risk_level: str | None = None,
     ) -> bool:
         request = self.get(approval_id)
-        if request is None or request.status != "APPROVED":
+        return bool(request and request.status == "APPROVED" and self.bound_for(approval_id, action, policy_version, risk_level))
+
+    def bound_for(
+        self,
+        approval_id: str,
+        action: ActionRequest,
+        policy_version: int,
+        risk_level: str | None = None,
+    ) -> bool:
+        request = self.get(approval_id)
+        if request is None:
             return False
         binding_matches = (
             request.task_id == action.task_id
@@ -493,27 +521,53 @@ class SecurityController:
             )
             return decision
         if decision.decision == "REQUIRE_APPROVAL":
-            if approval_id and self.approval_gate.valid_for(
-                approval_id,
-                action,
-                decision.policy_version,
-                decision.risk_level,
-            ):
-                approved = self.approval_gate.get(approval_id)
-                decision.decision = "ALLOW"
-                decision.approval_id = approval_id
-                decision.reasons.append("exact_approval_valid")
-                self.audit.record(
-                    "PERMISSION_GRANTED",
+            if approval_id:
+                request = self.approval_gate.get(approval_id)
+                if request and self.approval_gate.bound_for(
+                    approval_id,
                     action,
-                    decision="ALLOW",
-                    reason="Exact human approval matched the action binding",
-                    risk_level=decision.risk_level,
-                    policy_version=decision.policy_version,
-                    approval_id=approval_id,
-                    actor=approved.actor if approved else "human",
-                )
-                return decision
+                    decision.policy_version,
+                    decision.risk_level,
+                ):
+                    if request.status == "APPROVED":
+                        decision.decision = "ALLOW"
+                        decision.approval_id = approval_id
+                        decision.reasons.append("exact_approval_valid")
+                        self.audit.record(
+                            "APPROVAL_REVALIDATED",
+                            action,
+                            decision="ALLOW",
+                            reason="Persisted approval matched the current action binding",
+                            risk_level=decision.risk_level,
+                            policy_version=decision.policy_version,
+                            approval_id=approval_id,
+                            actor=request.actor,
+                        )
+                        self.audit.record(
+                            "PERMISSION_GRANTED",
+                            action,
+                            decision="ALLOW",
+                            reason="Exact human approval matched the action binding",
+                            risk_level=decision.risk_level,
+                            policy_version=decision.policy_version,
+                            approval_id=approval_id,
+                            actor=request.actor,
+                        )
+                        return decision
+                    if request.status == "PENDING":
+                        decision.approval_id = approval_id
+                        decision.reasons.append("persisted_approval_still_pending")
+                        return decision
+                if request is not None:
+                    self.audit.record(
+                        "APPROVAL_INVALIDATED",
+                        action,
+                        decision=request.status,
+                        reason="Persisted approval no longer matches current policy or action binding",
+                        risk_level=decision.risk_level,
+                        policy_version=decision.policy_version,
+                        approval_id=approval_id,
+                    )
             request = self.approval_gate.request(action, decision, ttl_seconds=self.policy_engine.policy.approval_ttl_seconds)
             decision.approval_id = request.approval_id
             decision.reasons.append("waiting_for_explicit_human_approval")
@@ -564,6 +618,17 @@ class SecurityController:
                     request = self.approval_gate.request(action, decision, ttl_seconds=self.policy_engine.policy.approval_ttl_seconds)
                     decision.approval_id = request.approval_id
                 else:
+                    request = self.approval_gate.get(approval_id)
+                    if request is not None:
+                        self.audit.record(
+                            "APPROVAL_INVALIDATED",
+                            action,
+                            decision=request.status,
+                            reason="Execution-boundary approval binding or policy validation failed",
+                            risk_level=decision.risk_level,
+                            policy_version=decision.policy_version,
+                            approval_id=approval_id,
+                        )
                     decision.reasons.append("approval_invalid_or_not_bound")
                 decision.reasons.append("execution_requires_valid_approval")
                 decision.decision = "REQUIRE_APPROVAL"

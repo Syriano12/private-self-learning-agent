@@ -50,6 +50,29 @@ class Store:
           plan_json TEXT NOT NULL, result_json TEXT NOT NULL, attempts INTEGER NOT NULL,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS task_state_schema (
+          schema_version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS task_states (
+          task_id TEXT PRIMARY KEY, state_version INTEGER NOT NULL,
+          status TEXT NOT NULL, current_phase TEXT NOT NULL, current_step TEXT NOT NULL,
+          plan_version INTEGER NOT NULL, plan_fingerprint TEXT NOT NULL,
+          state_fingerprint TEXT NOT NULL, state_json TEXT NOT NULL,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          last_checkpoint_at TEXT NOT NULL, last_successful_checkpoint TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS task_checkpoints (
+          checkpoint_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+          sequence INTEGER NOT NULL, checkpoint_type TEXT NOT NULL,
+          state_version INTEGER NOT NULL, state_fingerprint TEXT NOT NULL,
+          state_json TEXT NOT NULL, created_at TEXT NOT NULL,
+          UNIQUE(task_id, sequence)
+        );
+        CREATE TABLE IF NOT EXISTS task_action_records (
+          action_key TEXT PRIMARY KEY, task_id TEXT NOT NULL, step_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL, status TEXT NOT NULL, action_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS episodes (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL, goal TEXT NOT NULL,
           outcome TEXT NOT NULL, lessons_json TEXT NOT NULL, observations_json TEXT NOT NULL,
@@ -145,6 +168,10 @@ class Store:
           event_json TEXT NOT NULL
         );
         """)
+        self.db.execute(
+            "INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?,?)",
+            (1, now()),
+        )
         self.db.commit()
 
     def save_task(self, task_id: str, goal: str, status: str, plan: Any, result: Any, attempts: int) -> None:
@@ -152,6 +179,125 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
             (task_id, goal, status, json.dumps(plan), json.dumps(result), attempts, stamp, stamp))
         self.db.commit()
+
+    def save_task_state(self, state: Any, checkpoint_type: str, *, task_status: str | None = None) -> None:
+        """Persist state, checkpoint and action records in one SQLite transaction."""
+        payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
+        task_id = str(payload["task_id"])
+        status = str(task_status or payload["status"])
+        created_at = str(payload["created_at"])
+        updated_at = str(payload["updated_at"])
+        state_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        checkpoint_at = str(payload.get("last_checkpoint_at") or updated_at or now())
+        with self.db:
+            row = self.db.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM task_checkpoints WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            sequence = int(row["sequence"] or 0) + 1
+            self.db.execute(
+                """INSERT OR REPLACE INTO task_states
+                (task_id, state_version, status, current_phase, current_step,
+                 plan_version, plan_fingerprint, state_fingerprint, state_json,
+                 created_at, updated_at, last_checkpoint_at, last_successful_checkpoint)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    task_id,
+                    int(payload["state_version"]),
+                    status,
+                    payload["current_phase"],
+                    payload["current_step"],
+                    int(payload["plan_version"]),
+                    payload["plan_fingerprint"],
+                    payload["state_fingerprint"],
+                    state_json,
+                    created_at,
+                    updated_at,
+                    payload["last_checkpoint_at"],
+                    payload["last_successful_checkpoint"],
+                ),
+            )
+            self.db.execute(
+                """INSERT INTO task_checkpoints
+                (checkpoint_id, task_id, sequence, checkpoint_type, state_version,
+                 state_fingerprint, state_json, created_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    f"{task_id}:{sequence}",
+                    task_id,
+                    sequence,
+                    checkpoint_type,
+                    int(payload["state_version"]),
+                    payload["state_fingerprint"],
+                    state_json,
+                    checkpoint_at,
+                ),
+            )
+            for action_key, action_payload in payload.get("action_records", {}).items():
+                self.db.execute(
+                    """INSERT OR REPLACE INTO task_action_records
+                    (action_key, task_id, step_id, tool_name, status, action_json, updated_at)
+                    VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        action_key,
+                        task_id,
+                        action_payload.get("step_id", ""),
+                        action_payload.get("tool_name", ""),
+                        action_payload.get("status", "NOT_STARTED"),
+                        json.dumps(action_payload, ensure_ascii=False, sort_keys=True),
+                        action_payload.get("updated_at", updated_at),
+                    ),
+                )
+            self.db.execute(
+                """INSERT OR REPLACE INTO tasks
+                (id, goal, status, plan_json, result_json, attempts, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    task_id,
+                    payload["goal"],
+                    status.lower(),
+                    json.dumps(payload.get("plan", {}), ensure_ascii=False, sort_keys=True),
+                    json.dumps(payload.get("result", {}), ensure_ascii=False, sort_keys=True),
+                    int(payload.get("context", {}).get("attempts", 0)),
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+    def get_task_state(self, task_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["state_json"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("corrupted_task_state_json") from exc
+        return payload if isinstance(payload, dict) else None
+
+    def get_task_state_row(self, task_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+
+    def task_checkpoints(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY sequence",
+            (task_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_task_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY sequence DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def task_action_records(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM task_action_records WHERE task_id = ? ORDER BY updated_at",
+            (task_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_episode(self, episode_id: str, task_id: str, goal: str, outcome: str, lessons: Any, observations: Any) -> None:
         self.db.execute("INSERT OR REPLACE INTO episodes VALUES (?,?,?,?,?,?,?)",
@@ -414,6 +560,12 @@ class Store:
         row = self.db.execute(
             "SELECT * FROM security_policies WHERE policy_version = ?",
             (int(policy_version),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_latest_security_policy(self) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM security_policies ORDER BY policy_version DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
 

@@ -159,10 +159,113 @@ audit_events
 
 لا يثبت ذلك mathematically proven security أو perfect sandbox؛ العزل القوي للشبكة والملفات غير متاح في Sandbox الحالية، ولذلك تبقى القدرات التي لا يمكن عزلها تحت `QUARANTINE` أو `REQUIRE_APPROVAL` وفق السياسة.
 
+## Phase 10 — Durable Task State, Checkpoints & Safe Resume
+
+تمت إضافة persistence للحالة التشغيلية عبر `TaskState` وواجهات `Store` transactional. دورة المهمة أصبحت:
+
+```text
+Goal
+→ TASK_CREATED
+→ PLANNING
+→ PLAN_CREATED
+→ READY
+→ BEFORE_EXECUTION
+→ EXECUTING
+→ AFTER_EXECUTION
+→ OBSERVING
+→ AFTER_OBSERVATION
+→ VERIFYING
+→ AFTER_VERIFICATION
+→ READY / NEXT ACTION
+→ TASK_COMPLETED أو TASK_FAILED
+```
+
+حالات الانقطاع غير الآمن لا تُفسر على أنها نجاح:
+
+```text
+EXECUTING
+→ EXECUTION_UNKNOWN
+→ explicit observation / verification
+→ READY أو BLOCKED
+```
+
+إذا كان من الممكن أن يكون side effect خارجياً قد حدث، فإن `resume_task(task_id)` يحظر التنفيذ افتراضياً. لا يُسمح بإعادة المحاولة إلا بعد تقديم قرار صريح موثق بأن الإجراء لم يحدث، ولا يُسمح بتحويل الحالة إلى `VERIFIED` إلا مع observation وverification evidence صالحين.
+
+### Durable state model
+
+تتضمن الحالة المحفوظة:
+
+- task identity والهدف والحالة الحالية.
+- current phase وcurrent step.
+- plan version وplan fingerprint.
+- state version وstate fingerprint.
+- completed/pending/failed action identities.
+- observations وverification results.
+- recovery/replanning state.
+- approval IDs وsecurity decisions.
+- created/updated/checkpoint timestamps.
+- آخر checkpoint ناجح.
+
+يستخدم كل action هوية deterministic مشتقة من:
+
+```text
+plan_version + step_id + tool + canonical input
+```
+
+ولا يُعاد تنفيذ action مسجل كـ`VERIFIED` بعد restart. هذا يحمي الأدوات غير idempotent مثل network calls والكتابات وتغييرات filesystem/database على مستوى state machine، مع بقاء idempotency الفعلية لكل خدمة خارجية مسؤولية عقد الأداة.
+
+### Atomic persistence
+
+يحفظ SQLite الحالة في جداول:
+
+```text
+task_state_schema
+task_states
+task_checkpoints
+task_action_records
+```
+
+يتم حفظ state snapshot وcheckpoint sequence وaction records وtask summary داخل transaction واحدة. لا يتم اعتبار action مكتملاً قبل حفظ observation والـverification بنتيجة `VERIFIED`. ولا تصبح المهمة `COMPLETED` قبل حفظ verification النهائية.
+
+`state_version=1` معروف فقط حالياً. أي state version غير معروف، أو state JSON تالف، أو fingerprint غير مطابق، أو transition غير مسموح، يفشل مغلقاً ولا يُخمّن أو يُصلح تلقائياً. جدول `task_state_schema` يثبت إصدار مخطط persistence الحالي لاستراتيجية migrations مستقبلية صريحة.
+
+### Resume and Phase 9
+
+الاستئناف لا يتجاوز الأمن. قبل كل action مستأنف يتم:
+
+1. تحميل policy الحالية من SQLite.
+2. إعادة تقييم capabilities وrisk.
+3. إعادة فحص approval binding وinput fingerprint.
+4. إعادة فحص policy version وexpiration.
+5. إعادة تمرير action عبر execution-boundary `SecurityController`.
+
+تبقى approval `PENDING` pending بعد restart. الموافقة `APPROVED` لا تبقى صالحة إذا انتهت أو تغيرت هوية action أو capabilities أو policy version أو fingerprint. عند invalidation يتم تسجيل `APPROVAL_INVALIDATED` وإعادة الحظر/طلب موافقة جديدة.
+
+### Audit events
+
+تتكامل checkpoints مع AuditTrail وتشمل الأحداث:
+
+```text
+TASK_CREATED
+CHECKPOINT_SAVED
+TASK_RESUMED
+RESUME_BLOCKED
+EXECUTION_UNKNOWN
+RECOVERY_REQUIRED
+APPROVAL_REVALIDATED
+APPROVAL_INVALIDATED
+TASK_COMPLETED
+TASK_FAILED
+```
+
+لا تُحفظ الأسرار أو raw sensitive payloads في سجل التدقيق؛ تمر البيانات عبر sanitization القائمة.
+
+هذه المرحلة لا تنفذ Phase 11 observability، ولا Phase 12 public resume API، ولا Phase 13 UI، ولا Phase 14 WhatsApp integration. `resume_task` واجهة داخلية deterministic فقط.
+
 ## الاختبارات
 
 ```bash
 pytest -q
 ```
 
-تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، Phase 9 capability/risk/policy/approval binding/expiry/denial/cancellation/execution-boundary/audit/sanitization/planner-bypass/recovery-security/learning-security/Phase 8 integration، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.
+تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، Phase 9 capability/risk/policy/approval binding/expiry/denial/cancellation/execution-boundary/audit/sanitization/planner-bypass/recovery-security/learning-security/Phase 8 integration، Phase 10 task creation/checkpoints/normal resume/crash-like interruption/EXECUTION_UNKNOWN/duplicate prevention/idempotency/stale-corruption-version failures/approval persistence and revalidation/policy and capability invalidation/action fingerprint/recovery resume/atomic snapshots/audit lifecycle، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.
