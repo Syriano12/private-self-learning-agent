@@ -33,6 +33,7 @@ AUDIT_EVENTS = {
     "APPROVAL_REQUESTED",
     "APPROVAL_GRANTED",
     "APPROVAL_DENIED",
+    "APPROVAL_CANCELLED",
     "APPROVAL_EXPIRED",
     "APPROVAL_CANCELLED",
     "APPROVAL_INVALIDATED",
@@ -435,8 +436,9 @@ class ApprovalGate:
 
 
 class AuditTrail:
-    def __init__(self, *, store: Any | None = None) -> None:
+    def __init__(self, *, store: Any | None = None, observability: Any | None = None) -> None:
         self.store = store
+        self.observability = observability
         self._events: list[dict[str, Any]] = []
 
     def record(
@@ -475,6 +477,45 @@ class AuditTrail:
         self._events.append(event)
         if self.store is not None and hasattr(self.store, "save_audit_event"):
             self.store.save_audit_event(event)
+        observer = self.observability or getattr(self.store, "observability", None)
+        if observer is not None:
+            mapped_type = {
+                "PERMISSION_GRANTED": "SECURITY_ALLOW",
+                "PERMISSION_DENIED": "SECURITY_DENY",
+                "POLICY_EVALUATED": {
+                    "ALLOW": "SECURITY_ALLOW",
+                    "DENY": "SECURITY_DENY",
+                    "REQUIRE_APPROVAL": "SECURITY_REQUIRE_APPROVAL",
+                    "QUARANTINE": "SECURITY_QUARANTINE",
+                }.get(decision, "SECURITY_DENY"),
+                "APPROVAL_GRANTED": "APPROVAL_APPROVED",
+                "APPROVAL_CANCELLED": "APPROVAL_CANCELLED",
+                "SKILL_QUARANTINED": "SKILL_BLOCKED",
+                "ACTION_EXECUTED": "ACTION_COMPLETED" if decision == "ALLOW" else "ACTION_FAILED",
+                "ACTION_BLOCKED": "ACTION_BLOCKED",
+            }.get(event_type, event_type)
+            try:
+                observer.emit(
+                    mapped_type,
+                    task_id=event["task_id"],
+                    action_id=event["action_id"],
+                    component="security",
+                    severity="ERROR" if mapped_type in {"SECURITY_DENY", "SECURITY_REQUIRE_APPROVAL", "SECURITY_QUARANTINE", "ACTION_BLOCKED", "ACTION_FAILED"} else "INFO",
+                    metadata={
+                        "security_event": event_type,
+                        "decision": decision,
+                        "reason": reason,
+                        "risk_level": risk_level,
+                        "policy_version": policy_version,
+                        "approval_id": approval_id,
+                    },
+                    event_id=f"security:{event['event_id']}:{mapped_type}",
+                )
+            except Exception:
+                # The monitor itself decides degraded vs strict behavior; an
+                # observer must never turn an authorization decision into an
+                # authorization bypass.
+                pass
         return event
 
     def list(self, *, task_id: str | None = None) -> list[dict[str, Any]]:
@@ -493,11 +534,17 @@ class SecurityController:
         policy_engine: PolicyEngine | None = None,
         approval_gate: ApprovalGate | None = None,
         audit_trail: AuditTrail | None = None,
+        observability: Any | None = None,
     ) -> None:
         self.store = store
-        self.audit = audit_trail or AuditTrail(store=store)
+        self.audit = audit_trail or AuditTrail(store=store, observability=observability)
+        if observability is not None:
+            self.audit.observability = observability
         self.policy_engine = policy_engine or PolicyEngine(store=store)
         self.approval_gate = approval_gate or ApprovalGate(store=store, event_logger=self._approval_event)
+
+    def set_observability(self, observability: Any | None) -> None:
+        self.audit.observability = observability
 
     def preflight(self, action: ActionRequest, *, approval_id: str = "") -> PolicyDecision:
         decision = self.policy_engine.evaluate(action)

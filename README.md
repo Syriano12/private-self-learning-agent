@@ -260,7 +260,118 @@ TASK_FAILED
 
 لا تُحفظ الأسرار أو raw sensitive payloads في سجل التدقيق؛ تمر البيانات عبر sanitization القائمة.
 
-هذه المرحلة لا تنفذ Phase 11 observability، ولا Phase 12 public resume API، ولا Phase 13 UI، ولا Phase 14 WhatsApp integration. `resume_task` واجهة داخلية deterministic فقط.
+هذه المرحلة لا تنفذ Phase 12 public resume API، ولا Phase 13 UI، ولا Phase 14 WhatsApp integration. `resume_task` واجهة داخلية deterministic فقط.
+
+## Phase 11 — Structured Observability & Monitoring
+
+تمت إضافة طبقة Observability مستقلة لا تنفذ tools ولا تمنح approvals ولا تقرر permissions:
+
+```text
+Agent Runtime
+→ StructuredEvent
+→ SQLite Event Store
+→ Metrics
+→ Task Timeline
+→ Diagnostics / Queries
+```
+
+### Event schema and ordering
+
+كل `StructuredEvent` يحتوي على:
+
+```text
+event_id
+event_type
+timestamp
+task_id
+action_id
+step_id
+correlation_id
+component
+severity
+schema_version
+metadata
+sequence
+```
+
+يُستخدم vocabulary مغلق deterministic بدلاً من free-form log strings. ويستخدم SQLite `sequence INTEGER PRIMARY KEY AUTOINCREMENT` لترتيب الأحداث؛ لذلك لا يعتمد timeline على تساوي wall-clock timestamps أو على insertion order غير الموثق.
+
+الأحداث تشمل task/plan/action/tool/observation/verification/recovery/replan/approval/security/skill/checkpoint/memory/reflection/learning lifecycle، مثل:
+
+```text
+TASK_CREATED → PLAN_CREATED → ACTION_STARTED → TOOL_STARTED
+→ TOOL_COMPLETED → OBSERVATION_COMPLETED → VERIFICATION_PASSED
+→ CHECKPOINT_SAVED → TASK_COMPLETED
+```
+
+ويستمر نفس `task_id` و`correlation_id` بعد restart/resume.
+
+### Metrics and timing
+
+يوفر `ObservabilityMonitor` واجهات داخلية:
+
+```python
+get_task_timeline(task_id)
+get_recent_events(limit)
+get_task_metrics(task_id)
+get_system_metrics()
+get_failures(task_id=None)
+get_security_events(task_id=None)
+get_tool_events(task_id=None)
+```
+
+تشمل metrics counts للمهام/actions/verification/recovery/replan/approvals/tool failures/unknown execution، إضافة إلى planning/action/tool/observation/verification/recovery/task durations. تُقاس durations باستخدام `time.monotonic()`، ولا يُستنتج منها أي ادعاء عن intelligence؛ هي قياسات تشغيلية وتشخيصية فقط.
+
+### Persistence and degraded observability
+
+تُحفظ الأحداث في نفس SQLite عبر:
+
+```text
+observability_events
+```
+
+مع uniqueness على `event_id` وtransactional sequence. إعادة كتابة نفس event ID بالمحتوى نفسه idempotent، أما conflict فيُرفض. لا توجد قاعدة بيانات telemetry ثانية.
+
+السلوك الافتراضي عند فشل كتابة observability هو `degraded`:
+
+- تُسجل العملية في عداد `degraded_writes` واسم الخطأ فقط في الذاكرة.
+- لا تتغير policy أو approval أو execution.
+- لا يُعتبر action ناجحاً بسبب غياب telemetry.
+- لا تُفسد task state ولا تُتجاوز security boundary.
+
+يوجد `fail_mode="raise"` للاختبارات أو البيئات التي تريد جعل فشل telemetry مرئياً صراحة، لكنه ليس الوضع الافتراضي.
+
+### Sensitive-data protection
+
+يمر metadata عبر redaction deterministic قبل persistence. تُحجب مفاتيح مثل:
+
+```text
+api_key, password, token, authorization, credentials
+```
+
+وتُختصر raw `input`/`output`/`payload` إلى النوع وSHA-256، بينما تُنقح Bearer/API-key patterns وتُختصر النصوص الكبيرة. لا يتم تسجيل complete tool inputs/outputs أو authorization headers في observability.
+
+### Security and Phase 8 integration
+
+SecurityController يبقى السلطة الوحيدة. أحداث:
+
+```text
+SECURITY_ALLOW
+SECURITY_DENY
+SECURITY_REQUIRE_APPROVAL
+SECURITY_QUARANTINE
+APPROVAL_REQUESTED
+APPROVAL_APPROVED
+APPROVAL_DENIED
+APPROVAL_EXPIRED
+APPROVAL_INVALIDATED
+```
+
+هي visibility facts فقط؛ لا يفسرها monitor كموافقة ولا يطلق execution منها. كما تُظهر Store أحداث skill candidate/activation/quarantine/rollback/registry دون تعديل isolation أو approval requirements في Phase 8.
+
+تظل security/audit records منفصلة دلالياً عن telemetry العادية، حتى مع استخدام SQLite نفسه، ولا تطبق Phase 11 retention deletion قد يحذف evidence أمنية.
+
+هذه المرحلة لا تنفذ public HTTP API أو Web UI أو PWA أو WhatsApp أو strong sandbox أو billing أو multi-tenant architecture أو LLM provider جديد.
 
 ## الاختبارات
 
@@ -268,4 +379,4 @@ TASK_FAILED
 pytest -q
 ```
 
-تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، Phase 9 capability/risk/policy/approval binding/expiry/denial/cancellation/execution-boundary/audit/sanitization/planner-bypass/recovery-security/learning-security/Phase 8 integration، Phase 10 task creation/checkpoints/normal resume/crash-like interruption/EXECUTION_UNKNOWN/duplicate prevention/idempotency/stale-corruption-version failures/approval persistence and revalidation/policy and capability invalidation/action fingerprint/recovery resume/atomic snapshots/audit lifecycle، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.
+تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، Phase 9 capability/risk/policy/approval binding/expiry/denial/cancellation/execution-boundary/audit/sanitization/planner-bypass/recovery-security/learning-security/Phase 8 integration، Phase 10 task creation/checkpoints/normal resume/crash-like interruption/EXECUTION_UNKNOWN/duplicate prevention/idempotency/stale-corruption-version failures/approval persistence and revalidation/policy and capability invalidation/action fingerprint/recovery resume/atomic snapshots/audit lifecycle، Phase 11 structured schema/validation/ordering/correlation/timeline/metrics/duration/security-approval/tool-verification/recovery-memory-reflection-learning-skill/redaction/persistence/resume continuity/degraded storage/duplicate protection/authority invariants، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.

@@ -167,6 +167,20 @@ class Store:
           approval_id TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
           event_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS observability_events (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          action_id TEXT NOT NULL,
+          step_id TEXT NOT NULL,
+          correlation_id TEXT NOT NULL,
+          component TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          schema_version INTEGER NOT NULL,
+          metadata_json TEXT NOT NULL
+        );
         """)
         self.db.execute(
             "INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?,?)",
@@ -318,7 +332,12 @@ class Store:
             text = f"{row['concept']} {row['content']} {row['domain']}".lower()
             score = sum(term in text for term in terms)
             if score: scored.append((score, dict(row)))
-        return [item for _, item in sorted(scored, key=lambda x: (x[0], x[1]['confidence']), reverse=True)[:limit]]
+        result = [item for _, item in sorted(scored, key=lambda x: (x[0], x[1]['confidence']), reverse=True)[:limit]]
+        self._emit_observability(
+            "MEMORY_RETRIEVED",
+            metadata={"memory_type": "knowledge", "result_count": len(result)},
+        )
+        return result
 
     def recent_episodes(self, limit: int = 10) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM episodes ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()]
@@ -375,6 +394,91 @@ class Store:
         rows = self.db.execute("SELECT * FROM execution_events WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def save_observability_event(self, payload: dict[str, Any]) -> int:
+        """Persist one validated event and return its deterministic sequence number.
+
+        ``event_id`` is unique, so retrying a failed caller cannot duplicate an
+        already persisted event. The insert and sequence allocation are atomic.
+        """
+        metadata_json = json.dumps(payload.get("metadata", {}), ensure_ascii=False, sort_keys=True)
+        with self.db:
+            try:
+                self.db.execute(
+                    """INSERT INTO observability_events
+                    (event_id, event_type, timestamp, task_id, action_id, step_id,
+                     correlation_id, component, severity, schema_version, metadata_json)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        payload["event_id"],
+                        payload["event_type"],
+                        payload["timestamp"],
+                        payload.get("task_id", ""),
+                        payload.get("action_id", ""),
+                        payload.get("step_id", ""),
+                        payload["correlation_id"],
+                        payload["component"],
+                        payload["severity"],
+                        int(payload["schema_version"]),
+                        metadata_json,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                row = self.db.execute(
+                    "SELECT sequence, metadata_json, event_type FROM observability_events WHERE event_id = ?",
+                    (payload["event_id"],),
+                ).fetchone()
+                if row is None or row["metadata_json"] != metadata_json or row["event_type"] != payload["event_type"]:
+                    raise
+                return int(row["sequence"])
+            row = self.db.execute(
+                "SELECT sequence FROM observability_events WHERE event_id = ?",
+                (payload["event_id"],),
+            ).fetchone()
+            if row is None:
+                raise sqlite3.OperationalError("observability_sequence_missing")
+            return int(row["sequence"])
+
+    @staticmethod
+    def _decode_observability_row(row: sqlite3.Row) -> dict[str, Any]:
+        payload = {
+            "sequence": int(row["sequence"]),
+            "event_id": row["event_id"],
+            "event_type": row["event_type"],
+            "timestamp": row["timestamp"],
+            "task_id": row["task_id"],
+            "action_id": row["action_id"],
+            "step_id": row["step_id"],
+            "correlation_id": row["correlation_id"],
+            "component": row["component"],
+            "severity": row["severity"],
+            "schema_version": int(row["schema_version"]),
+        }
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, ValueError):
+            metadata = {"observability_error": "malformed_metadata"}
+        payload["metadata"] = metadata if isinstance(metadata, dict) else {}
+        return payload
+
+    def all_observability_events(self) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM observability_events ORDER BY sequence ASC").fetchall()
+        return [self._decode_observability_row(row) for row in rows]
+
+    def observability_events_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM observability_events WHERE task_id = ? ORDER BY sequence ASC",
+            (task_id,),
+        ).fetchall()
+        return [self._decode_observability_row(row) for row in rows]
+
+    def recent_observability_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 10000))
+        rows = self.db.execute(
+            "SELECT * FROM observability_events ORDER BY sequence DESC LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+        return [self._decode_observability_row(row) for row in reversed(rows)]
+
     def save_experience(self, experience: Any) -> None:
         payload = experience.to_dict() if hasattr(experience, "to_dict") else experience
         self.db.execute(
@@ -382,6 +486,11 @@ class Store:
             (payload["task_id"], payload["goal"], json.dumps(payload, ensure_ascii=False), payload.get("created_at", now())),
         )
         self.db.commit()
+        self._emit_observability(
+            "MEMORY_STORED",
+            task_id=str(payload.get("task_id", "")),
+            metadata={"memory_type": "experience", "action_count": len(payload.get("actions", []))},
+        )
 
     def get_experience(self, task_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM experiences WHERE task_id = ?", (task_id,)).fetchone()
@@ -404,6 +513,10 @@ class Store:
             ),
         )
         self.db.commit()
+        self._emit_observability(
+            "REFLECTION_COMPLETED",
+            metadata={"insight_id": payload.get("insight_id", ""), "confidence": payload.get("confidence", 0.0)},
+        )
 
     def get_reflection(self, insight_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM reflection_insights WHERE insight_id = ?", (insight_id,)).fetchone()
@@ -426,6 +539,10 @@ class Store:
             ),
         )
         self.db.commit()
+        self._emit_observability(
+            "LEARNING_COMPLETED",
+            metadata={"strategy_id": payload.get("strategy_id", ""), "status": payload.get("status", "")},
+        )
 
     def get_learned_strategy(self, strategy_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM learned_strategies WHERE strategy_id = ?", (strategy_id,)).fetchone()
@@ -463,6 +580,15 @@ class Store:
             ),
         )
         self.db.commit()
+        self._emit_observability(
+            "SKILL_CANDIDATE",
+            action_id=str(payload.get("skill_id", "")),
+            metadata={
+                "name": payload.get("name", ""),
+                "version": payload.get("version", 0),
+                "status": payload.get("status", "CANDIDATE"),
+            },
+        )
 
     def get_skill_candidate(self, skill_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM skill_candidates WHERE skill_id = ?", (skill_id,)).fetchone()
@@ -541,6 +667,22 @@ class Store:
             (event_id, skill_id, event_type, json.dumps(event, ensure_ascii=False), stamp),
         )
         self.db.commit()
+        mapping = {
+            "activated": "SKILL_ACTIVATED",
+            "rollback": "SKILL_ROLLED_BACK",
+            "status_changed": "SKILL_REGISTRY_UPDATED",
+            "candidate_rejected_without_overwrite": "SKILL_BLOCKED",
+        }
+        status = str(event.get("status", "")).upper()
+        observability_type = mapping.get(event_type)
+        if status in {"QUARANTINED", "REJECTED", "BLOCKED", "DEGRADED"}:
+            observability_type = "SKILL_BLOCKED"
+        if observability_type:
+            self._emit_observability(
+                observability_type,
+                action_id=skill_id,
+                metadata={"lifecycle_event": event_type, **event},
+            )
 
     def skill_events(self, skill_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute(
@@ -696,6 +838,32 @@ class Store:
             if isinstance(payload, dict):
                 events.append(payload)
         return events
+
+    def _emit_observability(
+        self,
+        event_type: str,
+        *,
+        task_id: str = "",
+        action_id: str = "",
+        step_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        observer = getattr(self, "observability", None)
+        if observer is None:
+            return
+        try:
+            observer.emit(
+                event_type,
+                task_id=task_id,
+                action_id=action_id,
+                step_id=step_id,
+                metadata=metadata or {},
+                component="storage",
+            )
+        except Exception:
+            # ObservabilityMonitor's default is degraded mode. This guard also
+            # protects legacy/custom observers from changing storage semantics.
+            return
 
     def close(self) -> None:
         self.db.close()

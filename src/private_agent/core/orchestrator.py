@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import inspect
+from time import monotonic
 from typing import Any
 
 from private_agent.core.diagnosis import FailureDiagnoser, FailureDiagnosis
@@ -21,6 +22,7 @@ from private_agent.core.task_state import (
     action_fingerprint,
 )
 from private_agent.core.verification import VerificationResult, VerifierRegistry
+from private_agent.observability import ObservabilityMonitor
 from private_agent.storage import KnowledgeItem, Store
 from private_agent.security import PolicyDecision, SecurityController
 from private_agent.tools.research import ToolRegistry
@@ -52,6 +54,7 @@ class Orchestrator:
         learning_engine: LearningEngine | None = None,
         security_controller: SecurityController | None = None,
         checkpoint_hook: Any | None = None,
+        observability: ObservabilityMonitor | None = None,
     ) -> None:
         self.store, self.tools, self.max_attempts = store, tools, max_attempts
         self.approved_permissions = approved_permissions or {"public_read"}
@@ -71,6 +74,29 @@ class Orchestrator:
         self.learning_engine = learning_engine or LearningEngine(self.learning_memory)
         self.security = security_controller
         self.checkpoint_hook = checkpoint_hook
+        self.observability = observability or ObservabilityMonitor(store)
+        if self.security is not None:
+            self.security.set_observability(self.observability)
+
+    def _emit_observability(
+        self,
+        event_type: str,
+        *,
+        task_id: str = "",
+        action_id: str = "",
+        step_id: str = "",
+        severity: str = "INFO",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.observability.emit(
+            event_type,
+            task_id=task_id,
+            action_id=action_id,
+            step_id=step_id,
+            severity=severity,
+            component="orchestrator",
+            metadata=metadata or {},
+        )
 
     def run(
         self,
@@ -109,7 +135,35 @@ class Orchestrator:
                 limit=5,
             )
         ]
-        initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
+        self._emit_observability(
+            "MEMORY_RETRIEVED",
+            task_id=task_id,
+            metadata={
+                "knowledge_count": len(prior),
+                "experience_count": len(retrieved_payload),
+                "reflection_count": len(reflection_context),
+                "learned_strategy_count": len(learned_context),
+            },
+        )
+        planning_started = monotonic()
+        try:
+            initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
+        except Exception as exc:
+            self._emit_observability(
+                "PLAN_REJECTED",
+                task_id=task_id,
+                severity="ERROR",
+                metadata={"error_category": type(exc).__name__},
+            )
+            raise
+        self._emit_observability(
+            "PLAN_CREATED",
+            task_id=task_id,
+            metadata={
+                "step_count": len(initial_plan.steps),
+                "duration_ms": round((monotonic() - planning_started) * 1000, 3),
+            },
+        )
         current_plan = initial_plan
         state.context.update(
             {
@@ -209,10 +263,18 @@ class Orchestrator:
                 metadata={"attempt": rounds},
                 security_controller=self.security,
                 approval_ids={**state.approval_ids, **approval_ids},
+                observability=self.observability,
             )
             for step in pending_steps:
                 self.store.save_event(task_id, "step_started", {"tool_name": step.tool, "round": rounds}, step_id=step.id)
                 key = state.action_key_for_step(step)
+                self._emit_observability(
+                    "ACTION_PROPOSED",
+                    task_id=task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"tool_name": step.tool, "round": rounds},
+                )
                 state.mark_action(
                     key,
                     status="EXECUTING",
@@ -228,6 +290,13 @@ class Orchestrator:
                 state.context["attempts"] = rounds
                 state.checkpoint("BEFORE_EXECUTION", status="EXECUTING", phase="BEFORE_EXECUTION", step_id=step.id)
                 self._save_checkpoint(state, "BEFORE_EXECUTION")
+                self._emit_observability(
+                    "ACTION_STARTED",
+                    task_id=task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"tool_name": step.tool, "round": rounds},
+                )
                 step_result = self._execute_one(step, execution_context)
                 all_step_results.append(step_result)
                 execution_context.previous_results[step.id] = step_result
@@ -266,6 +335,20 @@ class Orchestrator:
                     errors.append(f"{step_result.error.code}: {step_result.error.message}")
                 if outcome.verification_status in {"FAILED", "BLOCKED"}:
                     errors.append(f"verification_{outcome.verification_status.lower()}: {outcome.verification['reason']}")
+
+                self._emit_observability(
+                    "ACTION_COMPLETED" if step_result.status == "success" else "ACTION_BLOCKED" if step_result.status == "blocked" else "ACTION_FAILED",
+                    task_id=task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    severity="INFO" if step_result.status == "success" else "ERROR",
+                    metadata={
+                        "execution_status": step_result.status,
+                        "verification_status": outcome.verification_status,
+                        "error_category": step_result.error.code if step_result.error else "",
+                        "duration_ms": step_result.metadata.get("duration_ms", 0),
+                    },
+                )
 
                 if outcome.verification_status == "VERIFIED" and outcome.execution_status == "success":
                     step.status = "completed"
@@ -314,6 +397,14 @@ class Orchestrator:
                         suggested_recovery="ABORT",
                     )
                     diagnoses.append(diagnosis.to_dict())
+                recovery_started = monotonic()
+                self._emit_observability(
+                    "RECOVERY_STARTED",
+                    task_id=task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"failure_type": diagnosis.failure_type},
+                )
                 decision = self.recovery.choose(
                     step,
                     diagnosis,
@@ -331,9 +422,24 @@ class Orchestrator:
                     self.recovery.update_last(outcome=decision.terminal_status or "FAILED", verification_status=outcome.verification_status)
                     terminal_status = decision.terminal_status or "FAILED"
                     errors.append(decision.reason)
+                    self._emit_observability(
+                        "RECOVERY_COMPLETED",
+                        task_id=task_id,
+                        action_id=step.id,
+                        step_id=step.id,
+                        severity="ERROR",
+                        metadata={"strategy": decision.strategy, "duration_ms": round((monotonic() - recovery_started) * 1000, 3)},
+                    )
                     recovery_requested = False
                     break
 
+                self._emit_observability(
+                    "REPLAN_STARTED",
+                    task_id=task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"strategy": decision.strategy},
+                )
                 try:
                     current_plan = self._apply_decision(current_plan, step, decision, diagnosis, experience)
                 except ReplanError as exc:
@@ -345,6 +451,25 @@ class Orchestrator:
                     break
 
                 state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
+                self._emit_observability(
+                    "PLAN_UPDATED",
+                    task_id=task_id,
+                    metadata={"plan_version": state.plan_version, "step_count": len(current_plan.steps)},
+                )
+                self._emit_observability(
+                    "REPLAN_COMPLETED",
+                    task_id=task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"strategy": decision.strategy, "duration_ms": round((monotonic() - recovery_started) * 1000, 3)},
+                )
+                self._emit_observability(
+                    "RECOVERY_COMPLETED",
+                    task_id=task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"strategy": decision.strategy, "duration_ms": round((monotonic() - recovery_started) * 1000, 3)},
+                )
                 state.recovery_state = {
                     "decision": decision.to_dict(),
                     "diagnosis": diagnosis.to_dict(),
@@ -399,10 +524,37 @@ class Orchestrator:
             state.checkpoint("TASK_FAILED", status="FAILED", phase="TASK_FAILED", successful=False)
             self._save_checkpoint(state, "TASK_FAILED")
         self.experience_memory.store(experience)
+        self._emit_observability(
+            "REFLECTION_STARTED",
+            task_id=task_id,
+            metadata={"action_count": len(experience.actions)},
+        )
         reflection_insights = self.reflection_engine.reflect_for_experience(experience)
         result["reflection_insights"] = [insight.to_dict() for insight in reflection_insights]
+        self._emit_observability(
+            "REFLECTION_COMPLETED",
+            task_id=task_id,
+            metadata={"insight_count": len(reflection_insights)},
+        )
+        self._emit_observability(
+            "LEARNING_STARTED",
+            task_id=task_id,
+            metadata={"insight_count": len(reflection_insights)},
+        )
         learned_strategies = self.learning_engine.learn(reflection_insights)
         result["learned_strategies"] = [strategy.to_dict() for strategy in learned_strategies]
+        self._emit_observability(
+            "LEARNING_COMPLETED",
+            task_id=task_id,
+            metadata={"strategy_count": len(learned_strategies)},
+        )
+        if not learned_strategies:
+            self._emit_observability(
+                "LEARNING_REJECTED",
+                task_id=task_id,
+                severity="NOTICE",
+                metadata={"reason": "no_eligible_strategy", "insight_count": len(reflection_insights)},
+            )
         storage_status = {
             "COMPLETED": "completed",
             "BLOCKED": "blocked",
@@ -480,6 +632,15 @@ class Orchestrator:
             "security_action_blocked",
             {"decisions": result["security_decisions"], "approval_requests": approval_requests},
         )
+        self._emit_observability(
+            "TASK_BLOCKED",
+            task_id=task_id,
+            severity="ERROR",
+            metadata={
+                "reason": "security_policy_blocked",
+                "blocked_action_count": len(decisions),
+            },
+        )
         if state is not None:
             state.result = result
             state.context["attempts"] = 0
@@ -513,10 +674,18 @@ class Orchestrator:
 
         if state.status in TERMINAL_STATUSES:
             self._audit_task_event(state, "TASK_RESUMED", "Terminal task state reloaded without re-execution")
+            if self.security is None:
+                self._emit_observability(
+                    "TASK_RESUMED",
+                    task_id=state.task_id,
+                    metadata={"terminal_state": True},
+                )
             return state.result or self._resume_failure(task_id, "terminal_state_missing_result")
 
         self.recovery.attempts.clear()
         self._audit_task_event(state, "TASK_RESUMED", "Task state loaded after process restart")
+        if self.security is None:
+            self._emit_observability("TASK_RESUMED", task_id=state.task_id, metadata={"terminal_state": False})
         state.context["resume_count"] = int(state.context.get("resume_count", 0)) + 1
         state.approval_ids.update(approval_ids)
 
@@ -538,6 +707,15 @@ class Orchestrator:
                 state.touch()
                 self._save_checkpoint(state, "EXECUTION_UNKNOWN")
                 self._audit_task_event(state, "EXECUTION_UNKNOWN", "External side effect may have occurred")
+                if self.security is None:
+                    self._emit_observability(
+                        "EXECUTION_UNKNOWN",
+                        task_id=state.task_id,
+                        action_id=record.get("step_id", ""),
+                        step_id=record.get("step_id", ""),
+                        severity="ERROR",
+                        metadata={"reason": "external_side_effect_may_have_occurred"},
+                    )
                 resolution = unknown_resolutions.get(key) or unknown_resolutions.get(record.get("step_id", ""))
                 if resolution is None:
                     return self._resume_blocked(state, "ambiguous_execution_state_requires_observation")
@@ -707,10 +885,18 @@ class Orchestrator:
                 metadata={"attempt": rounds, "goal": state.goal},
                 security_controller=self.security,
                 approval_ids=state.approval_ids,
+                observability=self.observability,
             )
             for step in pending_steps:
                 key = state.action_key_for_step(step)
                 record = state.action_records.get(key, {})
+                self._emit_observability(
+                    "ACTION_PROPOSED",
+                    task_id=state.task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
+                )
                 if record.get("status") == "OBSERVING" and isinstance(record.get("output"), dict):
                     step_result = self._step_result_from_dict(record["output"])
                     if step_result is None:
@@ -731,6 +917,13 @@ class Orchestrator:
                     state.context["attempts"] = rounds
                     state.checkpoint("BEFORE_EXECUTION", status="EXECUTING", phase="BEFORE_EXECUTION", step_id=step.id)
                     self._save_checkpoint(state, "BEFORE_EXECUTION")
+                    self._emit_observability(
+                        "ACTION_STARTED",
+                        task_id=state.task_id,
+                        action_id=step.id,
+                        step_id=step.id,
+                        metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
+                    )
                     step_result = self._execute_one(step, context)
                     state.mark_action(
                         key,
@@ -763,6 +956,20 @@ class Orchestrator:
                     errors.append(f"{step_result.error.code}: {step_result.error.message}")
                 if outcome.verification_status in {"FAILED", "BLOCKED"}:
                     errors.append(f"verification_{outcome.verification_status.lower()}: {outcome.verification['reason']}")
+                self._emit_observability(
+                    "ACTION_COMPLETED" if step_result.status == "success" else "ACTION_BLOCKED" if step_result.status == "blocked" else "ACTION_FAILED",
+                    task_id=state.task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    severity="INFO" if step_result.status == "success" else "ERROR",
+                    metadata={
+                        "execution_status": step_result.status,
+                        "verification_status": outcome.verification_status,
+                        "error_category": step_result.error.code if step_result.error else "",
+                        "duration_ms": step_result.metadata.get("duration_ms", 0),
+                        "resumed": True,
+                    },
+                )
                 if outcome.verification_status == "VERIFIED" and outcome.execution_status == "success":
                     state.mark_action(
                         key,
@@ -801,6 +1008,14 @@ class Orchestrator:
                         "UNKNOWN_FAILURE", "No diagnosis was produced for an unsuccessful step",
                         failed_step=step.id, tool_name=step.tool, recoverable=False, suggested_recovery="ABORT",
                     )
+                recovery_started = monotonic()
+                self._emit_observability(
+                    "RECOVERY_STARTED",
+                    task_id=state.task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"failure_type": diagnosis.failure_type, "resumed": True},
+                )
                 decision = self.recovery.choose(
                     step, diagnosis, available_tools=self.tools.describe(), allow_replan=self.replanner.provider is not None
                 )
@@ -809,7 +1024,22 @@ class Orchestrator:
                     self.recovery.update_last(outcome=decision.terminal_status or "FAILED", verification_status=outcome.verification_status)
                     terminal_status = decision.terminal_status or "FAILED"
                     errors.append(decision.reason)
+                    self._emit_observability(
+                        "RECOVERY_COMPLETED",
+                        task_id=state.task_id,
+                        action_id=step.id,
+                        step_id=step.id,
+                        severity="ERROR",
+                        metadata={"strategy": decision.strategy, "duration_ms": round((monotonic() - recovery_started) * 1000, 3), "resumed": True},
+                    )
                     break
+                self._emit_observability(
+                    "REPLAN_STARTED",
+                    task_id=state.task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"strategy": decision.strategy, "resumed": True},
+                )
                 try:
                     current_plan = self._apply_decision(current_plan, step, decision, diagnosis, experience)
                 except ReplanError as exc:
@@ -817,6 +1047,25 @@ class Orchestrator:
                     errors.append(str(exc))
                     break
                 state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
+                self._emit_observability(
+                    "PLAN_UPDATED",
+                    task_id=state.task_id,
+                    metadata={"plan_version": state.plan_version, "step_count": len(current_plan.steps), "resumed": True},
+                )
+                self._emit_observability(
+                    "REPLAN_COMPLETED",
+                    task_id=state.task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"strategy": decision.strategy, "duration_ms": round((monotonic() - recovery_started) * 1000, 3), "resumed": True},
+                )
+                self._emit_observability(
+                    "RECOVERY_COMPLETED",
+                    task_id=state.task_id,
+                    action_id=step.id,
+                    step_id=step.id,
+                    metadata={"strategy": decision.strategy, "duration_ms": round((monotonic() - recovery_started) * 1000, 3), "resumed": True},
+                )
                 state.recovery_state = {"decision": decision.to_dict(), "diagnosis": diagnosis.to_dict(), "round": rounds}
                 state.checkpoint("AFTER_RECOVERY", status="READY", phase="AFTER_RECOVERY", step_id=step.id, successful=True)
                 self._save_checkpoint(state, "AFTER_RECOVERY")
@@ -864,10 +1113,37 @@ class Orchestrator:
             state.checkpoint("TASK_FAILED", status="FAILED", phase="TASK_FAILED")
             self._save_checkpoint(state, "TASK_FAILED")
         self.experience_memory.store(experience)
+        self._emit_observability(
+            "REFLECTION_STARTED",
+            task_id=state.task_id,
+            metadata={"action_count": len(experience.actions), "resumed": True},
+        )
         reflection_insights = self.reflection_engine.reflect_for_experience(experience)
         result["reflection_insights"] = [insight.to_dict() for insight in reflection_insights]
+        self._emit_observability(
+            "REFLECTION_COMPLETED",
+            task_id=state.task_id,
+            metadata={"insight_count": len(reflection_insights), "resumed": True},
+        )
+        self._emit_observability(
+            "LEARNING_STARTED",
+            task_id=state.task_id,
+            metadata={"insight_count": len(reflection_insights), "resumed": True},
+        )
         learned_strategies = self.learning_engine.learn(reflection_insights)
         result["learned_strategies"] = [strategy.to_dict() for strategy in learned_strategies]
+        self._emit_observability(
+            "LEARNING_COMPLETED",
+            task_id=state.task_id,
+            metadata={"strategy_count": len(learned_strategies), "resumed": True},
+        )
+        if not learned_strategies:
+            self._emit_observability(
+                "LEARNING_REJECTED",
+                task_id=state.task_id,
+                severity="NOTICE",
+                metadata={"reason": "no_eligible_strategy", "resumed": True},
+            )
         state.result = result
         state.touch()
         self._save_checkpoint(state, "TASK_COMPLETED" if terminal_status == "COMPLETED" else "TASK_FAILED")
@@ -913,6 +1189,14 @@ class Orchestrator:
         )
         self._save_checkpoint(state, "RESUME_BLOCKED")
         self._audit_task_event(state, "RESUME_BLOCKED", reason)
+        if self.security is None:
+            self._emit_observability(
+                "RESUME_BLOCKED",
+                task_id=state.task_id,
+                step_id=state.current_step,
+                severity="ERROR",
+                metadata={"reason": reason},
+            )
         return result
 
     def _resume_failure(self, task_id: str, reason: str) -> dict[str, Any]:
@@ -985,7 +1269,6 @@ class Orchestrator:
     def _save_checkpoint(self, state: TaskState, checkpoint_type: str) -> None:
         state.validate()
         self.store.save_task_state(state, checkpoint_type)
-        self._audit_task_event(state, "CHECKPOINT_SAVED", checkpoint_type)
         special_events = {
             "TASK_CREATED": "TASK_CREATED",
             "TASK_COMPLETED": "TASK_COMPLETED",
@@ -996,6 +1279,26 @@ class Orchestrator:
         special_event = special_events.get(checkpoint_type)
         if special_event:
             self._audit_task_event(state, special_event, checkpoint_type)
+        self._audit_task_event(state, "CHECKPOINT_SAVED", checkpoint_type)
+        if self.security is None:
+            if special_event:
+                self._emit_observability(
+                    special_event,
+                    task_id=state.task_id,
+                    step_id=state.current_step,
+                    severity="ERROR" if special_event == "TASK_FAILED" else "INFO",
+                    metadata={"checkpoint_type": checkpoint_type},
+                )
+            self._emit_observability(
+                "CHECKPOINT_SAVED",
+                task_id=state.task_id,
+                step_id=state.current_step,
+                metadata={
+                    "checkpoint_type": checkpoint_type,
+                    "state_version": state.state_version,
+                    "state_fingerprint": state.state_fingerprint,
+                },
+            )
         if self.checkpoint_hook is not None:
             self.checkpoint_hook(checkpoint_type, state.to_dict())
 
@@ -1051,15 +1354,54 @@ class Orchestrator:
         experience: ExperienceRecord,
     ) -> tuple[StepOutcome, FailureDiagnosis | None, ExperienceAction | None]:
         self.store.save_event(task_id, "tool_executed", {"round": round_number, **step_result.to_dict()}, step_id=step.id)
+        observation_started = monotonic()
+        self._emit_observability(
+            "OBSERVATION_STARTED",
+            task_id=task_id,
+            action_id=step.id,
+            step_id=step.id,
+            metadata={"tool_name": step.tool},
+        )
         observation = Observation.from_step_result(task_id, step_result)
         self.store.save_observation(observation)
         self.store.save_event(task_id, "observation_created", observation.to_dict(), step_id=step.id)
+        self._emit_observability(
+            "OBSERVATION_COMPLETED",
+            task_id=task_id,
+            action_id=step.id,
+            step_id=step.id,
+            metadata={
+                "tool_name": step.tool,
+                "execution_status": step_result.status,
+                "duration_ms": round((monotonic() - observation_started) * 1000, 3),
+            },
+        )
         verifier_name = self._verifier_for_step(step.tool, step.verifier)
         criteria = self._criteria_for_step(step.tool, step.success_criteria)
         self.store.save_event(task_id, "verification_started", {"verifier": verifier_name, "criteria": criteria}, step_id=step.id)
+        verification_started = monotonic()
+        self._emit_observability(
+            "VERIFICATION_STARTED",
+            task_id=task_id,
+            action_id=step.id,
+            step_id=step.id,
+            metadata={"verifier": verifier_name},
+        )
         verification = self.verifiers.verify(verifier_name, observation, criteria)
         self.store.save_verification(task_id, step.id, step.tool, verification)
         self.store.save_event(task_id, "verification_completed", verification.to_dict(), step_id=step.id)
+        self._emit_observability(
+            "VERIFICATION_PASSED" if verification.status == "VERIFIED" else "VERIFICATION_FAILED",
+            task_id=task_id,
+            action_id=step.id,
+            step_id=step.id,
+            severity="INFO" if verification.status == "VERIFIED" else "ERROR",
+            metadata={
+                "status": verification.status,
+                "evidence_count": len(verification.evidence),
+                "duration_ms": round((monotonic() - verification_started) * 1000, 3),
+            },
+        )
         outcome = StepOutcome(
             task_id=task_id,
             step_id=step.id,
