@@ -19,6 +19,9 @@ SEVERITIES = {"DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL"}
 # into timeline events that later code would mistake for lifecycle facts.
 EVENT_TYPES = frozenset(
     {
+        "API_REQUEST_STARTED",
+        "API_REQUEST_COMPLETED",
+        "API_REQUEST_FAILED",
         "TASK_CREATED",
         "TASK_RESUMED",
         "TASK_COMPLETED",
@@ -81,6 +84,7 @@ EVENT_TYPES = frozenset(
 
 _FAILURE_EVENTS = frozenset(
     {
+        "API_REQUEST_FAILED",
         "TASK_FAILED",
         "TASK_BLOCKED",
         "PLAN_REJECTED",

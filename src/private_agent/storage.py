@@ -181,6 +181,13 @@ class Store:
           schema_version INTEGER NOT NULL,
           metadata_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS api_idempotency_keys (
+          idempotency_key TEXT PRIMARY KEY,
+          request_fingerprint TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          response_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         """)
         self.db.execute(
             "INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?,?)",
@@ -192,6 +199,26 @@ class Store:
         stamp = now()
         self.db.execute("INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
             (task_id, goal, status, json.dumps(plan), json.dumps(result), attempts, stamp, stamp))
+        self.db.commit()
+
+    def get_api_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT idempotency_key, request_fingerprint, task_id, response_json, created_at FROM api_idempotency_keys WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_api_idempotency(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+        task_id: str,
+        response_json: str,
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO api_idempotency_keys (idempotency_key, request_fingerprint, task_id, response_json, created_at) VALUES (?,?,?,?,?)",
+            (idempotency_key, request_fingerprint, task_id, response_json, now()),
+        )
         self.db.commit()
 
     def save_task_state(self, state: Any, checkpoint_type: str, *, task_status: str | None = None) -> None:

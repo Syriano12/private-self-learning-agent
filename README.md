@@ -371,7 +371,98 @@ APPROVAL_INVALIDATED
 
 تظل security/audit records منفصلة دلالياً عن telemetry العادية، حتى مع استخدام SQLite نفسه، ولا تطبق Phase 11 retention deletion قد يحذف evidence أمنية.
 
-هذه المرحلة لا تنفذ public HTTP API أو Web UI أو PWA أو WhatsApp أو strong sandbox أو billing أو multi-tenant architecture أو LLM provider جديد.
+هذه المرحلة لا تنفذ Web UI أو PWA أو WhatsApp أو strong sandbox أو billing أو multi-tenant architecture أو LLM provider جديد.
+
+## Phase 12 — Stable Agent API
+
+تمت إضافة طبقة API رقيقة في `private_agent.api` فوق الـAgent Core الموجود. المسار التشغيلي هو:
+
+```text
+HTTP Request
+→ request id + typed validation
+→ Bearer authentication
+→ single-owner authorization
+→ AgentAPIService
+→ Orchestrator / Store / SecurityController / ObservabilityMonitor
+```
+
+لا تنشئ routes Planner أو Executor أو Security أو persistence أو telemetry جديدة، ولا تنقل business logic إلى HTTP handlers.
+
+### Authentication and authorization
+
+تتطلب كل مسارات `/api/v1/...` و`POST /tasks/run`:
+
+```http
+Authorization: Bearer <AGENT_API_TOKEN>
+```
+
+يُقرأ `AGENT_API_TOKEN` من environment/configuration فقط. لا يوجد token افتراضي، ولا bypass لقيم مثل `True` أو `admin` أو `secret` أو `test`. الطلب المفقود أو malformed أو غير الصحيح يعيد `401`، وغياب الإعداد يجعل readiness `503`.
+
+المصادقة منفصلة عن authorization. Phase 12 هو single-owner فقط؛ لا يضيف fake multi-tenancy. بعد المصادقة يستطيع المالك قراءة موارده المحلية، لكن `SecurityController` يظل السلطة الوحيدة للـcapabilities/risk/approval/quarantine، ويُعاد فحص security عند execution boundary كما في Phase 9.
+
+### Endpoints
+
+| Method | Endpoint | الوظيفة |
+|---|---|---|
+| GET | `/health` | liveness رخيص وغير مصادق عليه |
+| GET | `/ready` | فحص auth configuration وSQLite والجداول المطلوبة؛ يعيد `503` عند الفشل |
+| POST | `/api/v1/tasks` | تشغيل هدف عبر `Orchestrator` وإرجاع persisted task summary |
+| GET | `/api/v1/tasks/{task_id}` | قراءة typed safe task state |
+| POST | `/api/v1/tasks/{task_id}/resume` | استدعاء `Orchestrator.resume_task` فقط |
+| GET | `/api/v1/tasks/{task_id}/timeline` | timeline مرتب بـSQLite sequence |
+| GET | `/api/v1/tasks/{task_id}/metrics` | metrics للمهمة |
+| GET | `/api/v1/approvals` | pending approvals افتراضياً؛ `pending_only=false` لعرض الحالات الأخرى |
+| GET | `/api/v1/approvals/{approval_id}` | قراءة approval binding بصورة آمنة |
+| POST | `/api/v1/approvals/{approval_id}/approve` | موافقة على request الموجود فقط |
+| POST | `/api/v1/approvals/{approval_id}/deny` | رفض request الموجود فقط |
+| GET | `/api/v1/metrics` | system metrics |
+| GET | `/api/v1/failures` | failure events، مع `task_id` اختياري |
+| GET | `/api/v1/security-events` | policy/approval/security visibility، مع `task_id` اختياري |
+| GET | `/api/v1/tool-events` | tool lifecycle events، مع `task_id` اختياري |
+| GET | `/api/v1/tools` | وصف typed للـtools المتاحة |
+
+لا يوجد endpoint cancel في هذه المرحلة: Core لا يقدم cancellation آمنًا قابلاً للحفظ والاستئناف، ولذلك لا يتم fake support له. ولا يوجد endpoint لتفعيل skill أو تجاوز quarantine.
+
+إنشاء task synchronous لأن الـCore الحالي يقدم `Orchestrator.run` متزامناً ولا يقدم queue/worker API. الاستجابة لا تفترض completion: status وphase مأخوذان من TaskState المحفوظ فعلياً؛ high-risk task يعود `WAITING_APPROVAL` بدلاً من تنفيذ الشبكة تلقائياً.
+
+### Typed responses and redaction
+
+الاستجابات تستخدم Pydantic models ولا تعيد SQLite rows أو `TaskState` الخام. Task state يعرض status/phase/step/plan version/action summaries/recovery/verification/checkpoint/approval state والتواريخ، لكنه لا يعرض plan inputs أو tool outputs أو authorization headers أو secrets.
+
+كل خطأ له الشكل:
+
+```json
+{
+  "error_code": "task_not_found",
+  "message": "Task was not found",
+  "request_id": "...",
+  "task_id": "...",
+  "approval_id": "",
+  "api_version": "v1",
+  "schema_version": 1
+}
+```
+
+تُستخدم `400` للمعرّفات/headers غير الصالحة، `401` للمصادقة، `404` للموارد غير الموجودة، `409` لتعارض الحالة/Idempotency/approval، `422` لفشل schema validation، `500` لخطأ داخلي برسالة عامة، و`503` لعدم الجاهزية. لا تُعاد stack traces أو environment variables أو raw exceptions.
+
+### Resume and approvals
+
+`POST /api/v1/tasks/{task_id}/resume` يمرر الطلب إلى `resume_task` الموجود. لا يوجد retry بديل في API. حالة `EXECUTION_UNKNOWN` تبقى محظورة حتى observation/verification الصريحين وفق Phase 10، مع security/approval revalidation عند التنفيذ.
+
+Approval endpoints لا تقبل تعديل `task_id` أو `action_id` أو capabilities أو risk أو fingerprint أو policy version أو expiry. جسم approve/deny لا يحتوي binding fields؛ القرار يطبق على الطلب المحفوظ فقط، ثم يبقى execution-boundary check إلزامياً.
+
+### Idempotency and concurrency
+
+- `POST /api/v1/tasks` يدعم `Idempotency-Key` اختيارياً، ويخزن fingerprint وtask ID في جدول `api_idempotency_keys`. إعادة نفس key ونفس goal لا تنفذ مرة ثانية؛ إعادة استخدامه مع goal مختلف تعيد `409`.
+- approve/deny لا يعيدان تغيير approval غير `PENDING`، والإعادة الآمنة تعيد `409` بدلاً من تنفيذ شيء إضافي.
+- resume محمي بـlock مشترك داخل `AgentAPIService`؛ طلبات resume/approval المتزامنة تُسلسل ولا تضيف retry عام. Phase 12 يستهدف process API واحداً في single-owner deployment؛ SQLite يبقى مصدر persistence عند restart.
+- كل response يحمل `X-Request-ID`، ويُستخدم نفس identifier كـPhase 11 `correlation_id` في API request events. لا تُحفظ credentials في event metadata.
+
+### API documentation and limits
+
+FastAPI يوفر OpenAPI/Swagger على `/docs` و`/openapi.json`. هذا API contract منفصل عن internal commit/phase versions، ويعرض `api_version` و`schema_version` في الاستجابات.
+
+هذه المرحلة لا تضيف async job queue، cancellation، public UI/PWA، WhatsApp، payment/billing، multi-tenancy، commercial licensing، new LLM provider، scanners، exploitation، أو strong sandbox.
 
 ## الاختبارات
 
@@ -379,4 +470,4 @@ APPROVAL_INVALIDATED
 pytest -q
 ```
 
-تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، Phase 9 capability/risk/policy/approval binding/expiry/denial/cancellation/execution-boundary/audit/sanitization/planner-bypass/recovery-security/learning-security/Phase 8 integration، Phase 10 task creation/checkpoints/normal resume/crash-like interruption/EXECUTION_UNKNOWN/duplicate prevention/idempotency/stale-corruption-version failures/approval persistence and revalidation/policy and capability invalidation/action fingerprint/recovery resume/atomic snapshots/audit lifecycle، Phase 11 structured schema/validation/ordering/correlation/timeline/metrics/duration/security-approval/tool-verification/recovery-memory-reflection-learning-skill/redaction/persistence/resume continuity/degraded storage/duplicate protection/authority invariants، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.
+تغطي الاختبارات الاستجابة المنظمة، أخطاء JSON، 429 و5xx، إخفاء مفتاح API، التحقق من الخطط، التنفيذ الديناميكي، Observation/Verification، diagnosis/recovery/replanning، Experience Retrieval، Reflection patterns/confidence، LearningEngine، التعلم التزايدي، الأدلة المتعارضة والسلبية، Phase 8 AST/contract/mutation/sandbox/verification/approval/versioning/rollback، Phase 9 capability/risk/policy/approval binding/expiry/denial/cancellation/execution-boundary/audit/sanitization/planner-bypass/recovery-security/learning-security/Phase 8 integration، Phase 10 task creation/checkpoints/normal resume/crash-like interruption/EXECUTION_UNKNOWN/duplicate prevention/idempotency/stale-corruption-version failures/approval persistence and revalidation/policy and capability invalidation/action fingerprint/recovery resume/atomic snapshots/audit lifecycle، Phase 11 structured schema/validation/ordering/correlation/timeline/metrics/duration/security-approval/tool-verification/recovery-memory-reflection-learning-skill/redaction/persistence/resume continuity/degraded storage/duplicate protection/authority invariants، Phase 12 authentication/validation/typed task state/idempotency/resume unknown/approval binding/expiry/deny/security boundary/timeline ordering/metrics/request correlation/redaction/restart/concurrency/readiness/error model، الاستمرارية عبر إعادة التشغيل، والإثباتات السلوكية Candidate A/B/C وحماية الأسرار.
