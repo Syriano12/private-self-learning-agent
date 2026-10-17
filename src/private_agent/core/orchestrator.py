@@ -62,7 +62,11 @@ class Orchestrator:
         self.security = security_controller or SecurityController(store=store)
         if executor is not None:
             raise TypeError("unsupported_executor: production execution owns GenericExecutor")
-        self.executor = executor or GenericExecutor(tools, security_controller=self.security)
+        self.executor = executor or GenericExecutor(
+            tools,
+            security_controller=self.security,
+            lease_store=store,
+        )
         self.verifiers = verifiers or VerifierRegistry()
         self.diagnoser = diagnoser or FailureDiagnoser()
         self.recovery = recovery_manager or RecoveryManager(
@@ -108,7 +112,7 @@ class Orchestrator:
     ) -> dict[str, Any]:
         if task_id:
             existing_state = self.store.get_task_state(task_id)
-            if existing_state is not None:
+            if existing_state is not None and existing_state.get("status") != "QUEUED":
                 return self.resume_task(task_id, approval_ids=approval_ids)
         task_id = task_id or str(uuid.uuid4())
         approval_ids = approval_ids or {}

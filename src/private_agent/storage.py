@@ -2,15 +2,27 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_queue_time(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise QueueLeaseLost("invalid_queue_lease_timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass
@@ -43,13 +55,82 @@ class UnsupportedSchemaVersion(RuntimeError):
     """Raised when a database is newer than this application understands."""
 
 
+class QueueLeaseLost(RuntimeError):
+    """Raised when a worker tries to write after losing its queue lease."""
+
+
 class Store:
     def __init__(self, path: str | Path = "data/agent.sqlite3") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self._lease_local = threading.local()
         self.init_schema()
+
+    @contextmanager
+    def lease_context(self, task_id: str, lease_id: str, worker_id: str):
+        """Bind a claim to this thread while Orchestrator persists its checkpoints."""
+        previous = getattr(self._lease_local, "claim", None)
+        self._lease_local.claim = (str(task_id), str(lease_id), str(worker_id))
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del self._lease_local.claim
+                except AttributeError:
+                    pass
+            else:
+                self._lease_local.claim = previous
+
+    def _active_lease(self) -> tuple[str, str, str] | None:
+        claim = getattr(self._lease_local, "claim", None)
+        return claim if isinstance(claim, tuple) and len(claim) == 3 else None
+
+    def has_active_lease_context(self, task_id: str) -> bool:
+        """Return whether this thread is executing under the task's lease context."""
+        claim = self._active_lease()
+        return bool(claim is not None and claim[0] == str(task_id))
+
+    def _assert_active_lease(self, task_id: str) -> None:
+        """Fence all state/result writes for queue-managed tasks."""
+        row = self.db.execute(
+            "SELECT queue_status, lease_id, worker_id, lease_expires_at FROM task_queue WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        claim = self._active_lease()
+        if claim is None:
+            raise QueueLeaseLost(f"queue_lease_required:{task_id}")
+        claimed_task, lease_id, worker_id = claim
+        if claimed_task != task_id or row["queue_status"] != "LEASED" or row["lease_id"] != lease_id or row["worker_id"] != worker_id:
+            raise QueueLeaseLost(f"queue_lease_lost:{task_id}")
+        if not row["lease_expires_at"] or _parse_queue_time(row["lease_expires_at"]) <= datetime.now(timezone.utc):
+            raise QueueLeaseLost(f"queue_lease_expired:{task_id}")
+
+    def assert_active_lease(self, task_id: str) -> None:
+        """Check the current lease immediately before an external side effect."""
+        self._assert_active_lease(str(task_id))
+
+    @contextmanager
+    def _lease_write(self, task_id: str | None = None):
+        """Run one sensitive write under a transaction-scoped lease check.
+
+        ``BEGIN IMMEDIATE`` makes the lease check and the following write one
+        serialization point.  A stale worker therefore cannot check a lease,
+        lose it to recovery, and then commit a checkpoint or event afterward.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if task_id:
+                self._assert_active_lease(str(task_id))
+            yield
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     @staticmethod
     def _required_objects(version: int) -> tuple[tuple[str, str], ...]:
@@ -479,9 +560,9 @@ class Store:
 
     def save_task(self, task_id: str, goal: str, status: str, plan: Any, result: Any, attempts: int) -> None:
         stamp = now()
-        self.db.execute("INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
-            (task_id, goal, status, json.dumps(plan), json.dumps(result), attempts, stamp, stamp))
-        self.db.commit()
+        with self._lease_write(task_id):
+            self.db.execute("INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?,?,?)",
+                (task_id, goal, status, json.dumps(plan), json.dumps(result), attempts, stamp, stamp))
 
     def get_api_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
         row = self.db.execute(
@@ -509,9 +590,12 @@ class Store:
         checkpoint_type: str,
         *,
         task_status: str | None = None,
+        enforce_lease: bool = True,
     ) -> None:
         """Persist one state snapshot while the caller owns the transaction."""
         task_id = str(payload["task_id"])
+        if enforce_lease:
+            self._assert_active_lease(task_id)
         status = str(task_status or payload["status"])
         created_at = str(payload["created_at"])
         updated_at = str(payload["updated_at"])
@@ -594,7 +678,7 @@ class Store:
     def save_task_state(self, state: Any, checkpoint_type: str, *, task_status: str | None = None) -> None:
         """Persist state, checkpoint and action records in one SQLite transaction."""
         payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
-        with self.db:
+        with self._lease_write(str(payload["task_id"])):
             self._persist_task_state_in_transaction(payload, checkpoint_type, task_status=task_status)
 
     def create_queued_task(
@@ -687,6 +771,416 @@ class Store:
             self.db.rollback()
             raise
 
+    @staticmethod
+    def _queue_status_for_task_status(status: str) -> str:
+        return {
+            "COMPLETED": "COMPLETED",
+            "FAILED": "FAILED",
+            "BLOCKED": "BLOCKED",
+            "WAITING_APPROVAL": "WAITING_APPROVAL",
+            "EXECUTION_UNKNOWN": "EXECUTION_UNKNOWN",
+        }.get(status, "FAILED")
+
+    def _mark_expired_lease_in_transaction(self, row: sqlite3.Row, stamp: str) -> dict[str, Any]:
+        """Fence an expired worker and conservatively persist an unknown outcome."""
+        from private_agent.core.task_state import TERMINAL_STATUSES, TaskState
+
+        task_id = str(row["task_id"])
+        state_row = self.db.execute(
+            "SELECT state_json FROM task_states WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        queue_status = "EXECUTION_UNKNOWN"
+        error_code = "lease_expired_execution_unknown"
+        if state_row is not None:
+            state = TaskState.from_dict(json.loads(state_row["state_json"]))
+            if state.status in TERMINAL_STATUSES:
+                queue_status = self._queue_status_for_task_status(state.status)
+                error_code = "lease_expired_after_terminal_state"
+            elif state.status == "WAITING_APPROVAL":
+                # The Orchestrator can finish planning with approval pending
+                # before the worker manages to release its lease.
+                queue_status = "WAITING_APPROVAL"
+                error_code = "lease_expired_waiting_approval"
+            else:
+                state.recovery_state = {
+                    **state.recovery_state,
+                    "reason": "worker_lease_expired",
+                    "external_side_effect_may_have_occurred": True,
+                }
+                if state.status != "EXECUTION_UNKNOWN":
+                    state.checkpoint(
+                        "EXECUTION_UNKNOWN",
+                        status="EXECUTION_UNKNOWN",
+                        phase="EXECUTION_UNKNOWN",
+                        successful=False,
+                    )
+                else:
+                    state.touch()
+                self._persist_task_state_in_transaction(
+                    state.to_dict(),
+                    "EXECUTION_UNKNOWN",
+                    task_status="EXECUTION_UNKNOWN",
+                    enforce_lease=False,
+                )
+
+        updated = self.db.execute(
+            """UPDATE task_queue
+               SET queue_status = ?, lease_id = '', worker_id = '',
+                   lease_acquired_at = '', lease_expires_at = '',
+                   last_finished_at = ?, last_error_code = ?,
+                   last_error_message = ?, updated_at = ?
+             WHERE task_id = ? AND queue_status = 'LEASED' AND lease_id = ?""",
+            (
+                queue_status,
+                stamp,
+                error_code,
+                "Worker lease expired; automatic retry is disabled for safety",
+                stamp,
+                task_id,
+                str(row["lease_id"]),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise QueueLeaseLost(f"expired_lease_fencing_failed:{task_id}")
+        return {
+            "kind": "EXECUTION_UNKNOWN" if queue_status == "EXECUTION_UNKNOWN" else queue_status,
+            "task_id": task_id,
+            "queue_status": queue_status,
+            "error_code": error_code,
+        }
+
+    def claim_next_task(self, worker_id: str, *, lease_ttl_seconds: int = 60) -> dict[str, Any] | None:
+        """Atomically claim one runnable task or recover one expired lease."""
+        worker_id = str(worker_id).strip()
+        if not worker_id:
+            raise ValueError("worker_id_required")
+        if lease_ttl_seconds < 1:
+            raise ValueError("lease_ttl_invalid")
+        stamp = now()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=int(lease_ttl_seconds))).isoformat()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            expired = self.db.execute(
+                """SELECT * FROM task_queue
+                   WHERE queue_status = 'LEASED'
+                     AND lease_expires_at <> ''
+                     AND lease_expires_at <= ?
+                   ORDER BY lease_expires_at, task_id
+                   LIMIT 1""",
+                (stamp,),
+            ).fetchone()
+            if expired is not None:
+                recovered = self._mark_expired_lease_in_transaction(expired, stamp)
+                self.db.commit()
+                return recovered
+
+            candidate = self.db.execute(
+                """SELECT * FROM task_queue
+                   WHERE queue_status IN ('QUEUED', 'RETRY_WAIT')
+                     AND available_at <= ?
+                     AND attempt_count < max_attempts
+                   ORDER BY available_at, created_at, task_id
+                   LIMIT 1""",
+                (stamp,),
+            ).fetchone()
+            if candidate is None:
+                self.db.commit()
+                return None
+
+            lease_id = str(uuid.uuid4())
+            updated = self.db.execute(
+                """UPDATE task_queue
+                   SET queue_status = 'LEASED', attempt_count = attempt_count + 1,
+                       lease_id = ?, worker_id = ?, lease_acquired_at = ?,
+                       lease_expires_at = ?, last_started_at = ?, updated_at = ?
+                 WHERE task_id = ? AND queue_status IN ('QUEUED', 'RETRY_WAIT')
+                   AND available_at <= ? AND attempt_count < max_attempts""",
+                (lease_id, worker_id, stamp, expires, stamp, stamp, candidate["task_id"], stamp),
+            )
+            if updated.rowcount != 1:
+                raise QueueLeaseLost(f"queue_claim_lost:{candidate['task_id']}")
+            task_row = self.db.execute(
+                "SELECT state_json FROM task_states WHERE task_id = ?",
+                (candidate["task_id"],),
+            ).fetchone()
+            if task_row is None:
+                raise UnsupportedSchemaVersion(f"queue_task_state_missing:{candidate['task_id']}")
+            try:
+                task_payload = json.loads(task_row["state_json"])
+                goal = str(task_payload["goal"])
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnsupportedSchemaVersion(f"queue_task_state_invalid:{candidate['task_id']}") from exc
+            self.db.commit()
+            return {
+                "kind": "CLAIMED",
+                "task_id": str(candidate["task_id"]),
+                "goal": goal,
+                "lease_id": lease_id,
+                "worker_id": worker_id,
+                "attempt_count": int(candidate["attempt_count"]) + 1,
+                "max_attempts": int(candidate["max_attempts"]),
+                "lease_expires_at": expires,
+            }
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def renew_task_lease(
+        self,
+        task_id: str,
+        lease_id: str,
+        worker_id: str,
+        *,
+        lease_ttl_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Renew only the currently owned, non-expired lease."""
+        if lease_ttl_seconds < 1:
+            raise ValueError("lease_ttl_invalid")
+        stamp = now()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=int(lease_ttl_seconds))).isoformat()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            updated = self.db.execute(
+                """UPDATE task_queue
+                   SET lease_expires_at = ?, updated_at = ?
+                 WHERE task_id = ? AND queue_status = 'LEASED'
+                   AND lease_id = ? AND worker_id = ?
+                   AND lease_expires_at <> '' AND lease_expires_at > ?""",
+                (expires, stamp, task_id, lease_id, worker_id, stamp),
+            )
+            if updated.rowcount != 1:
+                raise QueueLeaseLost(f"queue_lease_lost:{task_id}")
+            self.db.commit()
+            return {"task_id": str(task_id), "lease_id": str(lease_id), "worker_id": str(worker_id), "lease_expires_at": expires}
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def finish_task_claim(
+        self,
+        claim: dict[str, Any],
+        queue_status: str,
+        *,
+        error_code: str = "",
+        error_message: str = "",
+        state_status: str | None = None,
+    ) -> dict[str, Any]:
+        """Fence and close a claim, optionally persisting a worker failure state."""
+        allowed = {"WAITING_APPROVAL", "EXECUTION_UNKNOWN", "COMPLETED", "FAILED", "BLOCKED"}
+        if queue_status not in allowed:
+            raise ValueError(f"invalid_queue_finish_status:{queue_status}")
+        task_id = str(claim["task_id"])
+        lease_id = str(claim["lease_id"])
+        worker_id = str(claim["worker_id"])
+        stamp = now()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.db.execute(
+                "SELECT * FROM task_queue WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if current is None or current["queue_status"] != "LEASED" or current["lease_id"] != lease_id or current["worker_id"] != worker_id:
+                raise QueueLeaseLost(f"queue_lease_lost:{task_id}")
+            if not current["lease_expires_at"] or _parse_queue_time(current["lease_expires_at"]) <= datetime.now(timezone.utc):
+                raise QueueLeaseLost(f"queue_lease_expired:{task_id}")
+
+            if state_status is not None:
+                from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+
+                state_row = self.db.execute(
+                    "SELECT state_json FROM task_states WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if state_row is not None:
+                    state = TaskState.from_dict(json.loads(state_row["state_json"]))
+                    if state_status == "EXECUTION_UNKNOWN":
+                        if state.status != "EXECUTION_UNKNOWN":
+                            state.recovery_state = {
+                                **state.recovery_state,
+                                "reason": "worker_execution_interrupted",
+                                "external_side_effect_may_have_occurred": True,
+                            }
+                            state.checkpoint(
+                                "EXECUTION_UNKNOWN",
+                                status="EXECUTION_UNKNOWN",
+                                phase="EXECUTION_UNKNOWN",
+                                successful=False,
+                            )
+                    elif state_status == "FAILED" and state.status not in TERMINAL_STATUSES:
+                        state.result = {
+                            **state.result,
+                            "final_status": "FAILED",
+                            "errors": list(state.result.get("errors", [])) + [error_message or error_code or "worker_failed"],
+                        }
+                        state.checkpoint("WORKER_FAILED", status="FAILED", phase="WORKER_FAILED", successful=False)
+                    self._persist_task_state_in_transaction(
+                        state.to_dict(),
+                        "EXECUTION_UNKNOWN" if state_status == "EXECUTION_UNKNOWN" else "WORKER_FAILED",
+                        task_status=state.status,
+                        enforce_lease=False,
+                    )
+
+            updated = self.db.execute(
+                """UPDATE task_queue
+                   SET queue_status = ?, lease_id = '', worker_id = '',
+                       lease_acquired_at = '', lease_expires_at = '',
+                       last_finished_at = ?, last_error_code = ?,
+                       last_error_message = ?, updated_at = ?
+                 WHERE task_id = ? AND queue_status = 'LEASED'
+                   AND lease_id = ? AND worker_id = ?""",
+                (
+                    queue_status,
+                    stamp,
+                    str(error_code)[:200],
+                    str(error_message)[:1000],
+                    stamp,
+                    task_id,
+                    lease_id,
+                    worker_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise QueueLeaseLost(f"queue_finish_lost:{task_id}")
+            self.db.commit()
+            return {"task_id": task_id, "queue_status": queue_status, "attempt_count": int(current["attempt_count"])}
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def mark_task_execution_unknown_if_owned(
+        self,
+        claim: dict[str, Any],
+        *,
+        reason: str = "max_execution_age_exceeded",
+    ) -> dict[str, Any]:
+        """Fence an owned long-running claim without retrying its external action."""
+        task_id = str(claim["task_id"])
+        lease_id = str(claim["lease_id"])
+        worker_id = str(claim["worker_id"])
+        stamp = now()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.db.execute(
+                "SELECT * FROM task_queue WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if current is None or current["queue_status"] != "LEASED" or current["lease_id"] != lease_id or current["worker_id"] != worker_id:
+                raise QueueLeaseLost(f"queue_lease_lost:{task_id}")
+
+            from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+
+            state_row = self.db.execute(
+                "SELECT state_json FROM task_states WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            queue_status = "EXECUTION_UNKNOWN"
+            if state_row is not None:
+                state = TaskState.from_dict(json.loads(state_row["state_json"]))
+                if state.status in TERMINAL_STATUSES:
+                    queue_status = state.status
+                elif state.status == "WAITING_APPROVAL":
+                    queue_status = "WAITING_APPROVAL"
+                else:
+                    state.recovery_state = {
+                        **state.recovery_state,
+                        "reason": reason,
+                        "external_side_effect_may_have_occurred": True,
+                    }
+                    if state.status != "EXECUTION_UNKNOWN":
+                        state.checkpoint(
+                            "EXECUTION_UNKNOWN",
+                            status="EXECUTION_UNKNOWN",
+                            phase="EXECUTION_UNKNOWN",
+                            successful=False,
+                        )
+                    else:
+                        state.touch()
+                    self._persist_task_state_in_transaction(
+                        state.to_dict(),
+                        "EXECUTION_UNKNOWN",
+                        task_status=state.status,
+                        enforce_lease=False,
+                    )
+
+            updated = self.db.execute(
+                """UPDATE task_queue
+                   SET queue_status = ?, lease_id = '', worker_id = '',
+                       lease_acquired_at = '', lease_expires_at = '',
+                       last_finished_at = ?, last_error_code = ?,
+                       last_error_message = ?, updated_at = ?
+                 WHERE task_id = ? AND queue_status = 'LEASED'
+                   AND lease_id = ? AND worker_id = ?""",
+                (
+                    queue_status,
+                    stamp,
+                    "execution_unknown" if queue_status == "EXECUTION_UNKNOWN" else "",
+                    reason[:1000],
+                    stamp,
+                    task_id,
+                    lease_id,
+                    worker_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise QueueLeaseLost(f"queue_unknown_lost:{task_id}")
+            self.db.commit()
+            return {"task_id": task_id, "queue_status": queue_status}
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def requeue_waiting_approval_task(self, task_id: str) -> dict[str, Any]:
+        """Explicitly make an approval-waiting task claimable again.
+
+        This method does not approve anything.  The worker must still pass the
+        task through Orchestrator resume and current SecurityController checks.
+        """
+        stamp = now()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            queue = self.db.execute(
+                "SELECT queue_status FROM task_queue WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            state = self.db.execute(
+                "SELECT state_json FROM task_states WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if queue is None or state is None:
+                raise ValueError(f"task_not_found:{task_id}")
+            from private_agent.core.task_state import TaskState
+
+            payload = json.loads(state["state_json"])
+            task_state = TaskState.from_dict(payload)
+            if queue["queue_status"] != "WAITING_APPROVAL" or task_state.status != "WAITING_APPROVAL":
+                raise ValueError("task_not_waiting_approval")
+            if not task_state.approval_ids:
+                raise ValueError("approval_not_approved")
+            for action_id, approval_id in task_state.approval_ids.items():
+                approval = self.get_approval_request(str(approval_id))
+                if (
+                    not approval
+                    or approval.get("status") != "APPROVED"
+                    or str(approval.get("task_id", "")) != str(task_id)
+                    or str(approval.get("action_id", "")) != str(action_id)
+                ):
+                    raise ValueError("approval_not_approved")
+            updated = self.db.execute(
+                """UPDATE task_queue
+                   SET queue_status = 'QUEUED', available_at = ?,
+                       last_error_code = '', last_error_message = '', updated_at = ?
+                 WHERE task_id = ? AND queue_status = 'WAITING_APPROVAL'""",
+                (stamp, stamp, task_id),
+            )
+            if updated.rowcount != 1:
+                raise QueueLeaseLost(f"queue_requeue_lost:{task_id}")
+            self.db.commit()
+            return {"task_id": str(task_id), "queue_status": "QUEUED"}
+        except Exception:
+            self.db.rollback()
+            raise
+
     def task_queue_record(self, task_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM task_queue WHERE task_id = ?", (task_id,)).fetchone()
         return dict(row) if row else None
@@ -768,15 +1262,17 @@ class Store:
         return [dict(row) for row in rows]
 
     def save_episode(self, episode_id: str, task_id: str, goal: str, outcome: str, lessons: Any, observations: Any) -> None:
-        self.db.execute("INSERT OR REPLACE INTO episodes VALUES (?,?,?,?,?,?,?)",
-            (episode_id, task_id, goal, outcome, json.dumps(lessons), json.dumps(observations), now()))
-        self.db.commit()
+        with self._lease_write(task_id):
+            self.db.execute("INSERT OR REPLACE INTO episodes VALUES (?,?,?,?,?,?,?)",
+                (episode_id, task_id, goal, outcome, json.dumps(lessons), json.dumps(observations), now()))
 
     def add_knowledge(self, item: KnowledgeItem) -> None:
         if not item.created_at: item.created_at = now()
         item.updated_at = now()
-        self.db.execute("INSERT OR REPLACE INTO knowledge_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(asdict(item).values()))
-        self.db.commit()
+        active = self._active_lease()
+        active_task_id = active[0] if active is not None else None
+        with self._lease_write(active_task_id):
+            self.db.execute("INSERT OR REPLACE INTO knowledge_items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(asdict(item).values()))
 
     def search_knowledge(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
         terms = [t.lower() for t in query.split() if len(t) > 2]
@@ -798,43 +1294,43 @@ class Store:
 
     def save_observation(self, observation: Any) -> None:
         payload = observation.to_dict() if hasattr(observation, "to_dict") else observation
-        self.db.execute(
-            "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?)",
-            (
-                f"{payload['task_id']}:{payload['step_id']}:{payload['timestamp']}",
-                payload["task_id"],
-                payload["step_id"],
-                payload["tool_name"],
-                payload["execution_status"],
-                json.dumps(payload, ensure_ascii=False),
-                payload["timestamp"],
-            ),
-        )
-        self.db.commit()
+        with self._lease_write(str(payload["task_id"])):
+            self.db.execute(
+                "INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?)",
+                (
+                    f"{payload['task_id']}:{payload['step_id']}:{payload['timestamp']}",
+                    payload["task_id"],
+                    payload["step_id"],
+                    payload["tool_name"],
+                    payload["execution_status"],
+                    json.dumps(payload, ensure_ascii=False),
+                    payload["timestamp"],
+                ),
+            )
 
     def save_verification(self, task_id: str, step_id: str, tool_name: str, verification: Any) -> None:
         payload = verification.to_dict() if hasattr(verification, "to_dict") else verification
-        self.db.execute(
-            "INSERT OR REPLACE INTO verifications VALUES (?,?,?,?,?,?,?)",
-            (
-                f"{task_id}:{step_id}:{payload.get('verifier_type', 'unknown')}:{payload.get('status')}",
-                task_id,
-                step_id,
-                tool_name,
-                payload["status"],
-                json.dumps(payload, ensure_ascii=False),
-                now(),
-            ),
-        )
-        self.db.commit()
+        with self._lease_write(task_id):
+            self.db.execute(
+                "INSERT OR REPLACE INTO verifications VALUES (?,?,?,?,?,?,?)",
+                (
+                    f"{task_id}:{step_id}:{payload.get('verifier_type', 'unknown')}:{payload.get('status')}",
+                    task_id,
+                    step_id,
+                    tool_name,
+                    payload["status"],
+                    json.dumps(payload, ensure_ascii=False),
+                    now(),
+                ),
+            )
 
     def save_event(self, task_id: str, event_type: str, event: dict[str, Any], *, step_id: str | None = None) -> None:
         stamp = now()
-        self.db.execute(
-            "INSERT OR REPLACE INTO execution_events VALUES (?,?,?,?,?,?)",
-            (f"{task_id}:{event_type}:{stamp}", task_id, step_id, event_type, json.dumps(event, ensure_ascii=False), stamp),
-        )
-        self.db.commit()
+        with self._lease_write(task_id):
+            self.db.execute(
+                "INSERT OR REPLACE INTO execution_events VALUES (?,?,?,?,?,?)",
+                (f"{task_id}:{event_type}:{stamp}", task_id, step_id, event_type, json.dumps(event, ensure_ascii=False), stamp),
+            )
 
     def observations_for_task(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM observations WHERE task_id = ? ORDER BY created_at", (task_id,)).fetchall()
@@ -855,7 +1351,14 @@ class Store:
         already persisted event. The insert and sequence allocation are atomic.
         """
         metadata_json = json.dumps(payload.get("metadata", {}), ensure_ascii=False, sort_keys=True)
-        with self.db:
+        task_id = str(payload.get("task_id", ""))
+        event_type = str(payload.get("event_type", ""))
+        # Owner approval events are written outside a worker lease.  Execution,
+        # tool, task, observation, verification, and security events tied to a
+        # queued task must remain fenced to the active worker.
+        requires_lease = bool(task_id) and not event_type.startswith(("APPROVAL_", "API_"))
+        sequence: int
+        with self._lease_write(task_id if requires_lease else None):
             try:
                 self.db.execute(
                     """INSERT INTO observability_events
@@ -883,14 +1386,16 @@ class Store:
                 ).fetchone()
                 if row is None or row["metadata_json"] != metadata_json or row["event_type"] != payload["event_type"]:
                     raise
-                return int(row["sequence"])
-            row = self.db.execute(
-                "SELECT sequence FROM observability_events WHERE event_id = ?",
-                (payload["event_id"],),
-            ).fetchone()
-            if row is None:
-                raise sqlite3.OperationalError("observability_sequence_missing")
-            return int(row["sequence"])
+                sequence = int(row["sequence"])
+            else:
+                row = self.db.execute(
+                    "SELECT sequence FROM observability_events WHERE event_id = ?",
+                    (payload["event_id"],),
+                ).fetchone()
+                if row is None:
+                    raise sqlite3.OperationalError("observability_sequence_missing")
+                sequence = int(row["sequence"])
+        return sequence
 
     @staticmethod
     def _decode_observability_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -935,11 +1440,12 @@ class Store:
 
     def save_experience(self, experience: Any) -> None:
         payload = experience.to_dict() if hasattr(experience, "to_dict") else experience
-        self.db.execute(
-            "INSERT OR REPLACE INTO experiences VALUES (?,?,?,?)",
-            (payload["task_id"], payload["goal"], json.dumps(payload, ensure_ascii=False), payload.get("created_at", now())),
-        )
-        self.db.commit()
+        task_id = str(payload.get("task_id", ""))
+        with self._lease_write(task_id):
+            self.db.execute(
+                "INSERT OR REPLACE INTO experiences VALUES (?,?,?,?)",
+                (payload["task_id"], payload["goal"], json.dumps(payload, ensure_ascii=False), payload.get("created_at", now())),
+            )
         self._emit_observability(
             "MEMORY_STORED",
             task_id=str(payload.get("task_id", "")),
@@ -956,17 +1462,19 @@ class Store:
 
     def save_reflection(self, insight: Any) -> None:
         payload = insight.to_dict() if hasattr(insight, "to_dict") else insight
-        self.db.execute(
-            "INSERT OR REPLACE INTO reflection_insights VALUES (?,?,?,?,?)",
-            (
-                payload["insight_id"],
-                payload.get("pattern", ""),
-                float(payload.get("confidence", 0.0)),
-                json.dumps(payload, ensure_ascii=False),
-                payload.get("created_at", now()),
-            ),
-        )
-        self.db.commit()
+        active = self._active_lease()
+        active_task_id = active[0] if active is not None else None
+        with self._lease_write(active_task_id):
+            self.db.execute(
+                "INSERT OR REPLACE INTO reflection_insights VALUES (?,?,?,?,?)",
+                (
+                    payload["insight_id"],
+                    payload.get("pattern", ""),
+                    float(payload.get("confidence", 0.0)),
+                    json.dumps(payload, ensure_ascii=False),
+                    payload.get("created_at", now()),
+                ),
+            )
         self._emit_observability(
             "REFLECTION_COMPLETED",
             metadata={"insight_id": payload.get("insight_id", ""), "confidence": payload.get("confidence", 0.0)},
@@ -982,17 +1490,19 @@ class Store:
 
     def save_learned_strategy(self, strategy: Any) -> None:
         payload = strategy.to_dict() if hasattr(strategy, "to_dict") else strategy
-        self.db.execute(
-            "INSERT OR REPLACE INTO learned_strategies VALUES (?,?,?,?,?)",
-            (
-                payload["strategy_id"],
-                payload.get("status", "uncertain"),
-                float(payload.get("confidence", 0.0)),
-                json.dumps(payload, ensure_ascii=False),
-                payload.get("created_at", now()),
-            ),
-        )
-        self.db.commit()
+        active = self._active_lease()
+        active_task_id = active[0] if active is not None else None
+        with self._lease_write(active_task_id):
+            self.db.execute(
+                "INSERT OR REPLACE INTO learned_strategies VALUES (?,?,?,?,?)",
+                (
+                    payload["strategy_id"],
+                    payload.get("status", "uncertain"),
+                    float(payload.get("confidence", 0.0)),
+                    json.dumps(payload, ensure_ascii=False),
+                    payload.get("created_at", now()),
+                ),
+            )
         self._emit_observability(
             "LEARNING_COMPLETED",
             metadata={"strategy_id": payload.get("strategy_id", ""), "status": payload.get("status", "")},
@@ -1174,33 +1684,34 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
-    def save_approval_request(self, payload: dict[str, Any]) -> None:
-        self.db.execute(
-            """INSERT OR REPLACE INTO approval_requests
-            (approval_id, task_id, action_id, tool_or_skill, requested_capabilities_json,
-             risk_level, reason, planned_effect, input_fingerprint, policy_version,
-             requested_at, expires_at, status, decided_at, actor, approval_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                payload["approval_id"],
-                payload["task_id"],
-                payload["action_id"],
-                payload["tool_or_skill"],
-                json.dumps(payload.get("requested_capabilities", []), ensure_ascii=False),
-                payload["risk_level"],
-                payload["reason"],
-                payload["planned_effect"],
-                payload["input_fingerprint"],
-                int(payload["policy_version"]),
-                payload["requested_at"],
-                payload["expires_at"],
-                payload["status"],
-                payload.get("decided_at", ""),
-                payload.get("actor", "system"),
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
-        self.db.commit()
+    def save_approval_request(self, payload: dict[str, Any], *, enforce_lease: bool = False) -> None:
+        task_id = str(payload["task_id"])
+        with self._lease_write(task_id if enforce_lease else None):
+            self.db.execute(
+                """INSERT OR REPLACE INTO approval_requests
+                (approval_id, task_id, action_id, tool_or_skill, requested_capabilities_json,
+                 risk_level, reason, planned_effect, input_fingerprint, policy_version,
+                 requested_at, expires_at, status, decided_at, actor, approval_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    payload["approval_id"],
+                    task_id,
+                    payload["action_id"],
+                    payload["tool_or_skill"],
+                    json.dumps(payload.get("requested_capabilities", []), ensure_ascii=False),
+                    payload["risk_level"],
+                    payload["reason"],
+                    payload["planned_effect"],
+                    payload["input_fingerprint"],
+                    int(payload["policy_version"]),
+                    payload["requested_at"],
+                    payload["expires_at"],
+                    payload["status"],
+                    payload.get("decided_at", ""),
+                    payload.get("actor", "system"),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
 
     def get_approval_request(self, approval_id: str) -> dict[str, Any] | None:
         row = self.db.execute(
@@ -1231,17 +1742,17 @@ class Store:
 
     def save_security_decision(self, payload: dict[str, Any]) -> None:
         decision_id = f"{payload['task_id']}:{payload['action_id']}:{payload['evaluated_at']}"
-        self.db.execute(
-            "INSERT OR REPLACE INTO security_decisions VALUES (?,?,?,?,?)",
-            (
-                decision_id,
-                payload["task_id"],
-                payload["action_id"],
-                json.dumps(payload, ensure_ascii=False),
-                payload.get("evaluated_at", now()),
-            ),
-        )
-        self.db.commit()
+        with self._lease_write(str(payload["task_id"])):
+            self.db.execute(
+                "INSERT OR REPLACE INTO security_decisions VALUES (?,?,?,?,?)",
+                (
+                    decision_id,
+                    payload["task_id"],
+                    payload["action_id"],
+                    json.dumps(payload, ensure_ascii=False),
+                    payload.get("evaluated_at", now()),
+                ),
+            )
 
     def security_decisions_for_task(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute(
@@ -1258,31 +1769,35 @@ class Store:
                 decisions.append(payload)
         return decisions
 
-    def save_audit_event(self, payload: dict[str, Any]) -> None:
-        self.db.execute(
-            """INSERT OR REPLACE INTO audit_events
-            (event_id, timestamp, event_type, task_id, action_id, actor,
-             tool_or_skill, capabilities_json, risk_level, policy_version,
-             approval_id, decision, reason, event_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                payload["event_id"],
-                payload["timestamp"],
-                payload["event_type"],
-                payload["task_id"],
-                payload["action_id"],
-                payload["actor"],
-                payload["tool_or_skill"],
-                json.dumps(payload.get("capabilities", []), ensure_ascii=False),
-                payload["risk_level"],
-                int(payload["policy_version"]),
-                payload.get("approval_id", ""),
-                payload["decision"],
-                payload["reason"],
-                json.dumps(payload, ensure_ascii=False),
-            ),
-        )
-        self.db.commit()
+    def save_audit_event(self, payload: dict[str, Any], *, requires_lease: bool | None = None) -> None:
+        event_type = str(payload.get("event_type", ""))
+        task_id = str(payload.get("task_id", ""))
+        if requires_lease is None:
+            requires_lease = event_type in {"ACTION_EXECUTED", "ACTION_FAILED", "ACTION_BLOCKED"}
+        with self._lease_write(task_id if requires_lease else None):
+            self.db.execute(
+                """INSERT OR REPLACE INTO audit_events
+                (event_id, timestamp, event_type, task_id, action_id, actor,
+                 tool_or_skill, capabilities_json, risk_level, policy_version,
+                 approval_id, decision, reason, event_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    payload["event_id"],
+                    payload["timestamp"],
+                    event_type,
+                    task_id,
+                    payload["action_id"],
+                    payload["actor"],
+                    payload["tool_or_skill"],
+                    json.dumps(payload.get("capabilities", []), ensure_ascii=False),
+                    payload["risk_level"],
+                    int(payload["policy_version"]),
+                    payload.get("approval_id", ""),
+                    payload["decision"],
+                    payload["reason"],
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
 
     def all_audit_events(self, *, task_id: str | None = None) -> list[dict[str, Any]]:
         if task_id is None:

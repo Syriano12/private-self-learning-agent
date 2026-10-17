@@ -126,6 +126,7 @@ class _SecurityAuditClaim:
     provenance: Any = field(default=None, repr=False, compare=False)
     provenance_snapshot: Any = field(default=None, repr=False, compare=False)
     issuance_nonce: Any = field(default=None, repr=False, compare=False)
+    worker_bound: bool = field(default=False, repr=False, compare=False)
 
     @property
     def action(self) -> "ActionRequest":
@@ -415,6 +416,7 @@ class AuthorizedExecutionResult:
     result: Any = None
     exception: BaseException | None = None
     receipt: ExecutionReceipt | None = None
+    blocked: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -709,7 +711,7 @@ class ApprovalGate:
             goal=action.goal,
         )
         self._requests[request.approval_id] = request
-        self._persist(request)
+        self._persist(request, enforce_lease=True)
         self._emit("APPROVAL_REQUESTED", request)
         return request
 
@@ -867,9 +869,9 @@ class ApprovalGate:
             self._persist(request)
             self._emit("APPROVAL_EXPIRED", request)
 
-    def _persist(self, request: ApprovalRequest) -> None:
+    def _persist(self, request: ApprovalRequest, *, enforce_lease: bool = False) -> None:
         if self.store is not None and hasattr(self.store, "save_approval_request"):
-            self.store.save_approval_request(request.to_dict())
+            self.store.save_approval_request(request.to_dict(), enforce_lease=enforce_lease)
 
     def _emit(self, event_type: str, request: ApprovalRequest) -> None:
         if self.event_logger is not None:
@@ -946,6 +948,7 @@ class AuditTrail:
                         actor=claim.actor,
                         metadata=claim.metadata,
                         _claim=claim,
+                        _requires_lease=claim.worker_bound,
                     )
                 finally:
                     # Claims are one-shot even when persistence fails.
@@ -1147,6 +1150,13 @@ class AuditTrail:
                     raise ValueError("policy_change_provenance_mismatch")
             else:
                 raise ValueError("security_audit_provenance_untrusted")
+        worker_bound = False
+        lease_context = getattr(self.store, "has_active_lease_context", None)
+        if callable(lease_context) and action.task_id:
+            try:
+                worker_bound = bool(lease_context(action.task_id))
+            except Exception:
+                worker_bound = False
         claim = _SecurityAuditClaim(
             audit=self,
             event_type=event_type,
@@ -1163,6 +1173,7 @@ class AuditTrail:
             provenance=provenance,
             provenance_snapshot=_provenance_snapshot(provenance),
             issuance_nonce=object(),
+            worker_bound=worker_bound,
         )
         with self._claim_lock:
             self._active_claims[claim.claim_id] = claim
@@ -1314,6 +1325,7 @@ class AuditTrail:
         actor: str = "system",
         metadata: dict[str, Any] | None = None,
         _claim: _SecurityAuditClaim | None = None,
+        _requires_lease: bool = False,
     ) -> dict[str, Any]:
         if event_type in TRUSTED_SECURITY_AUDIT_EVENTS:
             if (
@@ -1359,9 +1371,12 @@ class AuditTrail:
                 "metadata": metadata or {},
             }
         )
-        self._events.append(event)
         if self.store is not None and hasattr(self.store, "save_audit_event"):
-            self.store.save_audit_event(event)
+            self.store.save_audit_event(
+                event,
+                requires_lease=_requires_lease or event_type in {"ACTION_EXECUTED", "ACTION_FAILED", "ACTION_BLOCKED"},
+            )
+        self._events.append(event)
         observer = self.observability or getattr(self.store, "observability", None)
         if observer is not None:
             mapped_type = {
@@ -1437,6 +1452,7 @@ class AuditTrail:
                     actor=claim.actor,
                     metadata=claim.metadata,
                     _claim=claim,
+                    _requires_lease=claim.worker_bound,
                 )
             finally:
                 # Security audit claims are one-shot even if persistence fails.
@@ -2119,6 +2135,7 @@ class SecurityController:
         authorization: PolicyDecision | None = None,
         result_validator: Callable[[Any], tuple[bool, dict[str, Any]]] | None = None,
         operation_binding: TrustedOperationBinding | None = None,
+        pre_execution_check: Callable[[], None] | None = None,
     ) -> AuthorizedExecutionResult:
         """Run one operation inside the trusted authorization boundary.
 
@@ -2132,6 +2149,17 @@ class SecurityController:
         if not self._validate_operation_binding(operation_binding, action, operation):
             raise ValueError("trusted_operation_binding_required")
         self._begin_execution(action, decision)
+        if pre_execution_check is not None:
+            try:
+                pre_execution_check()
+            except Exception as exc:
+                # No external operation started.  Drop the in-flight evidence
+                # without producing ACTION_FAILED/ACTION_EXECUTED so a stale
+                # worker cannot later replay this authorization.
+                with self._authorization_evidence_lock:
+                    self._authorization_evidence.pop(id(decision), None)
+                    self._execution_inflight.discard(id(decision))
+                return AuthorizedExecutionResult(decision=decision, exception=exc, blocked=True)
         try:
             result = operation()
         except Exception as exc:

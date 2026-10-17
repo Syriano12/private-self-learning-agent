@@ -5,6 +5,7 @@ from time import monotonic
 from typing import Any
 
 from private_agent.core.planner import PlanStep, TaskPlan
+from private_agent.storage import QueueLeaseLost
 from private_agent.tools.contracts import ToolError, ToolResult, contract_errors, validate_schema_value
 from private_agent.tools.research import ToolRegistry
 
@@ -93,9 +94,16 @@ class StepResult:
 class GenericExecutor:
     """Execute any registered ToolContract without knowing concrete tool names."""
 
-    def __init__(self, tools: ToolRegistry, security_controller: Any | None = None) -> None:
+    def __init__(
+        self,
+        tools: ToolRegistry,
+        security_controller: Any | None = None,
+        *,
+        lease_store: Any | None = None,
+    ) -> None:
         self.tools = tools
         self.security_controller = security_controller
+        self.lease_store = lease_store
 
     def execute_plan(
         self,
@@ -272,7 +280,21 @@ class GenericExecutor:
             authorization=security_decision,
             result_validator=validate_tool_result,
             operation_binding=operation_binding,
+            pre_execution_check=(
+                lambda: self.lease_store.assert_active_lease(execution_context.task_id)
+                if self.lease_store is not None and execution_context.task_id
+                else None
+            ),
         )
+        if execution.blocked:
+            code = "queue_lease_lost" if isinstance(execution.exception, QueueLeaseLost) else "execution_boundary_blocked"
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                code,
+                "Execution lease was not valid at the side-effect boundary",
+                metadata=self._timed(base_metadata, started),
+            ))
         if execution.exception is not None:
             return finish(StepResult.failed(
                 step.id,
