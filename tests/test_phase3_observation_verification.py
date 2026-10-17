@@ -13,6 +13,7 @@ from private_agent.core.verification import (
     WebResearchVerifier,
 )
 from private_agent.storage import Store
+from private_agent.security import SecurityController
 from private_agent.tools.contracts import ToolResult
 from private_agent.tools.research import ToolRegistry
 
@@ -88,7 +89,7 @@ def test_observation_is_structured_and_separate_from_tool_result() -> None:
 def test_successful_execution_with_empty_output_is_insufficient_not_verified() -> None:
     tool = OutputTool("empty", {})
     registry = make_registry(tool)
-    execution = GenericExecutor(registry).execute_step(make_step("empty"))
+    execution = GenericExecutor(registry, SecurityController()).execute_step(make_step("empty"))
     assert execution.status == "success"
     observation = Observation.from_step_result("task", execution)
     verification = VerifierRegistry().verify("generic", observation, {"required_fields": []})
@@ -99,7 +100,7 @@ def test_successful_execution_with_empty_output_is_insufficient_not_verified() -
 
 def test_successful_execution_with_non_empty_output_missing_required_field_fails() -> None:
     tool = OutputTool("partial", {"other": "evidence"})
-    execution = GenericExecutor(make_registry(tool)).execute_step(make_step("partial"))
+    execution = GenericExecutor(make_registry(tool), SecurityController()).execute_step(make_step("partial"))
     assert execution.status == "success"
     observation = Observation.from_step_result("task", execution)
     verification = VerifierRegistry().verify("generic", observation, {"required_fields": ["value"]})
@@ -109,7 +110,7 @@ def test_successful_execution_with_non_empty_output_missing_required_field_fails
 
 def test_missing_success_criteria_is_insufficient() -> None:
     tool = OutputTool("valid", {"value": "evidence"})
-    execution = GenericExecutor(make_registry(tool)).execute_step(make_step("valid"))
+    execution = GenericExecutor(make_registry(tool), SecurityController()).execute_step(make_step("valid"))
     observation = Observation.from_step_result("task", execution)
     verification = VerifierRegistry().verify("generic", observation, {})
     assert execution.status == "success"
@@ -119,7 +120,7 @@ def test_missing_success_criteria_is_insufficient() -> None:
 
 def test_successful_execution_with_valid_output_is_verified() -> None:
     tool = OutputTool("valid", {"value": "evidence"})
-    execution = GenericExecutor(make_registry(tool)).execute_step(make_step("valid", criteria={"required_fields": ["value"]}))
+    execution = GenericExecutor(make_registry(tool), SecurityController()).execute_step(make_step("valid", criteria={"required_fields": ["value"]}))
     observation = Observation.from_step_result("task", execution)
     verification = VerifierRegistry().verify("generic", observation, {"required_fields": ["value"]})
     assert execution.status == "success"
@@ -130,7 +131,7 @@ def test_successful_execution_with_valid_output_is_verified() -> None:
 def test_blocked_observation_becomes_blocked_verification() -> None:
     tool = OutputTool("private", {"value": "secret"})
     tool.permission_level = "private_write"
-    execution = GenericExecutor(make_registry(tool)).execute_step(make_step("private"))
+    execution = GenericExecutor(make_registry(tool), SecurityController()).execute_step(make_step("private"))
     observation = Observation.from_step_result("task", execution)
     verification = VerifierRegistry().verify("generic", observation, {"required_fields": ["value"]})
     assert execution.status == "blocked"
@@ -189,7 +190,7 @@ def test_adding_a_verifier_does_not_require_generic_executor_changes() -> None:
     registry = VerifierRegistry()
     registry.register(CustomVerifier())
     tool = OutputTool("custom_tool", {"value": "ok"})
-    execution = GenericExecutor(make_registry(tool)).execute_step(make_step("custom_tool", verifier="custom"))
+    execution = GenericExecutor(make_registry(tool), SecurityController()).execute_step(make_step("custom_tool", verifier="custom"))
     observation = Observation.from_step_result("task", execution)
     result = registry.verify("custom", observation, {})
     assert execution.status == "success"
@@ -207,22 +208,11 @@ class StubPlanner:
         return TaskPlan(goal, [make_step(self.tool_name, criteria=self.criteria)], "stub")
 
 
-class RecordingExecutor:
-    def __init__(self, output: dict):
-        self.output = output
-        self.calls = 0
-
-    def execute_plan(self, plan: TaskPlan, context: ExecutionContext) -> list[StepResult]:
-        self.calls += 1
-        return [StepResult.success(plan.steps[0].id, plan.steps[0].tool, self.output)]
-
-
 def test_orchestrator_uses_verification_and_does_not_retry_or_replan_on_failure(tmp_path: Path) -> None:
     tool = OutputTool("empty", {})
     planner = StubPlanner("empty")
-    executor = RecordingExecutor({})
     store = Store(tmp_path / "agent.sqlite3")
-    agent = Orchestrator(store, make_registry(tool), planner=planner, executor=executor)
+    agent = Orchestrator(store, make_registry(tool), planner=planner)
     result = agent.run("goal")
     assert result["step_results"][0]["status"] == "success"
     assert result["step_outcomes"][0]["execution_status"] == "success"
@@ -230,7 +220,7 @@ def test_orchestrator_uses_verification_and_does_not_retry_or_replan_on_failure(
     assert result["verification"]["status"] == "INSUFFICIENT"
     assert result["verification"]["verified"] is False
     assert result["attempts"] == 1
-    assert executor.calls == 1
+    assert tool.calls == 1
     assert planner.calls == 1
     assert len(store.observations_for_task(result["task_id"])) == 1
     assert len(store.verifications_for_task(result["task_id"])) == 1
@@ -244,12 +234,10 @@ def test_orchestrator_uses_verification_and_does_not_retry_or_replan_on_failure(
 
 def test_orchestrator_reports_verified_only_after_valid_research_evidence(tmp_path: Path) -> None:
     tool = OutputTool("web_research", {"sources": [{"url": "https://a", "text": "one"}, {"url": "https://b", "text": "two"}], "errors": []})
-    executor = RecordingExecutor(tool.output)
     agent = Orchestrator(
         Store(tmp_path / "agent.sqlite3"),
         make_registry(tool),
         planner=StubPlanner("web_research", criteria={"minimum_sources": 2}),
-        executor=executor,
     )
     result = agent.run("goal")
     assert result["step_outcomes"][0]["execution_status"] == "success"

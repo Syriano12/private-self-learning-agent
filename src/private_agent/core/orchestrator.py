@@ -59,7 +59,10 @@ class Orchestrator:
         self.store, self.tools, self.max_attempts = store, tools, max_attempts
         self.approved_permissions = approved_permissions or {"public_read"}
         self.planner = planner or Planner()
-        self.executor = executor or GenericExecutor(tools)
+        self.security = security_controller or SecurityController(store=store)
+        if executor is not None:
+            raise TypeError("unsupported_executor: production execution owns GenericExecutor")
+        self.executor = executor or GenericExecutor(tools, security_controller=self.security)
         self.verifiers = verifiers or VerifierRegistry()
         self.diagnoser = diagnoser or FailureDiagnoser()
         self.recovery = recovery_manager or RecoveryManager(
@@ -72,11 +75,9 @@ class Orchestrator:
         self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
         self.learning_memory = learning_memory or SQLiteLearningMemory(store)
         self.learning_engine = learning_engine or LearningEngine(self.learning_memory)
-        self.security = security_controller
         self.checkpoint_hook = checkpoint_hook
         self.observability = observability or ObservabilityMonitor(store)
-        if self.security is not None:
-            self.security.set_observability(self.observability)
+        self.security.set_observability(self.observability)
 
     def _emit_observability(
         self,
@@ -260,7 +261,7 @@ class Orchestrator:
             execution_context = ExecutionContext(
                 task_id=task_id,
                 approved_permissions=set(self.approved_permissions),
-                metadata={"attempt": rounds},
+                metadata={"attempt": rounds, "goal": current_plan.goal},
                 security_controller=self.security,
                 approval_ids={**state.approval_ids, **approval_ids},
                 observability=self.observability,
@@ -337,7 +338,7 @@ class Orchestrator:
                     errors.append(f"verification_{outcome.verification_status.lower()}: {outcome.verification['reason']}")
 
                 self._emit_observability(
-                    "ACTION_COMPLETED" if step_result.status == "success" else "ACTION_BLOCKED" if step_result.status == "blocked" else "ACTION_FAILED",
+                    "ACTION_COMPLETED" if step_result.status == "success" else "ACTION_LIFECYCLE_BLOCKED" if step_result.status == "blocked" else "ACTION_FAILED",
                     task_id=task_id,
                     action_id=step.id,
                     step_id=step.id,
@@ -957,7 +958,7 @@ class Orchestrator:
                 if outcome.verification_status in {"FAILED", "BLOCKED"}:
                     errors.append(f"verification_{outcome.verification_status.lower()}: {outcome.verification['reason']}")
                 self._emit_observability(
-                    "ACTION_COMPLETED" if step_result.status == "success" else "ACTION_BLOCKED" if step_result.status == "blocked" else "ACTION_FAILED",
+                    "ACTION_COMPLETED" if step_result.status == "success" else "ACTION_LIFECYCLE_BLOCKED" if step_result.status == "blocked" else "ACTION_FAILED",
                     task_id=state.task_id,
                     action_id=step.id,
                     step_id=step.id,
@@ -1317,12 +1318,14 @@ class Orchestrator:
             input_fingerprint=state.state_fingerprint,
             action_type="task_state",
         )
+        decision = self.security.policy_engine.evaluate(action)
         self.security.audit.record(
             event_type,
             action,
             decision=state.status,
             reason=reason,
-            policy_version=self.security.policy_engine.policy.policy_version,
+            risk_level=decision.risk_level,
+            policy_version=decision.policy_version,
         )
 
     def _create_plan(

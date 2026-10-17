@@ -904,7 +904,9 @@ class SkillLifecycleManager:
         *,
         contract: SkillContract | None = None,
         inputs: dict[str, Any] | None = None,
+        goal: str = "",
         mutation_test_runner: Callable[[str, MutationCase], bool] | None = None,
+        approval_id: str = "",
     ) -> LifecycleResult:
         contract = contract or SkillContract.from_candidate(candidate)
         inputs = inputs or {}
@@ -981,10 +983,117 @@ class SkillLifecycleManager:
             )
             return LifecycleResult(candidate, contract_report, analysis, mutation, sandbox, runtime, cross, approval)
 
-        sandbox = self.sandbox.execute(candidate, contract, inputs)
-        runtime = self.runtime_verifier.verify(candidate, contract, inputs, sandbox)
-        cross = self.cross_verifier.verify(candidate, sandbox.output) if runtime.passed else CrossVerificationReport(False, ["runtime_verification_failed"])
-        approval = self.approval_engine.decide(analysis, contract_report, mutation, sandbox, runtime, cross)
+        if self.security is None:
+            candidate.status = "QUARANTINED"
+            sandbox = SandboxResult("BLOCKED", error="security_not_configured")
+            runtime = RuntimeVerificationReport(False, sandbox.status, [sandbox.error])
+            cross = CrossVerificationReport(False, ["security_not_configured"])
+            approval = ApprovalDecision("QUARANTINED", False, ["security_not_configured"], {"security_controller": False})
+            self.registry.persist_candidate(
+                candidate,
+                contract=contract,
+                analysis=analysis,
+                mutation=mutation,
+                runtime=runtime,
+                sandbox=sandbox,
+                cross_verification=cross,
+                approval=approval,
+                status=candidate.status,
+            )
+            return LifecycleResult(candidate, contract_report, analysis, mutation, sandbox, runtime, cross, approval)
+
+        security_action = self.security.action_for_skill(
+            f"skill-submit:{candidate.name}:{candidate.version}",
+            f"activate:{candidate.name}:{candidate.version}",
+            candidate,
+            inputs,
+            goal=goal,
+        )
+        security_action.action_type = "skill_activation"
+        activation_decision = self.security.authorize(
+            security_action,
+            approval_id=approval_id,
+            boundary=True,
+        )
+        if not activation_decision.allowed:
+            candidate.status = "QUARANTINED"
+            sandbox = SandboxResult("BLOCKED", error=f"security_policy_blocked:{activation_decision.decision}")
+            runtime = RuntimeVerificationReport(False, sandbox.status, [sandbox.error])
+            cross = CrossVerificationReport(False, ["security_policy_blocked"])
+            approval = ApprovalDecision(
+                "QUARANTINED",
+                False,
+                ["security_policy_blocked", *activation_decision.reasons],
+                {"security_authorization": False},
+            )
+            self.registry.persist_candidate(
+                candidate,
+                contract=contract,
+                analysis=analysis,
+                mutation=mutation,
+                runtime=runtime,
+                sandbox=sandbox,
+                cross_verification=cross,
+                approval=approval,
+                status=candidate.status,
+            )
+            return LifecycleResult(candidate, contract_report, analysis, mutation, sandbox, runtime, cross, approval)
+
+        execution_state: dict[str, Any] = {}
+
+        def run_activation() -> SandboxResult:
+            sandbox_result = self.sandbox.execute(candidate, contract, inputs)
+            runtime_result = self.runtime_verifier.verify(candidate, contract, inputs, sandbox_result)
+            cross_result = (
+                self.cross_verifier.verify(candidate, sandbox_result.output)
+                if runtime_result.passed
+                else CrossVerificationReport(False, ["runtime_verification_failed"])
+            )
+            approval_result = self.approval_engine.decide(
+                analysis,
+                contract_report,
+                mutation,
+                sandbox_result,
+                runtime_result,
+                cross_result,
+            )
+            execution_state.update(
+                sandbox=sandbox_result,
+                runtime=runtime_result,
+                cross=cross_result,
+                approval=approval_result,
+            )
+            return sandbox_result
+
+        def activation_result(value: SandboxResult) -> tuple[bool, dict[str, Any]]:
+            approval_result = execution_state["approval"]
+            return bool(approval_result.approved), {
+                "sandbox_status": value.status,
+                "verification": execution_state["runtime"].status,
+            }
+
+        activation_binding = self.security._bind_operation(
+            security_action,
+            run_activation,
+            kind="skill_activation",
+        )
+        execution = self.security.execute_authorized(
+            security_action,
+            run_activation,
+            authorization=activation_decision,
+            result_validator=activation_result,
+            operation_binding=activation_binding,
+        )
+        if execution.exception is not None:
+            sandbox = SandboxResult("FAILED", error=f"{type(execution.exception).__name__}: {execution.exception}")
+            runtime = RuntimeVerificationReport(False, sandbox.status, [sandbox.error])
+            cross = CrossVerificationReport(False, ["activation_execution_failed"])
+            approval = ApprovalDecision("REJECTED", False, ["activation_execution_failed"], {})
+        else:
+            sandbox = execution_state["sandbox"]
+            runtime = execution_state["runtime"]
+            cross = execution_state["cross"]
+            approval = execution_state["approval"]
         candidate.status = approval.status
         self.registry.persist_candidate(
             candidate,
@@ -1012,6 +1121,7 @@ class SkillLifecycleManager:
         *,
         task_id: str | None = None,
         action_id: str | None = None,
+        goal: str = "",
         approval_id: str = "",
     ) -> ActiveExecutionResult:
         record = self.registry.active(name)
@@ -1022,36 +1132,85 @@ class SkillLifecycleManager:
         if candidate is None:
             candidate = SkillCandidate.from_dict(record["candidate"])
         contract = self._contracts.get(skill_id) or SkillContract.from_candidate(candidate)
-        security_action = None
-        if self.security is not None:
-            security_action = self.security.action_for_skill(
-                task_id or f"skill-runtime:{candidate.name}:{candidate.version}",
-                action_id or f"invoke:{candidate.name}:{candidate.version}",
+        if self.security is None:
+            sandbox = SandboxResult("BLOCKED", error="security_not_configured")
+            runtime = RuntimeVerificationReport(False, sandbox.status, [sandbox.error])
+            cross = CrossVerificationReport(False, ["security_not_configured"])
+            metrics = self.registry.record_runtime(
                 candidate,
-                inputs,
+                success=False,
+                verification_failed=True,
+                contract_violation=False,
             )
-            security_decision = self.security.authorize(
-                security_action,
-                approval_id=approval_id,
-                boundary=True,
+            return ActiveExecutionResult("BLOCKED", candidate.skill_id, candidate.version, sandbox, runtime, cross, metrics)
+
+        security_action = None
+        security_action = self.security.action_for_skill(
+            task_id or f"skill-runtime:{candidate.name}:{candidate.version}",
+            action_id or f"invoke:{candidate.name}:{candidate.version}",
+            candidate,
+            inputs,
+            goal=goal,
+        )
+        security_decision = self.security.authorize(
+            security_action,
+            approval_id=approval_id,
+            boundary=True,
+        )
+        if not security_decision.allowed:
+            sandbox = SandboxResult("BLOCKED", error=f"security_policy_blocked:{security_decision.decision}")
+            runtime = self.runtime_verifier.verify(candidate, contract, inputs, sandbox)
+            cross = CrossVerificationReport(False, ["security_policy_blocked"])
+            metrics = self.registry.record_runtime(
+                candidate,
+                success=False,
+                verification_failed=True,
+                contract_violation=False,
             )
-            if not security_decision.allowed:
-                sandbox = SandboxResult("BLOCKED", error=f"security_policy_blocked:{security_decision.decision}")
-                runtime = self.runtime_verifier.verify(candidate, contract, inputs, sandbox)
-                cross = CrossVerificationReport(False, ["security_policy_blocked"])
-                metrics = self.registry.record_runtime(
-                    candidate,
-                    success=False,
-                    verification_failed=True,
-                    contract_violation=False,
-                )
-                return ActiveExecutionResult("BLOCKED", candidate.skill_id, candidate.version, sandbox, runtime, cross, metrics)
-        sandbox = self.sandbox.execute(candidate, contract, inputs)
-        runtime = self.runtime_verifier.verify(candidate, contract, inputs, sandbox)
-        cross = self.cross_verifier.verify(candidate, sandbox.output) if runtime.passed else CrossVerificationReport(False, ["runtime_verification_failed"])
-        success = runtime.passed and cross.passed
-        if security_action is not None:
-            self.security.record_execution(security_action, success=success, metadata={"verification": runtime.status})
+            return ActiveExecutionResult("BLOCKED", candidate.skill_id, candidate.version, sandbox, runtime, cross, metrics)
+        execution_state: dict[str, Any] = {}
+
+        def run_active() -> SandboxResult:
+            sandbox_result = self.sandbox.execute(candidate, contract, inputs)
+            runtime_result = self.runtime_verifier.verify(candidate, contract, inputs, sandbox_result)
+            cross_result = (
+                self.cross_verifier.verify(candidate, sandbox_result.output)
+                if runtime_result.passed
+                else CrossVerificationReport(False, ["runtime_verification_failed"])
+            )
+            execution_state.update(sandbox=sandbox_result, runtime=runtime_result, cross=cross_result)
+            return sandbox_result
+
+        def active_result(value: SandboxResult) -> tuple[bool, dict[str, Any]]:
+            runtime_result = execution_state["runtime"]
+            cross_result = execution_state["cross"]
+            return bool(runtime_result.passed and cross_result.passed), {
+                "sandbox_status": value.status,
+                "verification": runtime_result.status,
+            }
+
+        active_binding = self.security._bind_operation(
+            security_action,
+            run_active,
+            kind="skill_runtime",
+        )
+        execution = self.security.execute_authorized(
+            security_action,
+            run_active,
+            authorization=security_decision,
+            result_validator=active_result,
+            operation_binding=active_binding,
+        )
+        if execution.exception is not None:
+            sandbox = SandboxResult("FAILED", error=f"{type(execution.exception).__name__}: {execution.exception}")
+            runtime = RuntimeVerificationReport(False, sandbox.status, [sandbox.error])
+            cross = CrossVerificationReport(False, ["active_execution_failed"])
+            success = False
+        else:
+            sandbox = execution_state["sandbox"]
+            runtime = execution_state["runtime"]
+            cross = execution_state["cross"]
+            success = runtime.passed and cross.passed
         metrics = self.registry.record_runtime(
             candidate,
             success=success,
@@ -1116,13 +1275,14 @@ class SkillLifecycleManager:
             candidate,
             {},
         )
+        decision = self.security.policy_engine.evaluate(action)
         self.security.audit.record(
             event_type,
             action,
             decision=candidate.status,
             reason=reason,
-            risk_level=self.security.policy_engine.evaluate(action).risk_level,
-            policy_version=self.security.policy_engine.policy.policy_version,
+            risk_level=decision.risk_level,
+            policy_version=decision.policy_version,
         )
 
 

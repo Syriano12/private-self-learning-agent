@@ -171,7 +171,8 @@ def test_metrics_calculate_counts_and_durations(tmp_path: Path) -> None:
     assert metrics["task_count"] == 1
     assert metrics["completed_tasks"] == 1
     assert metrics["action_count"] == 1
-    assert metrics["successful_actions"] == 1
+    # The security decision and the tool execution are both recorded actions.
+    assert metrics["successful_actions"] == 2
     assert metrics["verification_success"] == 1
     assert metrics["tool_failures"] == 0
     assert metrics["task_duration_ms"] >= 0
@@ -215,8 +216,9 @@ def test_tool_lifecycle_events_cover_success_and_failure(tmp_path: Path) -> None
     success_tool = DemoTool("success")
     failure_tool = DemoTool("failure", [ToolResult.failed("tool_failed", "controlled failure")])
     tools = registry(success_tool, failure_tool)
-    executor = GenericExecutor(tools)
-    context = ExecutionContext(task_id="tool-task", observability=monitor)
+    controller = SecurityController(store=store)
+    executor = GenericExecutor(tools, controller)
+    context = ExecutionContext(task_id="tool-task", security_controller=controller, observability=monitor)
     executor.execute_step(make_step("success"), context)
     executor.execute_step(make_step("failure", "failure-step"), context)
     types = [event["event_type"] for event in monitor.get_tool_events("tool-task")]

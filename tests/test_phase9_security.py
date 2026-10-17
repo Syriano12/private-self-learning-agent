@@ -166,7 +166,7 @@ def test_execution_boundary_blocks_high_risk_without_calling_tool_and_allows_exa
     store = Store(tmp_path / "boundary.sqlite3")
     controller = SecurityController(store=store)
     sensitive = SecurityTool("network_tool", capabilities=["NETWORK_ACCESS"], risk="high")
-    executor = GenericExecutor(tools(sensitive))
+    executor = GenericExecutor(tools(sensitive), controller)
     step = PlanStep("action-1", "network", "network_tool", {}, "test", [])
     blocked = executor.execute_step(
         step,
@@ -214,7 +214,7 @@ def test_denied_and_expired_approvals_never_execute(tmp_path: Path) -> None:
     store = Store(tmp_path / "denial-expiry.sqlite3")
     controller = SecurityController(store=store)
     high = SecurityTool("high_tool", capabilities=["NETWORK_ACCESS"], risk="high")
-    executor = GenericExecutor(tools(high))
+    executor = GenericExecutor(tools(high), controller)
     step = PlanStep("denial-action", "network", "high_tool", {}, "test", [])
 
     denied_decision = controller.preflight(
@@ -257,7 +257,7 @@ def test_approval_for_one_high_risk_capability_cannot_authorize_another(tmp_path
     store = Store(tmp_path / "capability-binding.sqlite3")
     controller = SecurityController(store=store)
     tool = SecurityTool("mutable_high", capabilities=["NETWORK_ACCESS"], risk="high")
-    executor = GenericExecutor(tools(tool))
+    executor = GenericExecutor(tools(tool), controller)
     step = PlanStep("bound-action", "network", "mutable_high", {}, "test", [])
     decision = controller.preflight(
         action(task_id="binding-task", action_id="bound-action", tool="mutable_high", capabilities=["NETWORK_ACCESS"])

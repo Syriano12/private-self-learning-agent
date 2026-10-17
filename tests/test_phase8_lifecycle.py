@@ -25,6 +25,7 @@ from private_agent.skills.lifecycle import (
     SkillStaticAnalyzer,
 )
 from private_agent.skills.registry import SkillRegistry
+from private_agent.security import SecurityController
 from private_agent.storage import Store
 
 
@@ -107,10 +108,12 @@ def candidate(
 
 
 def manager(store: Store, *, monitor: SkillRuntimeMonitor | None = None, **kwargs) -> SkillLifecycleManager:
+    security_controller = kwargs.pop("security_controller", SecurityController(store=store))
     return SkillLifecycleManager(
         SkillRegistry(store),
         mutation_engine=MutationTestingEngine(max_mutants=2, threshold=1.0),
         monitor=monitor,
+        security_controller=security_controller,
         **kwargs,
     )
 

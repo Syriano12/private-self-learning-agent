@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -8,6 +10,7 @@ import secrets
 import threading
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 from fastapi import APIRouter, Body, Depends, FastAPI, Header, HTTPException, Path as APIPath, Query, Request, status
@@ -18,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from private_agent.core.llm import build_provider
 from private_agent.core.orchestrator import Orchestrator
-from private_agent.core.task_state import StateIntegrityError, TaskState
+from private_agent.core.task_state import TASK_STATUSES, StateIntegrityError, TaskState
 from private_agent.observability import ObservabilityMonitor, safe_metadata
 from private_agent.security import ApprovalRequest, SecurityController
 from private_agent.storage import Store
@@ -119,6 +122,49 @@ class TaskCreateResponse(APIModel):
     idempotent_replay: bool = False
 
 
+class TaskStatusFilter(str, Enum):
+    CREATED = "CREATED"
+    QUEUED = "QUEUED"
+    PLANNING = "PLANNING"
+    READY = "READY"
+    EXECUTING = "EXECUTING"
+    EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"
+    OBSERVING = "OBSERVING"
+    VERIFYING = "VERIFYING"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+    COMPLETED = "COMPLETED"
+
+
+class TaskSummaryResponse(APIModel):
+    task_id: str
+    goal: str
+    status: str
+    queue_status: str
+    current_phase: str
+    current_step: str
+    plan_version: int
+    verification_status: str
+    attempt_count: int
+    created_at: str
+    updated_at: str
+    last_checkpoint_at: str
+    last_successful_checkpoint: str
+    available_at: str
+    last_error_code: str = ""
+    waiting_for_approval: bool = False
+    execution_unknown: bool = False
+
+
+class TaskListResponse(APIModel):
+    items: list[TaskSummaryResponse]
+    next_cursor: str | None = None
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
+
+
 class CheckpointResponse(APIModel):
     last_checkpoint_at: str
     last_successful_checkpoint: str
@@ -207,6 +253,7 @@ class MetricsResponse(APIModel):
     successful_actions: int = 0
     failed_actions: int = 0
     blocked_actions: int = 0
+    blocked_lifecycle_actions: int = 0
     verification_success: int = 0
     verification_failure: int = 0
     recovery_count: int = 0
@@ -302,6 +349,55 @@ def _safe_id(value: str, field: str) -> str:
     if not value or len(value) > 256 or not _REQUEST_ID_PATTERN.fullmatch(value):
         raise APIError(400, f"invalid_{field}", f"Invalid {field}")
     return value
+
+
+def _encode_task_cursor(created_at: str, task_id: str) -> str:
+    payload = json.dumps(
+        {"created_at": created_at, "task_id": task_id},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_task_cursor(cursor: str) -> tuple[str, str]:
+    if not cursor or len(cursor) > 512 or not re.fullmatch(r"[A-Za-z0-9_-]+", cursor):
+        raise APIError(400, "invalid_cursor", "Invalid task list cursor")
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise APIError(400, "invalid_cursor", "Invalid task list cursor") from exc
+    if not isinstance(payload, dict) or set(payload) != {"created_at", "task_id"}:
+        raise APIError(400, "invalid_cursor", "Invalid task list cursor")
+    created_at = payload.get("created_at")
+    task_id = payload.get("task_id")
+    if not isinstance(created_at, str) or not created_at or len(created_at) > 128:
+        raise APIError(400, "invalid_cursor", "Invalid task list cursor")
+    if not isinstance(task_id, str):
+        raise APIError(400, "invalid_cursor", "Invalid task list cursor")
+    try:
+        task_id = _safe_id(task_id, "cursor_task_id")
+    except APIError as exc:
+        raise APIError(400, "invalid_cursor", "Invalid task list cursor") from exc
+    return created_at, task_id
+
+
+def _verification_status(state: TaskState) -> str:
+    verification_status = "NOT_STARTED"
+    statuses = [str(item.get("status", "")) for item in state.verification_results.values() if isinstance(item, dict)]
+    if any(item in {"FAILED", "BLOCKED", "INSUFFICIENT"} for item in statuses):
+        verification_status = "FAILED"
+    elif statuses and all(item == "VERIFIED" for item in statuses):
+        verification_status = "VERIFIED"
+    elif statuses:
+        verification_status = statuses[-1]
+    if isinstance(state.result.get("verification"), dict):
+        result_status = state.result["verification"].get("status")
+        if result_status:
+            verification_status = str(result_status)
+    return verification_status
 
 
 def _request_id(request: Request) -> str:
@@ -402,18 +498,6 @@ class AgentAPIService:
                     updated_at=str(raw.get("updated_at", "")),
                 )
             )
-        verification_status = "NOT_STARTED"
-        statuses = [str(item.get("status", "")) for item in state.verification_results.values() if isinstance(item, dict)]
-        if any(item in {"FAILED", "BLOCKED", "INSUFFICIENT"} for item in statuses):
-            verification_status = "FAILED"
-        elif statuses and all(item == "VERIFIED" for item in statuses):
-            verification_status = "VERIFIED"
-        elif statuses:
-            verification_status = statuses[-1]
-        if isinstance(state.result.get("verification"), dict):
-            result_status = state.result["verification"].get("status")
-            if result_status:
-                verification_status = str(result_status)
         approvals: list[ApprovalResponse] = []
         if self.security is not None:
             for approval_id in sorted(set(state.approval_ids.values())):
@@ -432,7 +516,7 @@ class AgentAPIService:
             failed_actions=list(state.failed_actions),
             actions=actions,
             recovery_state=_public_value(state.recovery_state),
-            verification_status=verification_status,
+            verification_status=_verification_status(state),
             checkpoint=CheckpointResponse(
                 last_checkpoint_at=state.last_checkpoint_at,
                 last_successful_checkpoint=state.last_successful_checkpoint,
@@ -456,25 +540,75 @@ class AgentAPIService:
                 raise APIError(400, "invalid_idempotency_key", "Invalid Idempotency-Key")
             key = idempotency_key
         with self._lock:
-            if key:
-                existing = self.store.get_api_idempotency(key)
-                if existing is not None:
-                    if existing["request_fingerprint"] != fingerprint:
-                        raise APIError(409, "idempotency_conflict", "Idempotency-Key was already used for another request")
-                    state = self._state(existing["task_id"])
-                    return self._task_response(state, request_id=request_id, replay=True)
-            result = self.orchestrator.run(goal)
-            task_id = str(result.get("task_id", ""))
-            state = self._state(task_id)
-            response = self._task_response(state, request_id=request_id)
-            if key:
-                self.store.save_api_idempotency(
-                    key,
-                    fingerprint,
-                    task_id,
-                    response.model_dump_json(),
+            try:
+                created = self.store.create_queued_task(
+                    goal,
+                    idempotency_key=key,
+                    request_fingerprint=fingerprint if key else None,
                 )
-            return response
+            except ValueError as exc:
+                if str(exc) == "idempotency_conflict":
+                    raise APIError(409, "idempotency_conflict", "Idempotency-Key was already used for another request") from exc
+                raise APIError(422, str(exc), "Task could not be queued") from exc
+            state = self._state(str(created["task_id"]))
+            return self._task_response(state, request_id=request_id, replay=bool(created["replayed"]))
+
+    def list_tasks(
+        self,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        status_filter: str | None = None,
+        request_id: str = "",
+    ) -> TaskListResponse:
+        if limit < 1 or limit > 100:
+            raise APIError(422, "invalid_limit", "Task list limit must be between 1 and 100")
+        if status_filter is not None and status_filter not in TASK_STATUSES:
+            raise APIError(422, "invalid_status", "Invalid task status filter")
+        cursor_created_at = ""
+        cursor_task_id = ""
+        if cursor:
+            cursor_created_at, cursor_task_id = _decode_task_cursor(cursor)
+        rows = self.store.list_task_summaries(
+            limit=limit + 1,
+            cursor_created_at=cursor_created_at,
+            cursor_task_id=cursor_task_id,
+            status=status_filter,
+        )
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        items: list[TaskSummaryResponse] = []
+        for row in page:
+            try:
+                state_payload = json.loads(str(row["state_json"]))
+                state = TaskState.from_dict(state_payload)
+            except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise APIError(409, "task_state_untrusted", "Task state failed integrity validation", task_id=str(row.get("task_id", ""))) from exc
+            items.append(
+                TaskSummaryResponse(
+                    task_id=state.task_id,
+                    goal=str(_public_value(state.goal)),
+                    status=state.status,
+                    queue_status=str(row["queue_status"]),
+                    current_phase=state.current_phase,
+                    current_step=state.current_step,
+                    plan_version=state.plan_version,
+                    verification_status=_verification_status(state),
+                    attempt_count=int(row["attempt_count"]),
+                    created_at=state.created_at,
+                    updated_at=state.updated_at,
+                    last_checkpoint_at=state.last_checkpoint_at,
+                    last_successful_checkpoint=state.last_successful_checkpoint,
+                    available_at=str(row["available_at"]),
+                    last_error_code=str(row["last_error_code"]),
+                    waiting_for_approval=state.status == "WAITING_APPROVAL",
+                    execution_unknown=state.status == "EXECUTION_UNKNOWN",
+                )
+            )
+        next_cursor = None
+        if has_more and page:
+            next_cursor = _encode_task_cursor(str(page[-1]["created_at"]), str(page[-1]["task_id"]))
+        return TaskListResponse(items=items, next_cursor=next_cursor, request_id=request_id)
 
     def get_task(self, task_id: str, *, request_id: str = "") -> TaskStateResponse:
         return self.task_state_response(self._state(task_id), request_id=request_id)
@@ -482,7 +616,9 @@ class AgentAPIService:
     def resume_task(self, task_id: str, approval_ids: dict[str, str] | None = None, *, request_id: str = "") -> TaskStateResponse:
         task_id = _safe_id(task_id, "task_id")
         with self._lock:
-            self._state(task_id)
+            state = self._state(task_id)
+            if state.status == "QUEUED":
+                raise APIError(409, "task_queued", "Task is queued and has not started yet", task_id=task_id)
             self.orchestrator.resume_task(task_id, approval_ids=approval_ids or {})
             state = self._state(task_id)
             return self.task_state_response(state, request_id=request_id)
@@ -554,6 +690,7 @@ class AgentAPIService:
                 "approval_requests",
                 "observability_events",
                 "api_idempotency_keys",
+                "task_queue",
             }
             rows = self.store.db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             tables = {str(row["name"]) for row in rows}
@@ -638,35 +775,38 @@ def create_app(*, service: AgentAPIService | None = None, token: str | None = No
         if current_service is None and (request.url.path.startswith("/api/") or request.url.path == "/tasks/run"):
             current_service = _service(request)
         if current_service is not None:
-            current_service.observability.emit(
-                "API_REQUEST_STARTED",
-                correlation_id=request_id,
-                component="api",
-                metadata={"method": request.method, "path": request.url.path},
-            )
+            with current_service._lock:
+                current_service.observability.emit(
+                    "API_REQUEST_STARTED",
+                    correlation_id=request_id,
+                    component="api",
+                    metadata={"method": request.method, "path": request.url.path},
+                )
         try:
             response = await call_next(request)
         except Exception:
             if current_service is not None:
-                current_service.observability.emit(
-                    "API_REQUEST_FAILED",
-                    task_id=getattr(request.state, "task_id", ""),
-                    correlation_id=request_id,
-                    component="api",
-                    severity="ERROR",
-                    metadata={"method": request.method, "path": request.url.path},
-                )
+                with current_service._lock:
+                    current_service.observability.emit(
+                        "API_REQUEST_FAILED",
+                        task_id=getattr(request.state, "task_id", ""),
+                        correlation_id=request_id,
+                        component="api",
+                        severity="ERROR",
+                        metadata={"method": request.method, "path": request.url.path},
+                    )
             raise
         current_service = getattr(application.state, "agent_api_service", None)
         if current_service is not None:
-            current_service.observability.emit(
-                "API_REQUEST_COMPLETED",
-                task_id=getattr(request.state, "task_id", ""),
-                correlation_id=request_id,
-                component="api",
-                severity="ERROR" if response.status_code >= 500 else "INFO",
-                metadata={"method": request.method, "path": request.url.path, "status_code": response.status_code},
-            )
+            with current_service._lock:
+                current_service.observability.emit(
+                    "API_REQUEST_COMPLETED",
+                    task_id=getattr(request.state, "task_id", ""),
+                    correlation_id=request_id,
+                    component="api",
+                    severity="ERROR" if response.status_code >= 500 else "INFO",
+                    metadata={"method": request.method, "path": request.url.path, "status_code": response.status_code},
+                )
         response.headers["X-Request-ID"] = request_id
         return response
 
@@ -729,6 +869,21 @@ def create_app(*, service: AgentAPIService | None = None, token: str | None = No
         response = service.create_task(payload.goal, idempotency_key=idempotency_key, request_id=_request_id(request))
         request.state.task_id = response.task_id
         return response
+
+    @router.get("/tasks", response_model=TaskListResponse)
+    def list_tasks(
+        request: Request,
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=512),
+        status_filter: TaskStatusFilter | None = Query(default=None, alias="status"),
+        service: AgentAPIService = Depends(_service),
+    ) -> TaskListResponse:
+        return service.list_tasks(
+            limit=limit,
+            cursor=cursor,
+            status_filter=status_filter.value if status_filter is not None else None,
+            request_id=_request_id(request),
+        )
 
     @router.get("/tasks/{task_id}", response_model=TaskStateResponse)
     def get_task(

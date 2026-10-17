@@ -93,15 +93,16 @@ class StepResult:
 class GenericExecutor:
     """Execute any registered ToolContract without knowing concrete tool names."""
 
-    def __init__(self, tools: ToolRegistry) -> None:
+    def __init__(self, tools: ToolRegistry, security_controller: Any | None = None) -> None:
         self.tools = tools
+        self.security_controller = security_controller
 
     def execute_plan(
         self,
         plan: TaskPlan,
         context: ExecutionContext | None = None,
     ) -> list[StepResult]:
-        execution_context = context or ExecutionContext()
+        execution_context = context or ExecutionContext(security_controller=self.security_controller)
         results: list[StepResult] = []
         for step in plan.steps:
             result = self.execute_step(step, execution_context)
@@ -110,7 +111,7 @@ class GenericExecutor:
         return results
 
     def execute_step(self, step: PlanStep, context: ExecutionContext | None = None) -> StepResult:
-        execution_context = context or ExecutionContext()
+        execution_context = context or ExecutionContext(security_controller=self.security_controller)
         started = monotonic()
         base_metadata = {"task_id": execution_context.task_id, "tool_name": step.tool}
         observer = execution_context.observability
@@ -141,6 +142,24 @@ class GenericExecutor:
                     },
                 )
             return result
+
+        trusted_controller = self.security_controller
+        if trusted_controller is None:
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "security_not_configured",
+                "Execution requires an initialized SecurityController owned by the executor",
+                metadata=self._timed(base_metadata, started),
+            ))
+        if trusted_controller is not None and execution_context.security_controller not in (None, trusted_controller):
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "security_controller_mismatch",
+                "ExecutionContext cannot replace the executor's trusted SecurityController",
+                metadata=self._timed(base_metadata, started),
+            ))
 
         try:
             tool = self.tools.get(step.tool)
@@ -176,42 +195,42 @@ class GenericExecutor:
             ))
 
         security_action = None
-        if execution_context.security_controller is not None:
-            security_action = execution_context.security_controller.action_for_tool(
-                execution_context.task_id,
+        security_action = trusted_controller.action_for_tool(
+            execution_context.task_id,
+            step.id,
+            tool,
+            step.input,
+            goal=str(execution_context.metadata.get("goal", "")),
+        )
+        security_decision = trusted_controller.authorize(
+            security_action,
+            approval_id=execution_context.approval_ids.get(step.id, "")
+            or execution_context.approval_ids.get(step.tool, ""),
+            boundary=True,
+        )
+        if not security_decision.allowed:
+            security_code = (
+                "permission_not_approved"
+                if security_decision.decision == "REQUIRE_APPROVAL"
+                else "security_policy_blocked"
+            )
+            return finish(StepResult.blocked(
                 step.id,
-                tool,
-                step.input,
-            )
-            security_decision = execution_context.security_controller.authorize(
-                security_action,
-                approval_id=execution_context.approval_ids.get(step.id, "")
-                or execution_context.approval_ids.get(step.tool, ""),
-                boundary=True,
-            )
-            if not security_decision.allowed:
-                security_code = (
-                    "permission_not_approved"
-                    if security_decision.decision == "REQUIRE_APPROVAL"
-                    else "security_policy_blocked"
-                )
-                return finish(StepResult.blocked(
-                    step.id,
-                    step.tool,
-                    security_code,
-                    f"Security policy blocked execution: {security_decision.decision}",
-                    details=security_decision.to_dict(),
-                    metadata=self._timed({**base_metadata, "security_decision": security_decision.to_dict()}, started),
-                ))
+                step.tool,
+                security_code,
+                f"Security policy blocked execution: {security_decision.decision}",
+                details=security_decision.to_dict(),
+                metadata=self._timed({**base_metadata, "security_decision": security_decision.to_dict()}, started),
+            ))
 
         permission = getattr(tool, "permission_level", "unknown")
         if permission not in execution_context.approved_permissions:
-            if security_action is not None:
-                execution_context.security_controller.record_blocked(
-                    security_action,
-                    reason=f"Existing permission set does not include {permission}",
-                    metadata={"required_permission": permission},
-                )
+            trusted_controller.record_blocked(
+                security_action,
+                reason=f"Existing permission set does not include {permission}",
+                authorization=security_decision,
+                metadata={"required_permission": permission},
+            )
             return finish(StepResult.blocked(
                 step.id,
                 step.tool,
@@ -232,31 +251,40 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
-        try:
-            tool_result = tool.execute(step.input, execution_context)
-        except Exception as exc:
-            if security_action is not None:
-                execution_context.security_controller.record_execution(
-                    security_action,
-                    success=False,
-                    metadata={"exception_type": type(exc).__name__},
-                )
+        def validate_tool_result(value: Any) -> tuple[bool, dict[str, Any]]:
+            if not isinstance(value, ToolResult) or value.status not in {"success", "failed", "blocked"}:
+                return False, {"error": "malformed_tool_result"}
+            if value.status == "success":
+                output_errors = validate_schema_value(value.output, tool.output_schema(), path="output")
+                if output_errors:
+                    return False, {"error": "malformed_tool_result", "details": output_errors}
+            return value.status == "success", {"tool_status": value.status}
+
+        operation = lambda: tool.execute(step.input, execution_context)
+        operation_binding = trusted_controller._bind_operation(
+            security_action,
+            operation,
+            kind="tool",
+        )
+        execution = trusted_controller.execute_authorized(
+            security_action,
+            operation,
+            authorization=security_decision,
+            result_validator=validate_tool_result,
+            operation_binding=operation_binding,
+        )
+        if execution.exception is not None:
             return finish(StepResult.failed(
                 step.id,
                 step.tool,
                 "tool_exception",
-                f"Tool execution failed: {type(exc).__name__}",
-                details={"exception_type": type(exc).__name__},
+                f"Tool execution failed: {type(execution.exception).__name__}",
+                details={"exception_type": type(execution.exception).__name__},
                 metadata=self._timed(base_metadata, started),
             ))
 
+        tool_result = execution.result
         if not isinstance(tool_result, ToolResult) or tool_result.status not in {"success", "failed", "blocked"}:
-            if security_action is not None:
-                execution_context.security_controller.record_execution(
-                    security_action,
-                    success=False,
-                    metadata={"error": "malformed_tool_result"},
-                )
             return finish(StepResult.failed(
                 step.id,
                 step.tool,
@@ -268,12 +296,6 @@ class GenericExecutor:
         if tool_result.status == "success":
             output_errors = validate_schema_value(tool_result.output, tool.output_schema(), path="output")
             if output_errors:
-                if security_action is not None:
-                    execution_context.security_controller.record_execution(
-                        security_action,
-                        success=False,
-                        metadata={"error": "malformed_tool_result", "details": output_errors},
-                    )
                 return finish(StepResult.failed(
                     step.id,
                     step.tool,
@@ -282,12 +304,6 @@ class GenericExecutor:
                     details={"errors": output_errors},
                     metadata=self._timed(base_metadata, started),
                 ))
-            if security_action is not None:
-                execution_context.security_controller.record_execution(
-                    security_action,
-                    success=True,
-                    metadata={"tool_status": "success"},
-                )
             return finish(StepResult.success(
                 step.id,
                 step.tool,
@@ -295,12 +311,6 @@ class GenericExecutor:
                 metadata={**tool_result.metadata, **self._timed(base_metadata, started)},
             ))
 
-        if security_action is not None:
-            execution_context.security_controller.record_execution(
-                security_action,
-                success=tool_result.status == "success",
-                metadata={"tool_status": tool_result.status},
-            )
         return finish(StepResult(
             step_id=step.id,
             tool_name=step.tool,

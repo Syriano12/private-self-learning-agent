@@ -135,6 +135,11 @@ def create_high_task(client: TestClient, *, key: str = "high-1"):
     return response, response.json()["task_id"]
 
 
+def run_core_task(service: AgentAPIService, goal: str) -> tuple[dict, str]:
+    result = service.orchestrator.run(goal)
+    return result, str(result["task_id"])
+
+
 def test_authentication_rejects_missing_invalid_and_malformed_credentials(tmp_path: Path) -> None:
     service, store, monitor = make_service(tmp_path, APITestTool("safe"))
     client = client_for(service)
@@ -154,13 +159,13 @@ def test_valid_authentication_creates_real_typed_task_response(tmp_path: Path) -
     response, task_id = create_low_task(client)
     body = response.json()
     assert body["task_id"] == task_id
-    assert body["status"] == "COMPLETED"
-    assert body["current_phase"] == "TASK_COMPLETED"
+    assert body["status"] == "QUEUED"
+    assert body["current_phase"] == "QUEUED"
     assert body["created_at"]
     assert body["api_version"] == "v1"
     assert body["schema_version"] == 1
     assert body["request_id"] == response.headers["X-Request-ID"]
-    assert store.get_task_state(task_id)["status"] == "COMPLETED"
+    assert store.get_task_state(task_id)["status"] == "QUEUED"
     store.close()
 
 
@@ -185,10 +190,10 @@ def test_task_get_is_safe_and_unknown_task_is_404(tmp_path: Path) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["task_id"] == task_id
-    assert body["status"] == "COMPLETED"
-    assert body["plan_version"] == 1
-    assert body["checkpoint"]["last_successful_checkpoint"] == "TASK_COMPLETED"
-    assert body["verification_status"] == "VERIFIED"
+    assert body["status"] == "QUEUED"
+    assert body["plan_version"] == 0
+    assert body["checkpoint"]["last_successful_checkpoint"] == "TASK_QUEUED"
+    assert body["verification_status"] == "NOT_STARTED"
     assert '"value":"safe"' not in response.text
     assert "raw sensitive payload" not in response.text
     unknown = client.get("/api/v1/tasks/not-a-real-task", headers=auth_headers())
@@ -206,7 +211,7 @@ def test_task_idempotency_replays_without_duplicate_execution_and_conflicts_safe
     assert replay.status_code == 201
     assert replay.json()["task_id"] == task_id
     assert replay.json()["idempotent_replay"] is True
-    assert tool.calls == 1
+    assert tool.calls == 0
     conflict = client.post("/api/v1/tasks", json={"goal": "a different goal"}, headers=auth_headers(key="stable-key"))
     assert conflict.status_code == 409
     assert conflict.json()["error_code"] == "idempotency_conflict"
@@ -226,7 +231,7 @@ def test_concurrent_same_idempotency_key_returns_one_task(tmp_path: Path) -> Non
         results = list(pool.map(lambda _: submit(), range(2)))
     assert all(status == 201 for status, _ in results)
     assert len({task_id for _, task_id in results}) == 1
-    assert tool.calls == 1
+    assert tool.calls == 0
     store.close()
 
 
@@ -236,9 +241,9 @@ def test_resume_calls_core_and_terminal_resume_does_not_execute_again(tmp_path: 
     client = client_for(service)
     _, task_id = create_low_task(client)
     resumed = client.post(f"/api/v1/tasks/{task_id}/resume", json={}, headers=auth_headers())
-    assert resumed.status_code == 200
-    assert resumed.json()["status"] == "COMPLETED"
-    assert tool.calls == 1
+    assert resumed.status_code == 409
+    assert resumed.json()["error_code"] == "task_queued"
+    assert tool.calls == 0
     assert client.post("/api/v1/tasks/not-real/resume", json={}, headers=auth_headers()).status_code == 404
     store.close()
 
@@ -252,8 +257,8 @@ def test_execution_unknown_resume_does_not_blindly_retry(tmp_path: Path) -> None
 
     service, store, _ = make_service(tmp_path, tool, hook=interrupt)
     client = client_for(service)
-    failed_create = client.post("/api/v1/tasks", json={"goal": "unknown execution task"}, headers=auth_headers())
-    assert failed_create.status_code == 500
+    with pytest.raises(TaskInterrupted):
+        service.orchestrator.run("unknown execution task")
     task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
     resumed = client.post(f"/api/v1/tasks/{task_id}/resume", json={}, headers=auth_headers())
     assert resumed.status_code == 200
@@ -270,8 +275,8 @@ def test_approval_list_inspect_approve_and_resume_preserve_binding(tmp_path: Pat
     tool = APITestTool("network", capabilities=["NETWORK_ACCESS"], risk="high")
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)
-    created, task_id = create_high_task(client)
-    assert created.json()["status"] == "WAITING_APPROVAL"
+    _, task_id = run_core_task(service, "request a controlled high risk action")
+    assert store.get_task_state(task_id)["status"] == "WAITING_APPROVAL"
     pending = client.get("/api/v1/approvals", headers=auth_headers())
     assert pending.status_code == 200
     assert len(pending.json()) == 1
@@ -305,13 +310,13 @@ def test_approval_deny_and_expiry_are_safe_and_non_executable(tmp_path: Path) ->
     tool = APITestTool("network", capabilities=["NETWORK_ACCESS"], risk="high")
     service, store, _ = make_service(tmp_path, tool)
     client = client_for(service)
-    _, task_id = create_high_task(client, key="deny-task")
+    _, task_id = run_core_task(service, "request a controlled high risk action")
     approval_id = client.get("/api/v1/approvals", headers=auth_headers()).json()[0]["approval_id"]
     denied = client.post(f"/api/v1/approvals/{approval_id}/deny", json={}, headers=auth_headers())
     assert denied.status_code == 200
     assert denied.json()["status"] == "DENIED"
     assert tool.calls == 0
-    _, expired_task_id = create_high_task(client, key="expired-task")
+    _, expired_task_id = run_core_task(service, "request another controlled high risk action")
     expired_id = client.get("/api/v1/approvals", headers=auth_headers()).json()[0]["approval_id"]
     request = service.security.approval_gate.get(expired_id)
     request.expires_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
@@ -334,8 +339,8 @@ def test_api_cannot_bypass_capability_or_quarantined_skill_boundaries(tmp_path: 
     )
     service, store, monitor = make_service(tmp_path, mismatch)
     client = client_for(service)
-    created, task_id = create_low_task(client, key="mismatch")
-    assert created.json()["status"] == "BLOCKED"
+    result, task_id = run_core_task(service, "complete a safe API task")
+    assert result["final_status"] == "BLOCKED"
     assert mismatch.calls == 0
     security_events = client.get(f"/api/v1/security-events?task_id={task_id}", headers=auth_headers())
     assert security_events.status_code == 200
@@ -348,7 +353,7 @@ def test_observability_timeline_metrics_failures_security_and_tools_are_read_onl
     tool = APITestTool("safe", [ToolResult.failed("tool_failed", "controlled failure")])
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)
-    _, task_id = create_low_task(client, key="failure-task")
+    _, task_id = run_core_task(service, "complete a safe API task")
     timeline = client.get(f"/api/v1/tasks/{task_id}/timeline", headers=auth_headers())
     assert timeline.status_code == 200
     events = timeline.json()
@@ -405,7 +410,7 @@ def test_api_created_task_timeline_and_approval_survive_service_restart(tmp_path
     tool = APITestTool("network", capabilities=["NETWORK_ACCESS"], risk="high")
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)
-    created, task_id = create_high_task(client, key="restart-high")
+    _, task_id = run_core_task(service, "request a controlled high risk action")
     approval_id = client.get("/api/v1/approvals", headers=auth_headers()).json()[0]["approval_id"]
     store.close()
     reopened = Store(path)
@@ -433,7 +438,7 @@ def test_duplicate_approval_requests_are_serialized_and_state_remains_valid(tmp_
     tool = APITestTool("network", capabilities=["NETWORK_ACCESS"], risk="high")
     service, store, _ = make_service(tmp_path, tool)
     client = client_for(service)
-    _, task_id = create_high_task(client, key="approval-race")
+    _, task_id = run_core_task(service, "request a controlled high risk action")
     approval_id = client.get("/api/v1/approvals", headers=auth_headers()).json()[0]["approval_id"]
 
     def approve() -> int:
@@ -452,7 +457,7 @@ def test_approval_resume_race_has_no_500_and_never_executes_twice(tmp_path: Path
     tool = APITestTool("network", capabilities=["NETWORK_ACCESS"], risk="high")
     service, store, _ = make_service(tmp_path, tool)
     client = client_for(service)
-    _, task_id = create_high_task(client, key="approval-resume-race")
+    _, task_id = run_core_task(service, "request a controlled high risk action")
     approval_id = client.get("/api/v1/approvals", headers=auth_headers()).json()[0]["approval_id"]
 
     def approve() -> int:

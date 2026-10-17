@@ -35,6 +35,7 @@ EVENT_TYPES = frozenset(
         "ACTION_COMPLETED",
         "ACTION_FAILED",
         "ACTION_BLOCKED",
+        "ACTION_LIFECYCLE_BLOCKED",
         "EXECUTION_UNKNOWN",
         "OBSERVATION_STARTED",
         "OBSERVATION_COMPLETED",
@@ -90,6 +91,7 @@ _FAILURE_EVENTS = frozenset(
         "PLAN_REJECTED",
         "ACTION_FAILED",
         "ACTION_BLOCKED",
+        "ACTION_LIFECYCLE_BLOCKED",
         "EXECUTION_UNKNOWN",
         "VERIFICATION_FAILED",
         "SECURITY_DENY",
@@ -371,7 +373,7 @@ class ObservabilityMonitor:
         action_ids = {
             (event.get("task_id", ""), event.get("action_id"))
             for event in events
-            if event["event_type"] in {"ACTION_PROPOSED", "ACTION_STARTED", "ACTION_COMPLETED", "ACTION_FAILED", "ACTION_BLOCKED"}
+            if event["event_type"] in {"ACTION_PROPOSED", "ACTION_STARTED", "ACTION_COMPLETED", "ACTION_FAILED", "ACTION_BLOCKED", "ACTION_LIFECYCLE_BLOCKED"}
             and event.get("action_id")
         }
         counts = {
@@ -383,6 +385,7 @@ class ObservabilityMonitor:
             "successful_actions": sum(event["event_type"] == "ACTION_COMPLETED" for event in events),
             "failed_actions": sum(event["event_type"] == "ACTION_FAILED" for event in events),
             "blocked_actions": sum(event["event_type"] == "ACTION_BLOCKED" for event in events),
+            "blocked_lifecycle_actions": sum(event["event_type"] == "ACTION_LIFECYCLE_BLOCKED" for event in events),
             "verification_success": sum(event["event_type"] == "VERIFICATION_PASSED" for event in events),
             "verification_failure": sum(event["event_type"] == "VERIFICATION_FAILED" for event in events),
             "recovery_count": sum(event["event_type"] == "RECOVERY_STARTED" for event in events),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,13 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
+CURRENT_SCHEMA_VERSION = 4
+
+
+class UnsupportedSchemaVersion(RuntimeError):
+    """Raised when a database is newer than this application understands."""
+
+
 class Store:
     def __init__(self, path: str | Path = "data/agent.sqlite3") -> None:
         self.path = Path(path)
@@ -43,7 +51,40 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.init_schema()
 
+    @staticmethod
+    def _required_objects(version: int) -> tuple[tuple[str, str], ...]:
+        if version == 2:
+            return (
+                ("table", "owner_permission_rules"),
+                ("table", "owner_policy_audit"),
+                ("index", "idx_owner_rules_active_scope"),
+                ("index", "idx_owner_rules_expiry"),
+            )
+        if version == 3:
+            return (
+                ("table", "owner_policy_state"),
+                ("table", "owner_permission_rule_history"),
+            )
+        if version == 4:
+            return (
+                ("table", "task_queue"),
+                ("index", "idx_task_queue_claim"),
+                ("index", "idx_task_queue_lease"),
+            )
+        return ()
+
+    def _assert_migration_objects(self, version: int) -> None:
+        for object_type, name in self._required_objects(version):
+            row = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?",
+                (object_type, name),
+            ).fetchone()
+            if row is None:
+                raise UnsupportedSchemaVersion(f"inconsistent_schema_version:{version}:missing_{object_type}:{name}")
+
     def init_schema(self) -> None:
+        self.db.execute("PRAGMA foreign_keys = ON")
+        self.db.execute("PRAGMA busy_timeout = 5000")
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS tasks (
           id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
@@ -189,11 +230,252 @@ class Store:
           created_at TEXT NOT NULL
         );
         """)
-        self.db.execute(
-            "INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?,?)",
-            (1, now()),
+        # The historical schema is version 1.  Keep its creation intact, then
+        # apply only monotonic migrations for databases opened by newer code.
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?,?)",
+                (1, now()),
+            )
+            rows = self.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version").fetchall()
+            versions = {int(row["schema_version"]) for row in rows}
+            unsupported = sorted(version for version in versions if version > CURRENT_SCHEMA_VERSION)
+            if unsupported:
+                raise UnsupportedSchemaVersion(f"unsupported_schema_version:{unsupported[-1]}")
+            for version in sorted(versions):
+                if version >= 2:
+                    self._assert_migration_objects(version)
+            for version in range(2, CURRENT_SCHEMA_VERSION + 1):
+                if version not in versions:
+                    self._apply_migration(version)
+
+    def _apply_migration(self, version: int) -> None:
+        """Apply one migration inside the caller's transaction, monotonically."""
+        if version == 2:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS owner_permission_rules (
+              rule_id TEXT PRIMARY KEY, policy_version INTEGER NOT NULL,
+              actor TEXT NOT NULL, effect TEXT NOT NULL, scope_type TEXT NOT NULL,
+              scope_key TEXT NOT NULL, conditions_json TEXT NOT NULL,
+              expires_at TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL,
+              created_at TEXT NOT NULL, disabled_at TEXT NOT NULL
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_owner_rules_active_scope ON owner_permission_rules(status, scope_type, scope_key)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_owner_rules_expiry ON owner_permission_rules(status, expires_at)")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS owner_policy_audit (
+              event_id TEXT PRIMARY KEY, rule_id TEXT NOT NULL,
+              policy_version INTEGER NOT NULL, event_type TEXT NOT NULL,
+              actor TEXT NOT NULL, previous_json TEXT NOT NULL,
+              new_json TEXT NOT NULL, reason TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )""")
+            self.db.execute("INSERT INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (2, now()))
+            return
+        if version == 3:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS owner_policy_state (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              current_version INTEGER NOT NULL CHECK (current_version >= 0),
+              updated_at TEXT NOT NULL
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS owner_permission_rule_history (
+              history_id TEXT PRIMARY KEY, rule_id TEXT NOT NULL,
+              policy_version INTEGER NOT NULL, event_type TEXT NOT NULL,
+              snapshot_json TEXT NOT NULL, actor TEXT NOT NULL,
+              reason TEXT NOT NULL, created_at TEXT NOT NULL
+            )""")
+            security = self.db.execute("SELECT COALESCE(MAX(policy_version), 0) AS version FROM security_policies").fetchone()
+            rules = self.db.execute("SELECT COALESCE(MAX(policy_version), 0) AS version FROM owner_permission_rules").fetchone()
+            initial = max(int(security["version"] or 0), int(rules["version"] or 0))
+            self.db.execute(
+                "INSERT INTO owner_policy_state(singleton, current_version, updated_at) VALUES (1, ?, ?)",
+                (initial, now()),
+            )
+            self.db.execute("INSERT INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (3, now()))
+            return
+        if version == 4:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_queue (
+              task_id TEXT PRIMARY KEY,
+              queue_status TEXT NOT NULL CHECK (queue_status IN (
+                'QUEUED', 'LEASED', 'WAITING_APPROVAL', 'RETRY_WAIT',
+                'EXECUTION_UNKNOWN', 'COMPLETED', 'FAILED', 'BLOCKED'
+              )),
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+              max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
+              available_at TEXT NOT NULL,
+              lease_id TEXT NOT NULL DEFAULT '',
+              worker_id TEXT NOT NULL DEFAULT '',
+              lease_acquired_at TEXT NOT NULL DEFAULT '',
+              lease_expires_at TEXT NOT NULL DEFAULT '',
+              last_started_at TEXT NOT NULL DEFAULT '',
+              last_finished_at TEXT NOT NULL DEFAULT '',
+              last_error_code TEXT NOT NULL DEFAULT '',
+              last_error_message TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_queue_claim "
+                "ON task_queue(queue_status, available_at, created_at, task_id)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_queue_lease "
+                "ON task_queue(queue_status, lease_expires_at)"
+            )
+            self.db.execute("""INSERT OR IGNORE INTO task_queue
+              (task_id, queue_status, attempt_count, max_attempts, available_at,
+               lease_id, worker_id, lease_acquired_at, lease_expires_at,
+               last_started_at, last_finished_at, last_error_code, last_error_message,
+               created_at, updated_at)
+              SELECT task_id,
+                     CASE status
+                       WHEN 'COMPLETED' THEN 'COMPLETED'
+                       WHEN 'BLOCKED' THEN 'BLOCKED'
+                       WHEN 'FAILED' THEN 'FAILED'
+                       WHEN 'WAITING_APPROVAL' THEN 'WAITING_APPROVAL'
+                       WHEN 'EXECUTION_UNKNOWN' THEN 'EXECUTION_UNKNOWN'
+                       WHEN 'EXECUTING' THEN 'EXECUTION_UNKNOWN'
+                       WHEN 'OBSERVING' THEN 'EXECUTION_UNKNOWN'
+                       WHEN 'VERIFYING' THEN 'EXECUTION_UNKNOWN'
+                       ELSE 'QUEUED'
+                     END,
+                     0, 3, created_at, '', '', '', '', '', '', '', '', created_at, updated_at
+                FROM task_states""")
+            self.db.execute("INSERT INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (4, now()))
+            return
+        raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
+
+    def latest_owner_policy_version(self) -> int:
+        row = self.db.execute("SELECT current_version FROM owner_policy_state WHERE singleton = 1").fetchone()
+        if row is None:
+            raise UnsupportedSchemaVersion("missing_owner_policy_state")
+        return int(row["current_version"])
+
+    def _allocate_owner_policy_version(self) -> int:
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise RuntimeError("owner_policy_version_busy") from exc
+            raise
+        try:
+            current = self.latest_owner_policy_version()
+            version = current + 1
+            self.db.execute(
+                "UPDATE owner_policy_state SET current_version = ?, updated_at = ? WHERE singleton = 1",
+                (version, now()),
+            )
+            return version
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def owner_permission_rules(self, *, active_only: bool = True) -> list[dict[str, Any]]:
+        query = "SELECT * FROM owner_permission_rules"
+        if active_only:
+            query += " WHERE status = 'ACTIVE' AND (expires_at = '' OR expires_at > ?)"
+            rows = self.db.execute(query + " ORDER BY policy_version DESC, created_at DESC", (now(),)).fetchall()
+        else:
+            rows = self.db.execute(query + " ORDER BY policy_version DESC, created_at DESC").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["conditions"] = json.loads(item.pop("conditions_json"))
+            result.append(item)
+        return result
+
+    def create_owner_permission_rule(self, rule: Any, *, actor: str, reason: str) -> dict[str, Any]:
+        payload = rule.to_dict() if hasattr(rule, "to_dict") else dict(rule)
+        from private_agent.security import OwnerPermissionRule
+
+        validated = OwnerPermissionRule(
+            rule_id=str(payload.get("rule_id", "")),
+            effect=str(payload.get("effect", "")),
+            scope_type=str(payload.get("scope_type", "")),
+            scope_key=str(payload.get("scope_key", "")),
+            conditions=dict(payload.get("conditions", {})),
+            expires_at=str(payload.get("expires_at", "")),
+            policy_version=int(payload.get("policy_version", 0)),
+            actor=actor,
+            reason=reason,
+            created_at=str(payload.get("created_at") or now()),
         )
-        self.db.commit()
+        payload = validated.to_dict()
+        stamp = now()
+        with self.db:
+            version = self._allocate_owner_policy_version()
+            payload["policy_version"] = version
+            payload["actor"] = actor
+            payload["reason"] = reason
+            payload["created_at"] = payload.get("created_at") or stamp
+            payload["status"] = "ACTIVE"
+            payload.setdefault("disabled_at", "")
+            self.db.execute(
+                """INSERT INTO owner_permission_rules
+                (rule_id, policy_version, actor, effect, scope_type, scope_key, conditions_json,
+                 expires_at, reason, status, created_at, disabled_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (payload["rule_id"], version, actor, payload["effect"], payload["scope_type"],
+                 payload["scope_key"], json.dumps(payload.get("conditions", {}), sort_keys=True),
+                 payload.get("expires_at", ""), reason, "ACTIVE", payload["created_at"], ""),
+            )
+            snapshot = json.dumps(payload, sort_keys=True)
+            self.db.execute(
+                """INSERT INTO owner_policy_audit
+                (event_id, rule_id, policy_version, event_type, actor, previous_json, new_json, reason, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (f"owner-policy:{payload['rule_id']}:{version}", payload["rule_id"], version,
+                 "RULE_CREATED", actor, "{}", snapshot, reason, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO owner_permission_rule_history
+                (history_id, rule_id, policy_version, event_type, snapshot_json, actor, reason, created_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (f"owner-rule-history:{payload['rule_id']}:{version}", payload["rule_id"], version,
+                 "RULE_CREATED", snapshot, actor, reason, stamp),
+            )
+        return payload
+
+    def disable_owner_permission_rule(self, rule_id: str, *, actor: str, reason: str) -> dict[str, Any]:
+        if not actor or len(actor) > 256:
+            raise ValueError("owner_actor_required")
+        if not reason or len(reason) > 1000:
+            raise ValueError("owner_rule_reason_required")
+        with self.db:
+            row = self.db.execute("SELECT * FROM owner_permission_rules WHERE rule_id = ?", (rule_id,)).fetchone()
+            if row is None:
+                raise KeyError("owner_rule_not_found")
+            previous = dict(row)
+            version = self._allocate_owner_policy_version()
+            stamp = now()
+            self.db.execute("UPDATE owner_permission_rules SET status='DISABLED', disabled_at=?, policy_version=? WHERE rule_id=?", (stamp, version, rule_id))
+            updated = dict(self.db.execute("SELECT * FROM owner_permission_rules WHERE rule_id = ?", (rule_id,)).fetchone())
+            snapshot = json.dumps(updated, sort_keys=True)
+            self.db.execute(
+                """INSERT INTO owner_policy_audit
+                (event_id, rule_id, policy_version, event_type, actor, previous_json, new_json, reason, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (f"owner-policy:{rule_id}:{version}", rule_id, version, "RULE_DISABLED", actor,
+                 json.dumps(previous, sort_keys=True), snapshot, reason, stamp),
+            )
+            self.db.execute(
+                """INSERT INTO owner_permission_rule_history
+                (history_id, rule_id, policy_version, event_type, snapshot_json, actor, reason, created_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (f"owner-rule-history:{rule_id}:{version}", rule_id, version,
+                 "RULE_DISABLED", snapshot, actor, reason, stamp),
+            )
+        return updated
+
+    def owner_permission_rule_history(self, rule_id: str | None = None) -> list[dict[str, Any]]:
+        if rule_id is None:
+            rows = self.db.execute("SELECT * FROM owner_permission_rule_history ORDER BY policy_version, created_at").fetchall()
+        else:
+            rows = self.db.execute("SELECT * FROM owner_permission_rule_history WHERE rule_id = ? ORDER BY policy_version, created_at", (rule_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def owner_policy_audit(self) -> list[dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM owner_policy_audit ORDER BY policy_version, created_at").fetchall()
+        return [dict(row) for row in rows]
 
     def save_task(self, task_id: str, goal: str, status: str, plan: Any, result: Any, attempts: int) -> None:
         stamp = now()
@@ -221,89 +503,234 @@ class Store:
         )
         self.db.commit()
 
-    def save_task_state(self, state: Any, checkpoint_type: str, *, task_status: str | None = None) -> None:
-        """Persist state, checkpoint and action records in one SQLite transaction."""
-        payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
+    def _persist_task_state_in_transaction(
+        self,
+        payload: dict[str, Any],
+        checkpoint_type: str,
+        *,
+        task_status: str | None = None,
+    ) -> None:
+        """Persist one state snapshot while the caller owns the transaction."""
         task_id = str(payload["task_id"])
         status = str(task_status or payload["status"])
         created_at = str(payload["created_at"])
         updated_at = str(payload["updated_at"])
         state_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         checkpoint_at = str(payload.get("last_checkpoint_at") or updated_at or now())
+        row = self.db.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM task_checkpoints WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        sequence = int(row["sequence"] or 0) + 1
+        self.db.execute(
+            """INSERT OR REPLACE INTO task_states
+            (task_id, state_version, status, current_phase, current_step,
+             plan_version, plan_fingerprint, state_fingerprint, state_json,
+             created_at, updated_at, last_checkpoint_at, last_successful_checkpoint)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                task_id,
+                int(payload["state_version"]),
+                status,
+                payload["current_phase"],
+                payload["current_step"],
+                int(payload["plan_version"]),
+                payload["plan_fingerprint"],
+                payload["state_fingerprint"],
+                state_json,
+                created_at,
+                updated_at,
+                payload["last_checkpoint_at"],
+                payload["last_successful_checkpoint"],
+            ),
+        )
+        self.db.execute(
+            """INSERT INTO task_checkpoints
+            (checkpoint_id, task_id, sequence, checkpoint_type, state_version,
+             state_fingerprint, state_json, created_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                f"{task_id}:{sequence}",
+                task_id,
+                sequence,
+                checkpoint_type,
+                int(payload["state_version"]),
+                payload["state_fingerprint"],
+                state_json,
+                checkpoint_at,
+            ),
+        )
+        for action_key, action_payload in payload.get("action_records", {}).items():
+            self.db.execute(
+                """INSERT OR REPLACE INTO task_action_records
+                (action_key, task_id, step_id, tool_name, status, action_json, updated_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (
+                    action_key,
+                    task_id,
+                    action_payload.get("step_id", ""),
+                    action_payload.get("tool_name", ""),
+                    action_payload.get("status", "NOT_STARTED"),
+                    json.dumps(action_payload, ensure_ascii=False, sort_keys=True),
+                    action_payload.get("updated_at", updated_at),
+                ),
+            )
+        self.db.execute(
+            """INSERT OR REPLACE INTO tasks
+            (id, goal, status, plan_json, result_json, attempts, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                task_id,
+                payload["goal"],
+                status.lower(),
+                json.dumps(payload.get("plan", {}), ensure_ascii=False, sort_keys=True),
+                json.dumps(payload.get("result", {}), ensure_ascii=False, sort_keys=True),
+                int(payload.get("context", {}).get("attempts", 0)),
+                created_at,
+                updated_at,
+            ),
+        )
+
+    def save_task_state(self, state: Any, checkpoint_type: str, *, task_status: str | None = None) -> None:
+        """Persist state, checkpoint and action records in one SQLite transaction."""
+        payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
         with self.db:
-            row = self.db.execute(
-                "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM task_checkpoints WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            sequence = int(row["sequence"] or 0) + 1
+            self._persist_task_state_in_transaction(payload, checkpoint_type, task_status=task_status)
+
+    def create_queued_task(
+        self,
+        goal: str,
+        *,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Atomically create a QUEUED state, checkpoint, queue row, and idempotency record."""
+        from private_agent.core.task_state import TaskState
+
+        if not goal or not goal.strip():
+            raise ValueError("goal_required")
+        if max_attempts < 1:
+            raise ValueError("max_attempts_invalid")
+        if idempotency_key is not None and not request_fingerprint:
+            raise ValueError("request_fingerprint_required")
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if idempotency_key:
+                existing = self.db.execute(
+                    "SELECT request_fingerprint, task_id FROM api_idempotency_keys WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["request_fingerprint"] != request_fingerprint:
+                        raise ValueError("idempotency_conflict")
+                    task = self.db.execute(
+                        "SELECT 1 FROM task_states WHERE task_id = ?",
+                        (existing["task_id"],),
+                    ).fetchone()
+                    queue = self.db.execute(
+                        "SELECT 1 FROM task_queue WHERE task_id = ?",
+                        (existing["task_id"],),
+                    ).fetchone()
+                    if task is None or queue is None:
+                        raise UnsupportedSchemaVersion("idempotency_task_queue_missing")
+                    self.db.commit()
+                    return {"task_id": str(existing["task_id"]), "replayed": True}
+
+            state = TaskState.create_queued(task_id or str(uuid.uuid4()), goal.strip())
+            payload = state.to_dict()
+            stamp = now()
+            self._persist_task_state_in_transaction(payload, "TASK_QUEUED")
             self.db.execute(
-                """INSERT OR REPLACE INTO task_states
-                (task_id, state_version, status, current_phase, current_step,
-                 plan_version, plan_fingerprint, state_fingerprint, state_json,
-                 created_at, updated_at, last_checkpoint_at, last_successful_checkpoint)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO task_queue
+                (task_id, queue_status, attempt_count, max_attempts, available_at,
+                 lease_id, worker_id, lease_acquired_at, lease_expires_at,
+                 last_started_at, last_finished_at, last_error_code, last_error_message,
+                 created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    task_id,
-                    int(payload["state_version"]),
-                    status,
-                    payload["current_phase"],
-                    payload["current_step"],
-                    int(payload["plan_version"]),
-                    payload["plan_fingerprint"],
-                    payload["state_fingerprint"],
-                    state_json,
-                    created_at,
-                    updated_at,
-                    payload["last_checkpoint_at"],
-                    payload["last_successful_checkpoint"],
+                    state.task_id,
+                    "QUEUED",
+                    0,
+                    int(max_attempts),
+                    stamp,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    state.created_at,
+                    stamp,
                 ),
             )
-            self.db.execute(
-                """INSERT INTO task_checkpoints
-                (checkpoint_id, task_id, sequence, checkpoint_type, state_version,
-                 state_fingerprint, state_json, created_at)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    f"{task_id}:{sequence}",
-                    task_id,
-                    sequence,
-                    checkpoint_type,
-                    int(payload["state_version"]),
-                    payload["state_fingerprint"],
-                    state_json,
-                    checkpoint_at,
-                ),
-            )
-            for action_key, action_payload in payload.get("action_records", {}).items():
+            if idempotency_key:
                 self.db.execute(
-                    """INSERT OR REPLACE INTO task_action_records
-                    (action_key, task_id, step_id, tool_name, status, action_json, updated_at)
-                    VALUES (?,?,?,?,?,?,?)""",
+                    """INSERT INTO api_idempotency_keys
+                    (idempotency_key, request_fingerprint, task_id, response_json, created_at)
+                    VALUES (?,?,?,?,?)""",
                     (
-                        action_key,
-                        task_id,
-                        action_payload.get("step_id", ""),
-                        action_payload.get("tool_name", ""),
-                        action_payload.get("status", "NOT_STARTED"),
-                        json.dumps(action_payload, ensure_ascii=False, sort_keys=True),
-                        action_payload.get("updated_at", updated_at),
+                        idempotency_key,
+                        str(request_fingerprint),
+                        state.task_id,
+                        json.dumps({"task_id": state.task_id, "status": "QUEUED"}, sort_keys=True),
+                        stamp,
                     ),
                 )
-            self.db.execute(
-                """INSERT OR REPLACE INTO tasks
-                (id, goal, status, plan_json, result_json, attempts, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    task_id,
-                    payload["goal"],
-                    status.lower(),
-                    json.dumps(payload.get("plan", {}), ensure_ascii=False, sort_keys=True),
-                    json.dumps(payload.get("result", {}), ensure_ascii=False, sort_keys=True),
-                    int(payload.get("context", {}).get("attempts", 0)),
-                    created_at,
-                    updated_at,
-                ),
-            )
+            self.db.commit()
+            return {"task_id": state.task_id, "replayed": False}
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def task_queue_record(self, task_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM task_queue WHERE task_id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_task_summaries(
+        self,
+        *,
+        limit: int,
+        cursor_created_at: str = "",
+        cursor_task_id: str = "",
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if status:
+            clauses.append("s.status = ?")
+            params.append(status)
+        if cursor_created_at and cursor_task_id:
+            clauses.append("(s.created_at < ? OR (s.created_at = ? AND s.task_id < ?))")
+            params.extend([cursor_created_at, cursor_created_at, cursor_task_id])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.db.execute(
+            f"""SELECT s.task_id, s.status, s.current_phase, s.current_step,
+                       s.plan_version, s.state_json, s.created_at, s.updated_at,
+                       s.last_checkpoint_at, s.last_successful_checkpoint,
+                       CASE
+                         WHEN q.queue_status IS NOT NULL THEN q.queue_status
+                         WHEN s.status IN ('EXECUTING', 'OBSERVING', 'VERIFYING') THEN 'EXECUTION_UNKNOWN'
+                         WHEN s.status IN ('CREATED', 'QUEUED') THEN 'QUEUED'
+                         WHEN s.status = 'WAITING_APPROVAL' THEN 'WAITING_APPROVAL'
+                         ELSE s.status
+                       END AS queue_status,
+                       COALESCE(q.attempt_count, 0) AS attempt_count,
+                       COALESCE(q.available_at, s.created_at) AS available_at,
+                       COALESCE(q.last_error_code, '') AS last_error_code,
+                       q.updated_at AS queue_updated_at
+                FROM task_states AS s
+                LEFT JOIN task_queue AS q ON q.task_id = s.task_id
+                {where}
+                ORDER BY s.created_at DESC, s.task_id DESC
+                LIMIT ?""",
+            (*params, int(limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_task_state(self, task_id: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
@@ -719,11 +1146,20 @@ class Store:
         return [dict(row) for row in rows]
 
     def save_security_policy(self, payload: dict[str, Any]) -> None:
-        self.db.execute(
-            "INSERT OR REPLACE INTO security_policies VALUES (?,?,?)",
-            (int(payload["policy_version"]), json.dumps(payload, ensure_ascii=False), now()),
-        )
-        self.db.commit()
+        with self.db:
+            version = int(payload["policy_version"])
+            self.db.execute(
+                "INSERT OR REPLACE INTO security_policies VALUES (?,?,?)",
+                (version, json.dumps(payload, ensure_ascii=False), now()),
+            )
+            state = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_policy_state'"
+            ).fetchone()
+            if state:
+                self.db.execute(
+                    "UPDATE owner_policy_state SET current_version = MAX(current_version, ?), updated_at = ? WHERE singleton = 1",
+                    (version, now()),
+                )
 
     def get_security_policy(self, policy_version: int) -> dict[str, Any] | None:
         row = self.db.execute(

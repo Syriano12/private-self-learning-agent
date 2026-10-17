@@ -12,6 +12,7 @@ from private_agent.core.experience import sanitize_value
 STATE_VERSION = 1
 TASK_STATUSES = {
     "CREATED",
+    "QUEUED",
     "PLANNING",
     "READY",
     "EXECUTING",
@@ -27,6 +28,7 @@ TERMINAL_STATUSES = {"BLOCKED", "FAILED", "COMPLETED"}
 
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "CREATED": {"CREATED", "PLANNING", "READY", "WAITING_APPROVAL", "BLOCKED", "FAILED"},
+    "QUEUED": {"QUEUED", "PLANNING", "READY", "WAITING_APPROVAL", "BLOCKED", "FAILED"},
     "PLANNING": {"PLANNING", "READY", "WAITING_APPROVAL", "BLOCKED", "FAILED"},
     "READY": {"READY", "EXECUTING", "WAITING_APPROVAL", "COMPLETED", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
     "EXECUTING": {"EXECUTING", "OBSERVING", "EXECUTION_UNKNOWN", "BLOCKED", "FAILED"},
@@ -118,6 +120,12 @@ class TaskState:
     def create(cls, task_id: str, goal: str) -> "TaskState":
         state = cls(task_id=task_id, goal=goal)
         state.touch()
+        return state
+
+    @classmethod
+    def create_queued(cls, task_id: str, goal: str) -> "TaskState":
+        state = cls(task_id=task_id, goal=goal, status="QUEUED", current_phase="QUEUED")
+        state.checkpoint("TASK_QUEUED", phase="QUEUED", successful=True)
         return state
 
     @classmethod

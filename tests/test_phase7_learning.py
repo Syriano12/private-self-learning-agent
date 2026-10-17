@@ -424,8 +424,18 @@ def test_before_after_behavioral_proof_changes_tool_and_verifies_future_task(tmp
     assert second["final_status"] == "COMPLETED"
     assert tool_a.calls == 2, "future planning must avoid executing tool_a again"
     assert tool_b.calls == 2
-    first_plan_tool = json.loads(store.events_for_task(first["task_id"])[0]["event_json"])["steps"][0]["tool"]
-    second_plan_tool = json.loads(store.events_for_task(second["task_id"])[0]["event_json"])["steps"][0]["tool"]
+    first_plan = next(
+        json.loads(event["event_json"])
+        for event in store.events_for_task(first["task_id"])
+        if "steps" in json.loads(event["event_json"])
+    )
+    second_plan = next(
+        json.loads(event["event_json"])
+        for event in store.events_for_task(second["task_id"])
+        if "steps" in json.loads(event["event_json"])
+    )
+    first_plan_tool = first_plan["steps"][0]["tool"]
+    second_plan_tool = second_plan["steps"][0]["tool"]
     assert first_plan_tool == "tool_a"
     assert second_plan_tool == "tool_b"
     store.close()
