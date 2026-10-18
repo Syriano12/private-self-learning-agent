@@ -13,6 +13,7 @@ from private_agent.tools.contracts import ToolResult, validate_schema_value
 from private_agent.tools.bug_investigation import BugInvestigationTool, bug_report_like
 from private_agent.tools.github_access import GitHubAccess, RepositoryAccessError, parse_repository, validate_repository_path
 from private_agent.tools.local_repository import LocalRepository, sensitive_path
+from private_agent.tools.patching import register_patch_tools
 from private_agent.tools.repository_analysis import dependencies, structure
 
 TOOL_NAMES = (
@@ -306,8 +307,14 @@ class RepositoryTool:
             return ToolResult.failed("repository_inspection_failed", "Repository inspection failed safely")
 
 
-def register_repository_tools(registry: Any, inspector: RepositoryInspector | None = None) -> None:
+def register_repository_tools(
+    registry: Any,
+    inspector: RepositoryInspector | None = None,
+    *,
+    patch_workspace_root: Path | None = None,
+) -> None:
     trusted_inspector = inspector or RepositoryInspector()
     for name in TOOL_NAMES:
         registry.register(RepositoryTool(name, trusted_inspector))
     registry.register(BugInvestigationTool(trusted_inspector))
+    register_patch_tools(registry, trusted_inspector, workspace_root=patch_workspace_root)

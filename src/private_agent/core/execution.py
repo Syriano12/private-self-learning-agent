@@ -268,7 +268,20 @@ class GenericExecutor:
                     return False, {"error": "malformed_tool_result", "details": output_errors}
             return value.status == "success", {"tool_status": value.status}
 
-        operation = lambda: tool.execute(step.input, execution_context)
+        operation_binding = None
+        trusted_execute = getattr(tool, "_execute_trusted", None)
+
+        def operation() -> Any:
+            if callable(trusted_execute):
+                return trusted_execute(
+                    step.input,
+                    execution_context,
+                    operation_binding=operation_binding,
+                    authorization=security_decision,
+                    operation=operation,
+                )
+            return tool.execute(step.input, execution_context)
+
         operation_binding = trusted_controller._bind_operation(
             security_action,
             operation,

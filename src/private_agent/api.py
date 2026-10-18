@@ -722,6 +722,9 @@ def build_orchestrator() -> Orchestrator:
         registry,
         max_attempts=int(os.getenv("AGENT_MAX_ATTEMPTS", "2")),
         planner=planner,
+        # Patch tools write only to agent-owned isolated workspaces; ordinary
+        # private_write tools remain excluded from the default permission set.
+        approved_permissions={"public_read", "isolated_write"},
         security_controller=SecurityController(store=store),
     )
 
