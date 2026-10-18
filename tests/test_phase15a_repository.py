@@ -48,6 +48,7 @@ def test_repository_tree_is_bounded_and_registered_through_real_executor(reposit
     assert {tool["name"] for tool in registry.describe()} == {
         "list_repository_files", "read_repository_file", "search_repository_code",
         "inspect_repository_structure", "inspect_repository_dependencies", "inspect_repository_metadata",
+        "investigate_repository_bug",
     }
     result = run(executor, "list_repository_files", limit=2)
     assert result.status == "success"

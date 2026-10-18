@@ -96,6 +96,38 @@ class Planner:
     ) -> TaskPlan:
         if not goal.strip():
             raise PlanValidationError(["goal_required"])
+        if self.provider is not None:
+            # An explicit repository bug report has a specialized, conservative
+            # report contract. Route it through the registered tool proposal
+            # before consulting the provider; the normal validator and execution
+            # authorization still remain authoritative.
+            try:
+                investigator = tools.get("investigate_repository_bug")
+            except KeyError:
+                investigator = None
+            propose = getattr(investigator, "planning_inputs", None)
+            proposed_inputs = propose(goal) if callable(propose) else None
+            if isinstance(proposed_inputs, dict):
+                output_schema = getattr(investigator, "output_schema", lambda: {})()
+                required_fields = list(output_schema.get("required", [])) if isinstance(output_schema, dict) else []
+                return self.validate(
+                    {
+                        "goal": goal,
+                        "rationale": "Deterministic repository bug-investigation route; provider is not consulted",
+                        "steps": [{
+                            "id": str(uuid.uuid4()),
+                            "objective": "Investigate the reported repository bug using bounded evidence",
+                            "tool": "investigate_repository_bug",
+                            "input": proposed_inputs,
+                            "reason": "Explicit bug-report goal routed to the specialized read-only diagnostic contract",
+                            "depends_on": [],
+                            "success_criteria": {"required_fields": required_fields},
+                        }],
+                    },
+                    goal=goal,
+                    tools=tools,
+                    permissions=permissions,
+                )
         if self.provider is None:
             fallback = self._unavailable_fallback(goal, tools, prior_knowledge, learned_strategies or [])
             return self.validate(

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from private_agent.tools.contracts import ToolResult, validate_schema_value
+from private_agent.tools.bug_investigation import BugInvestigationTool, bug_report_like
 from private_agent.tools.github_access import GitHubAccess, RepositoryAccessError, parse_repository, validate_repository_path
 from private_agent.tools.local_repository import LocalRepository, sensitive_path
 from private_agent.tools.repository_analysis import dependencies, structure
@@ -78,7 +79,11 @@ class RepositoryInspector:
         text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|AKIA[A-Z0-9]{16})\b", "[REDACTED]", text)
         text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", text)
         text = re.sub(r"(?i)(https?://)[^\s/@]+:[^\s/@]+@", r"\1[REDACTED]@", text)
-        text = re.sub(r"(?i)([\"']?(?:api[_-]?key|password|passwd|secret|access[_-]?token|token|authorization)[\"']?\s*[:=]\s*)([^\n,;]+)", r"\1\"[REDACTED]\"", text)
+        text = re.sub(
+            r"(?im)([\"']?(?:api[_-]?key|password|passwd|secret|access[_-]?token|token|authorization)[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[A-Za-z0-9_+=/-]+)(?=[ \t]*(?:[,;)]|$))",
+            r'\1"[REDACTED]"',
+            text,
+        )
         return text
 
     def _safe_values(self, value: Any) -> Any:
@@ -245,6 +250,8 @@ class RepositoryTool:
         """Optional deterministic proposal for the existing no-provider fallback."""
         if self.name != "inspect_repository_structure":
             return None
+        if bug_report_like(goal):
+            return None
         candidates = re.findall(r"https://github\.com/[^\s<>\"'()\[\]]+", goal)
         if not candidates:
             if not re.search(r"repository|architecture|codebase|\brepo\b|مستودع|معمارية|بنية", goal, re.I):
@@ -303,3 +310,4 @@ def register_repository_tools(registry: Any, inspector: RepositoryInspector | No
     trusted_inspector = inspector or RepositoryInspector()
     for name in TOOL_NAMES:
         registry.register(RepositoryTool(name, trusted_inspector))
+    registry.register(BugInvestigationTool(trusted_inspector))
