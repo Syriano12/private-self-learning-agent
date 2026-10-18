@@ -705,6 +705,9 @@ def build_orchestrator() -> Orchestrator:
     store = Store(os.getenv("AGENT_DB_PATH", "data/agent.sqlite3"))
     registry = ToolRegistry()
     registry.register(WebResearchTool(timeout=float(os.getenv("AGENT_HTTP_TIMEOUT", "15"))))
+    from private_agent.tools.repository import register_repository_tools
+
+    register_repository_tools(registry)
     planner = None
     if os.getenv("GEMINI_API_KEY"):
         from private_agent.core.planner import Planner
