@@ -16,6 +16,7 @@ from private_agent.core.learning import LearningEngine
 from private_agent.core.memory import ExperienceMemory
 from private_agent.core.reflection import ReflectionEngine
 from private_agent.security import SecurityController
+from private_agent.skills.sandbox_contract import SandboxResult, ValidationOutcome, detect_podman
 from private_agent.tools.contracts import validate_schema_value
 from private_agent.skills.registry import SkillRegistry
 
@@ -569,13 +570,27 @@ class SandboxCapabilities:
     isolation_level: str
     unavailable: list[str] = field(default_factory=list)
     external_sandbox: bool = False
+    runtime_name: str = ""
+    runtime_version: str = ""
+    runtime_executable: str = ""
+    runtime_detected: bool = False
+    runtime_verified: bool = False
+    security_controls_verified: bool = False
+    validation_outcome: str = ValidationOutcome.SANDBOX_UNAVAILABLE.value
 
     @classmethod
     def detect(cls) -> "SandboxCapabilities":
+        report = detect_podman()
+        legacy_unavailable = [
+            "process_isolation",
+            "resource_limits",
+            "filesystem_restrictions",
+            "network_restrictions",
+            "strong_isolation",
+            "external_sandbox",
+        ]
+        unavailable = sorted(set(legacy_unavailable).union(report.reasons))
         return cls(
-            # A local fork is not treated as a security boundary.  Until an
-            # independently configured external runtime exists, none of the
-            # execution controls below are claimed to be enforced.
             process_isolation=False,
             timeout=False,
             resource_limits=False,
@@ -583,33 +598,20 @@ class SandboxCapabilities:
             filesystem_restrictions=False,
             network_restrictions=False,
             strong_isolation=False,
-            external_sandbox=False,
-            isolation_level="unavailable",
-            unavailable=[
-                "process_isolation",
-                "resource_limits",
-                "filesystem_restrictions",
-                "network_restrictions",
-                "strong_isolation",
-                "external_sandbox",
-            ],
+            external_sandbox=report.available,
+            isolation_level="verified" if report.available else "unavailable",
+            unavailable=unavailable,
+            runtime_name=report.runtime_name,
+            runtime_version=report.version or "",
+            runtime_executable=report.executable or "",
+            runtime_detected=report.detected,
+            runtime_verified=report.version_verified,
+            security_controls_verified=report.security_controls_verified,
+            validation_outcome=report.validation_outcome.value,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-
-@dataclass
-class SandboxResult:
-    status: str
-    output: Any = None
-    error: str = ""
-    capabilities: dict[str, Any] = field(default_factory=dict)
-    applied_restrictions: list[str] = field(default_factory=list)
-    duration_ms: float = 0.0
-
-    def to_dict(self) -> dict[str, Any]:
-        return sanitize_value(asdict(self))
 
 
 MAX_SANDBOX_MESSAGE_BYTES = 64_000
@@ -700,6 +702,7 @@ class SkillSandbox:
             error="external_sandbox_unavailable",
             capabilities=self.capabilities.to_dict(),
             applied_restrictions=["no_untrusted_host_execution"],
+            validation_outcome=ValidationOutcome.SANDBOX_UNAVAILABLE,
         )
 
 
