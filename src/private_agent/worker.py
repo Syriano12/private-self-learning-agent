@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import logging
+import sqlite3
 import threading
 import time
 import uuid
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.task_state import TaskState
 from private_agent.storage import QueueLeaseLost, Store
+
+
+LOGGER = logging.getLogger(__name__)
+WorkerEventLogger = Callable[[dict[str, Any]], None]
 
 
 class _LeaseHeartbeat:
@@ -118,7 +125,16 @@ class _LeaseHeartbeat:
 
 
 class BackgroundWorker:
-    """Single-step durable worker; intentionally no run_forever loop yet."""
+    """Controlled durable worker with one loop per instance.
+
+    ``run_once`` remains the single-claim primitive. ``run_forever`` adds the
+    operational lifecycle around it: bounded polling, recoverable-error
+    backoff, structured lifecycle events, and cooperative shutdown. It never
+    cancels an in-flight external operation; the existing lease fencing and
+    ``EXECUTION_UNKNOWN`` rules remain authoritative.
+    """
+
+    _RECOVERABLE_ERRORS = (QueueLeaseLost, sqlite3.OperationalError, TimeoutError)
 
     def __init__(
         self,
@@ -128,6 +144,10 @@ class BackgroundWorker:
         lease_ttl_seconds: int = 60,
         heartbeat_interval_seconds: float | None = None,
         max_execution_age_seconds: float = 300.0,
+        poll_interval_seconds: float = 0.1,
+        idle_poll_interval_seconds: float = 1.0,
+        error_backoff_seconds: float = 1.0,
+        event_logger: WorkerEventLogger | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.store: Store = orchestrator.store
@@ -144,6 +164,214 @@ class BackgroundWorker:
         self.max_execution_age_seconds = float(max_execution_age_seconds)
         if self.max_execution_age_seconds <= 0:
             raise ValueError("max_execution_age_invalid")
+        self.poll_interval_seconds = float(poll_interval_seconds)
+        self.idle_poll_interval_seconds = float(idle_poll_interval_seconds)
+        self.error_backoff_seconds = float(error_backoff_seconds)
+        if self.poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_invalid")
+        if self.idle_poll_interval_seconds <= 0:
+            raise ValueError("idle_poll_interval_invalid")
+        if self.error_backoff_seconds <= 0:
+            raise ValueError("error_backoff_invalid")
+        self.event_logger = event_logger
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._running = False
+        self._loop_thread: threading.Thread | None = None
+        self._last_report: dict[str, Any] | None = None
+        self._fatal_error: BaseException | None = None
+
+    @property
+    def running(self) -> bool:
+        with self._lifecycle_lock:
+            return self._running
+
+    @property
+    def last_report(self) -> dict[str, Any] | None:
+        with self._lifecycle_lock:
+            return dict(self._last_report) if self._last_report is not None else None
+
+    @property
+    def fatal_error(self) -> BaseException | None:
+        with self._lifecycle_lock:
+            return self._fatal_error
+
+    def start(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        daemon: bool = True,
+    ) -> threading.Thread:
+        """Start the loop on a thread and return that thread.
+
+        Starting a second loop on the same worker instance is rejected. The
+        returned thread is intentionally observable so callers can join it.
+        """
+        with self._lifecycle_lock:
+            if self._running:
+                raise RuntimeError("worker_already_running")
+            self._stop_event.clear()
+            self._fatal_error = None
+            self._running = True
+            thread = threading.Thread(
+                target=self._run_loop,
+                args=(stop_event,),
+                name=f"agent-worker-{self.worker_id}",
+                daemon=daemon,
+            )
+            self._loop_thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            with self._lifecycle_lock:
+                self._running = False
+                self._loop_thread = None
+            raise
+        return thread
+
+    def stop(self, *, timeout: float = 5.0) -> bool:
+        """Request cooperative shutdown and wait for at most ``timeout`` seconds."""
+        if timeout < 0:
+            raise ValueError("shutdown_timeout_invalid")
+        self._stop_event.set()
+        with self._lifecycle_lock:
+            thread = self._loop_thread
+        if thread is None or thread is threading.current_thread():
+            return not self.running
+        thread.join(timeout=float(timeout))
+        return not thread.is_alive()
+
+    def run_forever(self, *, stop_event: threading.Event | None = None) -> dict[str, Any]:
+        """Run until stopped, returning a serializable lifecycle report.
+
+        Fatal exceptions are recorded and re-raised. Recoverable queue/lease
+        errors are reported and retried after bounded backoff.
+        """
+        with self._lifecycle_lock:
+            if self._running:
+                raise RuntimeError("worker_already_running")
+            self._stop_event.clear()
+            self._fatal_error = None
+            self._running = True
+            self._loop_thread = threading.current_thread()
+        return self._run_loop(stop_event)
+
+    def _run_loop(self, external_stop_event: threading.Event | None) -> dict[str, Any]:
+        report: dict[str, Any] = {
+            "status": "RUNNING",
+            "worker_id": self.worker_id,
+            "iterations": 0,
+            "processed": 0,
+            "idle_polls": 0,
+            "recoverable_errors": 0,
+            "lease_losses": 0,
+            "execution_unknown": 0,
+            "last_error_type": "",
+            "last_error_code": "",
+            "fatal_error_type": "",
+        }
+        self._emit_event("worker_started")
+        try:
+            while not self._stop_requested(external_stop_event):
+                report["iterations"] += 1
+                try:
+                    result = self.run_once()
+                except self._RECOVERABLE_ERRORS as exc:
+                    report["recoverable_errors"] += 1
+                    report["last_error_type"] = type(exc).__name__
+                    report["last_error_code"] = self._error_code(exc)
+                    self._emit_event(
+                        "worker_recoverable_error",
+                        error_type=type(exc).__name__,
+                        error_code=self._error_code(exc),
+                    )
+                    if self._wait_for(self.error_backoff_seconds, external_stop_event):
+                        break
+                    continue
+                except BaseException as exc:
+                    report["status"] = "FATAL"
+                    report["fatal_error_type"] = type(exc).__name__
+                    with self._lifecycle_lock:
+                        self._fatal_error = exc
+                    self._emit_event("worker_fatal_error", error_type=type(exc).__name__)
+                    raise
+
+                status = str(result.get("status", ""))
+                task_id = str(result.get("task_id", ""))
+                if status == "NO_TASK":
+                    report["idle_polls"] += 1
+                    self._emit_event("worker_idle", idle_polls=report["idle_polls"])
+                    delay = self.idle_poll_interval_seconds
+                else:
+                    if bool(result.get("processed")):
+                        report["processed"] += 1
+                    if status == "LEASE_LOST":
+                        report["lease_losses"] += 1
+                        self._emit_event(
+                            "worker_lease_lost",
+                            task_id=task_id,
+                            error_code=str(result.get("error_code", "queue_lease_lost")),
+                        )
+                    elif status == "EXECUTION_UNKNOWN":
+                        report["execution_unknown"] += 1
+                        self._emit_event("worker_execution_unknown", task_id=task_id)
+                    self._emit_event(
+                        "worker_result",
+                        task_id=task_id,
+                        status=status,
+                        processed=bool(result.get("processed")),
+                        error_code=str(result.get("error_code", "")),
+                    )
+                    delay = self.poll_interval_seconds
+                if self._wait_for(delay, external_stop_event):
+                    break
+            report["status"] = "STOPPED"
+            return report
+        finally:
+            if report["status"] == "RUNNING":
+                report["status"] = "STOPPED"
+            with self._lifecycle_lock:
+                self._last_report = dict(report)
+                self._running = False
+                self._loop_thread = None
+            self._emit_event("worker_stopped", status=str(report["status"]))
+
+    def _stop_requested(self, external_stop_event: threading.Event | None) -> bool:
+        return self._stop_event.is_set() or bool(external_stop_event is not None and external_stop_event.is_set())
+
+    def _wait_for(self, delay: float, external_stop_event: threading.Event | None) -> bool:
+        delay = max(0.0, float(delay))
+        if self._stop_requested(external_stop_event):
+            return True
+        deadline = time.monotonic() + delay
+        while not self._stop_requested(external_stop_event):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._stop_requested(external_stop_event)
+            self._stop_event.wait(min(remaining, 0.05))
+            if external_stop_event is not None and external_stop_event.wait(0):
+                return True
+        return True
+
+    def _emit_event(self, event_type: str, **fields: Any) -> None:
+        event = {
+            "event_type": event_type,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "worker_id": self.worker_id,
+            **fields,
+        }
+        try:
+            if self.event_logger is not None:
+                self.event_logger(dict(event))
+            else:
+                LOGGER.info("background_worker_event", extra={"worker_event": event})
+        except Exception:
+            # Diagnostics must never change authorization or task outcome.
+            LOGGER.exception("background_worker_event_logger_failed")
+
+    @staticmethod
+    def _error_code(exc: BaseException) -> str:
+        return str(exc).split(":", 1)[0][:120] or type(exc).__name__
 
     def run_once(self) -> dict[str, Any]:
         """Claim and process at most one task, returning a serializable result."""
@@ -154,14 +382,25 @@ class BackgroundWorker:
         if claim is None:
             return {"status": "NO_TASK", "processed": False, "task_id": ""}
         if claim.get("kind") == "EXECUTION_UNKNOWN":
+            task_id = str(claim["task_id"])
+            self._emit_event(
+                "worker_execution_unknown_recovered",
+                task_id=task_id,
+                error_code=str(claim.get("error_code", "lease_expired_execution_unknown")),
+            )
             return {
                 "status": "EXECUTION_UNKNOWN",
                 "processed": False,
-                "task_id": str(claim["task_id"]),
+                "task_id": task_id,
                 "error_code": str(claim.get("error_code", "lease_expired_execution_unknown")),
             }
 
         task_id = str(claim["task_id"])
+        self._emit_event(
+            "worker_task_claimed",
+            task_id=task_id,
+            attempt_count=int(claim["attempt_count"]),
+        )
         claim = {**claim, "lease_ttl_seconds": self.lease_ttl_seconds}
         heartbeat = _LeaseHeartbeat(
             self.store,
@@ -291,7 +530,7 @@ class BackgroundWorker:
                 reason="worker_lease_lost",
             )
         except QueueLeaseLost:
-            # Another worker may already have recovered the claim.  Its
+            # Another worker may already have recovered the claim. Its
             # recovery transaction owns the authoritative outcome.
             return
 
