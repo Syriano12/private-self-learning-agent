@@ -5,8 +5,6 @@ import copy
 import hashlib
 import inspect
 import json
-import multiprocessing
-import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -109,9 +107,28 @@ class SkillCandidate:
             raise ValueError("skill_version_must_be_positive")
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload.pop("implementation", None)
-        payload.pop("mutation_test_runner", None)
+        # Build the persisted metadata explicitly.  Calling ``asdict`` would
+        # deepcopy arbitrary callable fields before they could be removed.
+        payload = {
+            "skill_id": self.skill_id,
+            "name": self.name,
+            "version": self.version,
+            "description": self.description,
+            "source": self.source,
+            "entry_point": self.entry_point,
+            "declared_capabilities": self.declared_capabilities,
+            "required_resources": self.required_resources,
+            "allowed_imports": self.allowed_imports,
+            "allowed_network_domains": self.allowed_network_domains,
+            "expected_inputs": self.expected_inputs,
+            "expected_outputs": self.expected_outputs,
+            "tests": self.tests,
+            "metadata": self.metadata,
+            "provenance": self.provenance,
+            "status": self.status,
+            "parent_version": self.parent_version,
+            "created_at": self.created_at,
+        }
         return sanitize_value(payload)
 
     @classmethod
@@ -514,7 +531,7 @@ class MutationTestingEngine:
         test_runner: Callable[[str, MutationCase], bool] | None = None,
     ) -> MutationReport:
         mutants = _generate_mutants(candidate.source, self.max_mutants)
-        runner = test_runner or candidate.mutation_test_runner
+        runner = test_runner if test_runner is not None else candidate.mutation_test_runner
         if not mutants:
             return MutationReport(False, 0, 0, 0, 0.0, self.threshold, reason="no_supported_mutants_generated")
         if runner is None:
@@ -528,27 +545,15 @@ class MutationTestingEngine:
                 mutants,
                 "mutation_test_runner_required",
             )
-        killed = 0
-        for mutant in mutants:
-            try:
-                mutant.killed = bool(runner(mutant.mutated_source, mutant))
-                mutant.evidence.append("configured_test_runner_executed")
-            except Exception as exc:
-                mutant.killed = False
-                mutant.evidence.append(f"test_runner_error:{type(exc).__name__}")
-            if mutant.killed:
-                killed += 1
-        score = round(killed / len(mutants), 4)
-        passed = score >= self.threshold and all(mutant.killed for mutant in mutants if self.threshold >= 1.0)
         return MutationReport(
-            passed,
+            False,
             len(mutants),
-            killed,
-            len(mutants) - killed,
-            score,
+            0,
+            len(mutants),
+            0.0,
             self.threshold,
             mutants,
-            "" if passed else "mutation_threshold_not_met",
+            "external_sandbox_required",
         )
 
 
@@ -563,36 +568,31 @@ class SandboxCapabilities:
     strong_isolation: bool
     isolation_level: str
     unavailable: list[str] = field(default_factory=list)
+    external_sandbox: bool = False
 
     @classmethod
     def detect(cls) -> "SandboxCapabilities":
-        try:
-            import resource  # noqa: F401
-
-            resource_limits = True
-        except ImportError:
-            resource_limits = False
-        process_isolation = "fork" in multiprocessing.get_all_start_methods()
-        unavailable = []
-        for capability, available in {
-            "process_isolation": process_isolation,
-            "resource_limits": resource_limits,
-            "filesystem_restrictions": False,
-            "network_restrictions": False,
-            "strong_isolation": False,
-        }.items():
-            if not available:
-                unavailable.append(capability)
         return cls(
-            process_isolation=process_isolation,
-            timeout=process_isolation,
-            resource_limits=resource_limits,
-            environment_restrictions=process_isolation,
+            # A local fork is not treated as a security boundary.  Until an
+            # independently configured external runtime exists, none of the
+            # execution controls below are claimed to be enforced.
+            process_isolation=False,
+            timeout=False,
+            resource_limits=False,
+            environment_restrictions=False,
             filesystem_restrictions=False,
             network_restrictions=False,
             strong_isolation=False,
-            isolation_level="partial" if process_isolation else "unavailable",
-            unavailable=unavailable,
+            external_sandbox=False,
+            isolation_level="unavailable",
+            unavailable=[
+                "process_isolation",
+                "resource_limits",
+                "filesystem_restrictions",
+                "network_restrictions",
+                "strong_isolation",
+                "external_sandbox",
+            ],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -612,86 +612,94 @@ class SandboxResult:
         return sanitize_value(asdict(self))
 
 
-def _sandbox_worker(connection: Any, implementation: Callable[[dict[str, Any]], Any], inputs: dict[str, Any], contract: SkillContract) -> None:
-    try:
-        os.environ.clear()
-        try:
-            import resource
+MAX_SANDBOX_MESSAGE_BYTES = 64_000
+_SANDBOX_RESULT_KEYS = {"status", "output", "error", "duration_ms"}
+_SANDBOX_RESULT_STATUSES = {"success", "failed"}
 
-            cpu_seconds = max(1, int(contract.max_execution_time) + 1)
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-            if contract.max_memory_bytes > 0:
-                resource.setrlimit(resource.RLIMIT_AS, (contract.max_memory_bytes, contract.max_memory_bytes))
-        except Exception:
-            pass
-        output = implementation(inputs)
-        connection.send({"status": "success", "output": output})
-    except Exception as exc:
-        connection.send({"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
-    finally:
-        connection.close()
+
+def _validate_json_primitives(value: Any, *, depth: int = 0) -> None:
+    if depth > 32:
+        raise ValueError("sandbox_result_nesting_limit_exceeded")
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_primitives(item, depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("sandbox_result_non_string_key")
+        for item in value.values():
+            _validate_json_primitives(item, depth=depth + 1)
+        return
+    raise ValueError("sandbox_result_non_primitive_value")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(value)
+
+
+def decode_sandbox_result(payload: bytes | bytearray, *, max_bytes: int = MAX_SANDBOX_MESSAGE_BYTES) -> dict[str, Any]:
+    """Decode the future external-runner protocol without Python object loading.
+
+    The current project intentionally has no external runner, so this decoder is
+    not a fallback execution path. It defines the only acceptable result shape
+    for a future runner: bounded UTF-8 JSON containing primitives only.
+    """
+    if not isinstance(payload, (bytes, bytearray)):
+        raise ValueError("sandbox_result_must_be_bytes")
+    if max_bytes <= 0 or len(payload) > max_bytes:
+        raise ValueError("sandbox_result_too_large")
+    try:
+        decoded = bytes(payload).decode("utf-8")
+        message = json.loads(
+            decoded,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, TypeError):
+        raise ValueError("sandbox_result_malformed") from None
+    if not isinstance(message, dict):
+        raise ValueError("sandbox_result_malformed")
+    if set(message) - _SANDBOX_RESULT_KEYS:
+        raise ValueError("sandbox_result_unexpected_fields")
+    status = message.get("status")
+    if status not in _SANDBOX_RESULT_STATUSES:
+        raise ValueError("sandbox_result_invalid_status")
+    if status == "success" and "output" not in message:
+        raise ValueError("sandbox_result_missing_output")
+    if status == "failed" and "error" not in message:
+        raise ValueError("sandbox_result_missing_error")
+    try:
+        _validate_json_primitives(message)
+    except ValueError:
+        raise
+    if "error" in message and not isinstance(message["error"], str):
+        raise ValueError("sandbox_result_invalid_error")
+    if "duration_ms" in message and (
+        isinstance(message["duration_ms"], bool)
+        or not isinstance(message["duration_ms"], (int, float))
+        or message["duration_ms"] < 0
+    ):
+        raise ValueError("sandbox_result_invalid_duration")
+    return message
 
 
 class SkillSandbox:
     def __init__(self, capabilities: SandboxCapabilities | None = None) -> None:
-        self.capabilities = capabilities or SandboxCapabilities.detect()
+        if capabilities is not None and type(capabilities) is not SandboxCapabilities:
+            raise TypeError("untrusted_sandbox_capabilities_not_supported")
+        self.capabilities = capabilities if capabilities is not None else SandboxCapabilities.detect()
 
     def execute(self, candidate: SkillCandidate, contract: SkillContract, inputs: dict[str, Any]) -> SandboxResult:
-        started = time.monotonic()
-        if not self.capabilities.process_isolation:
-            return SandboxResult("QUARANTINED", error="process_isolation_unavailable", capabilities=self.capabilities.to_dict())
-        if contract.require_strong_isolation and not self.capabilities.strong_isolation:
-            return SandboxResult("QUARANTINED", error="strong_isolation_unavailable", capabilities=self.capabilities.to_dict())
-        if "network" in candidate.declared_capabilities and not self.capabilities.network_restrictions:
-            return SandboxResult("QUARANTINED", error="network_restriction_unavailable", capabilities=self.capabilities.to_dict())
-        if "filesystem" in candidate.declared_capabilities and not self.capabilities.filesystem_restrictions:
-            return SandboxResult("QUARANTINED", error="filesystem_restriction_unavailable", capabilities=self.capabilities.to_dict())
-        if not callable(candidate.implementation):
-            return SandboxResult("QUARANTINED", error="runtime_implementation_unavailable", capabilities=self.capabilities.to_dict())
-
-        context = multiprocessing.get_context("fork")
-        receive, send = context.Pipe(duplex=False)
-        process = context.Process(target=_sandbox_worker, args=(send, candidate.implementation, inputs, contract))
-        process.daemon = True
-        process.start()
-        send.close()
-        process.join(max(0.01, contract.max_execution_time))
-        if process.is_alive():
-            process.terminate()
-            process.join(1.0)
-            return SandboxResult(
-                "TIMEOUT",
-                error="execution_timeout",
-                capabilities=self.capabilities.to_dict(),
-                applied_restrictions=["process_boundary", "timeout", "environment_cleared", "resource_limits"],
-                duration_ms=round((time.monotonic() - started) * 1000, 3),
-            )
-        message = receive.recv() if receive.poll(0.2) else {"status": "failed", "error": "worker_no_result"}
-        receive.close()
-        if message.get("status") != "success":
-            return SandboxResult(
-                "FAILED",
-                error=str(message.get("error", "worker_failed")),
-                capabilities=self.capabilities.to_dict(),
-                applied_restrictions=["process_boundary", "timeout", "environment_cleared", "resource_limits"],
-                duration_ms=round((time.monotonic() - started) * 1000, 3),
-            )
-        output = message.get("output")
-        serialized = json.dumps(sanitize_value(output), ensure_ascii=False, default=str)
-        if len(serialized) > contract.max_output_size:
-            return SandboxResult(
-                "FAILED",
-                error="output_size_limit_exceeded",
-                capabilities=self.capabilities.to_dict(),
-                applied_restrictions=["process_boundary", "timeout", "environment_cleared", "resource_limits", "output_limit"],
-                duration_ms=round((time.monotonic() - started) * 1000, 3),
-            )
+        # A local fork/pipe is not a security sandbox and its old result
+        # channel previously deserialized arbitrary Python objects. Never
+        # execute an untrusted implementation until an external sandbox is
+        # configured. This guard also makes direct calls fail closed.
         return SandboxResult(
-            "PASSED",
-            output=output,
+            "QUARANTINED",
+            error="external_sandbox_unavailable",
             capabilities=self.capabilities.to_dict(),
-            applied_restrictions=["process_boundary", "timeout", "environment_cleared", "resource_limits", "output_limit"],
-            duration_ms=round((time.monotonic() - started) * 1000, 3),
+            applied_restrictions=["no_untrusted_host_execution"],
         )
 
 
@@ -881,6 +889,10 @@ class SkillLifecycleManager:
         learning_engine: LearningEngine | None = None,
         security_controller: SecurityController | None = None,
     ) -> None:
+        if mutation_engine is not None and type(mutation_engine) is not MutationTestingEngine:
+            raise TypeError("untrusted_mutation_engine_not_supported")
+        if sandbox is not None and type(sandbox) is not SkillSandbox:
+            raise TypeError("untrusted_sandbox_provider_not_supported")
         self.registry = registry
         self.analyzer = analyzer or SkillStaticAnalyzer()
         self.contract_validator = contract_validator or SkillContractValidator()
@@ -896,7 +908,6 @@ class SkillLifecycleManager:
         self.security = security_controller
         self._candidates: dict[str, SkillCandidate] = {}
         self._contracts: dict[str, SkillContract] = {}
-        self._implementations: dict[str, Callable[[dict[str, Any]], Any]] = {}
 
     def submit(
         self,
@@ -933,9 +944,10 @@ class SkillLifecycleManager:
             )
             return LifecycleResult(candidate, empty_contract, empty_analysis, empty_mutation, sandbox, runtime, cross, approval)
 
-        self._candidates[candidate.skill_id] = candidate
+        # Keep only the serializable candidate metadata.  Learned callables are
+        # never retained as an execution authority in this process.
+        self._candidates[candidate.skill_id] = SkillCandidate.from_dict(candidate.to_dict())
         self._contracts[candidate.skill_id] = contract
-        self._implementations[candidate.skill_id] = candidate.implementation  # type: ignore[assignment]
         candidate.status = "ANALYZING"
         self.registry.persist_candidate(candidate, contract=contract, status=candidate.status)
         contract_report = self.contract_validator.validate(candidate, contract)
@@ -965,11 +977,12 @@ class SkillLifecycleManager:
         mutation = self.mutation_engine.run(candidate, mutation_test_runner)
         if not mutation.passed:
             candidate.status = "QUARANTINED"
-            self._audit_skill_event(candidate, "SKILL_QUARANTINED", "mutation_threshold_not_met")
-            sandbox = SandboxResult("QUARANTINED", error="mutation_threshold_not_met", capabilities=self.sandbox.capabilities.to_dict())
+            quarantine_reason = mutation.reason or "mutation_threshold_not_met"
+            self._audit_skill_event(candidate, "SKILL_QUARANTINED", quarantine_reason)
+            sandbox = SandboxResult("QUARANTINED", error=quarantine_reason)
             runtime = RuntimeVerificationReport(False, sandbox.status, [sandbox.error])
-            cross = CrossVerificationReport(False, ["mutation_threshold_not_met"])
-            approval = ApprovalDecision("QUARANTINED", False, ["mutation_threshold_not_met"], {"mutation_threshold": False})
+            cross = CrossVerificationReport(False, [quarantine_reason])
+            approval = ApprovalDecision("QUARANTINED", False, [quarantine_reason], {"mutation_threshold": False})
             self.registry.persist_candidate(
                 candidate,
                 contract=contract,
@@ -1042,6 +1055,26 @@ class SkillLifecycleManager:
         execution_state: dict[str, Any] = {}
 
         def run_activation() -> SandboxResult:
+            if type(self.sandbox) is not SkillSandbox:
+                sandbox_result = SandboxResult(
+                    "QUARANTINED",
+                    error="untrusted_sandbox_provider_not_supported",
+                )
+                runtime_result = self.runtime_verifier.verify(candidate, contract, inputs, sandbox_result)
+                cross_result = CrossVerificationReport(False, [sandbox_result.error])
+                approval_result = ApprovalDecision(
+                    "QUARANTINED",
+                    False,
+                    [sandbox_result.error],
+                    {"external_sandbox": False},
+                )
+                execution_state.update(
+                    sandbox=sandbox_result,
+                    runtime=runtime_result,
+                    cross=cross_result,
+                    approval=approval_result,
+                )
+                return sandbox_result
             sandbox_result = self.sandbox.execute(candidate, contract, inputs)
             runtime_result = self.runtime_verifier.verify(candidate, contract, inputs, sandbox_result)
             cross_result = (
@@ -1171,6 +1204,12 @@ class SkillLifecycleManager:
         execution_state: dict[str, Any] = {}
 
         def run_active() -> SandboxResult:
+            if type(self.sandbox) is not SkillSandbox:
+                sandbox_result = SandboxResult("QUARANTINED", error="untrusted_sandbox_provider_not_supported")
+                runtime_result = self.runtime_verifier.verify(candidate, contract, inputs, sandbox_result)
+                cross_result = CrossVerificationReport(False, [sandbox_result.error])
+                execution_state.update(sandbox=sandbox_result, runtime=runtime_result, cross=cross_result)
+                return sandbox_result
             sandbox_result = self.sandbox.execute(candidate, contract, inputs)
             runtime_result = self.runtime_verifier.verify(candidate, contract, inputs, sandbox_result)
             cross_result = (

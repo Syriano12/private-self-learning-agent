@@ -149,19 +149,20 @@ def test_ast_detects_undeclared_network_and_filesystem_capabilities() -> None:
     assert any(item.rule_id == "undeclared_filesystem_access" for item in report.findings)
 
 
-def test_mutation_engine_generates_kills_and_survivors_without_mutating_source() -> None:
+def test_mutation_engine_generates_bounded_mutants_without_running_untrusted_runner() -> None:
     safe = candidate("mutation")
     original = safe.source
     killed = MutationTestingEngine(max_mutants=2, threshold=1.0).run(safe, kill_comparison_mutants)
     assert killed.total_mutants >= 1
-    assert killed.killed_mutants == killed.total_mutants
-    assert killed.passed is True
+    assert killed.killed_mutants == 0
+    assert killed.passed is False
+    assert killed.reason == "external_sandbox_required"
     assert safe.source == original
 
     survived = MutationTestingEngine(max_mutants=2, threshold=1.0).run(safe, survive_all_mutants)
     assert survived.survived_mutants == survived.total_mutants
     assert survived.passed is False
-    assert survived.reason == "mutation_threshold_not_met"
+    assert survived.reason == "external_sandbox_required"
 
 
 def test_mutation_requires_a_configured_test_runner() -> None:
@@ -171,17 +172,17 @@ def test_mutation_requires_a_configured_test_runner() -> None:
     assert report.reason == "mutation_test_runner_required"
 
 
-def test_sandbox_capabilities_are_detected_and_unsupported_network_is_quarantined() -> None:
+def test_sandbox_capabilities_are_unavailable_without_external_runtime() -> None:
     capabilities = SandboxCapabilities.detect()
     assert isinstance(capabilities.to_dict(), dict)
     assert "filesystem_restrictions" in capabilities.unavailable
     network = candidate("network-skill", capabilities=["network"])
     result = SkillSandbox(capabilities).execute(network, SkillContract.from_candidate(network), {"value": 1})
     assert result.status == "QUARANTINED"
-    assert result.error == "network_restriction_unavailable"
+    assert result.error == "external_sandbox_unavailable"
 
 
-def test_sandbox_timeout_and_runtime_output_verification() -> None:
+def test_sandbox_execution_is_disabled_and_runtime_output_verification_remains_available() -> None:
     def slow(inputs: dict) -> dict:
         time.sleep(0.2)
         return {"result": "late"}
@@ -189,7 +190,8 @@ def test_sandbox_timeout_and_runtime_output_verification() -> None:
     slow_candidate = candidate("slow", implementation=slow)
     contract = SkillContract(max_execution_time=0.05, max_output_size=1000)
     result = SkillSandbox().execute(slow_candidate, contract, {"value": 1})
-    assert result.status == "TIMEOUT"
+    assert result.status == "QUARANTINED"
+    assert result.error == "external_sandbox_unavailable"
 
     verifier = SkillRuntimeVerifier()
     bad = verifier.verify(
@@ -216,32 +218,33 @@ def test_cross_verification_and_contract_policy_reject_unsafe_capabilities() -> 
     assert "network_capability_not_allowed_by_contract" in report.errors
 
 
-def test_candidate_a_is_approved_persisted_and_retrievable_after_restart(tmp_path: Path) -> None:
+def test_candidate_metadata_is_quarantined_persisted_and_retrievable_after_restart(tmp_path: Path) -> None:
     path = tmp_path / "agent.sqlite3"
     store = Store(path)
     lifecycle = manager(store)
     result = lifecycle.submit(candidate("candidate-a"), inputs={"value": 1})
-    assert result.approval.status == "APPROVED"
-    assert result.candidate.status == "ACTIVE"
+    assert result.approval.status == "QUARANTINED"
+    assert result.candidate.status == "QUARANTINED"
     assert result.analysis.passed is True
-    assert result.mutation.passed is True
-    assert result.sandbox.status == "PASSED"
-    assert result.runtime.passed is True
-    assert result.cross_verification.passed is True
+    assert result.mutation.passed is False
+    assert result.mutation.reason == "external_sandbox_required"
+    assert result.sandbox.status == "QUARANTINED"
+    assert result.sandbox.error == "external_sandbox_required"
     active = lifecycle.registry.active("positive_skill")
-    assert active is not None
-    assert active["status"] == "ACTIVE"
-    assert active["version"] == 1
-    assert active["candidate"]["status"] == "ACTIVE"
-    assert active["analysis"]["passed"] is True
-    assert active["runtime"]["sandbox"]["status"] == "PASSED"
+    assert active is None
+    persisted = lifecycle.registry.get_version("positive_skill", 1)
+    assert persisted is not None
+    assert persisted["status"] == "QUARANTINED"
+    assert persisted["analysis"]["passed"] is True
     store.close()
 
     restarted = Store(path)
     loaded = SkillRegistry(restarted).active("positive_skill")
-    assert loaded is not None
-    assert loaded["candidate"]["skill_id"] == "candidate-a"
-    assert loaded["status"] == "ACTIVE"
+    assert loaded is None
+    persisted_after_restart = SkillRegistry(restarted).get_version("positive_skill", 1)
+    assert persisted_after_restart is not None
+    assert persisted_after_restart["candidate"]["skill_id"] == "candidate-a"
+    assert persisted_after_restart["status"] == "QUARANTINED"
     restarted.close()
 
 
@@ -273,24 +276,26 @@ def test_weak_candidate_is_quarantined_when_mutants_survive(tmp_path: Path) -> N
     store.close()
 
 
-def test_versioning_never_overwrites_active_version(tmp_path: Path) -> None:
+def test_versioning_never_activates_untrusted_versions(tmp_path: Path) -> None:
     store = Store(tmp_path / "agent.sqlite3")
     lifecycle = manager(store)
     first = candidate("version-1", version=1)
-    assert lifecycle.submit(first, inputs={"value": 1}).approval.approved is True
+    first_result = lifecycle.submit(first, inputs={"value": 1})
+    assert first_result.approval.approved is False
     conflict = candidate("version-conflict", version=1)
     conflict_result = lifecycle.submit(conflict, inputs={"value": 1})
-    assert conflict_result.approval.status == "REJECTED"
-    assert lifecycle.registry.get_version("positive_skill", 1)["candidate"]["skill_id"] == "version-1"
+    assert conflict_result.approval.status == "QUARANTINED"
+    assert lifecycle.registry.active("positive_skill") is None
 
     second = candidate("version-2", version=2, parent_version=1)
-    assert lifecycle.submit(second, inputs={"value": 1}).approval.approved is True
-    assert lifecycle.registry.active("positive_skill")["version"] == 2
-    assert lifecycle.registry.get_version("positive_skill", 1)["status"] == "ACTIVE"
+    assert lifecycle.submit(second, inputs={"value": 1}).approval.approved is False
+    assert lifecycle.registry.active("positive_skill") is None
+    assert lifecycle.registry.get_version("positive_skill", 1)["status"] == "QUARANTINED"
+    assert lifecycle.registry.get_version("positive_skill", 2)["status"] == "QUARANTINED"
     store.close()
 
 
-def test_candidate_c_degrades_rolls_back_and_creates_experience_and_learning_trace(tmp_path: Path) -> None:
+def test_candidate_c_is_quarantined_before_runtime_or_learning(tmp_path: Path) -> None:
     store = Store(tmp_path / "agent.sqlite3")
     experience_memory = SQLiteExperienceMemory(store)
     reflection_memory = SQLiteReflectionMemory(store)
@@ -324,38 +329,25 @@ def test_candidate_c_degrades_rolls_back_and_creates_experience_and_learning_tra
     )
     first = candidate("runtime-v1", name="runtime_skill", version=1, implementation=v1_impl)
     second = candidate("runtime-v2", name="runtime_skill", version=2, implementation=v2_impl, parent_version=1)
-    assert lifecycle.submit(first, inputs={"value": 1}).approval.approved is True
-    assert lifecycle.submit(second, inputs={"value": 1}).approval.approved is True
-    v2_impl.failing = True
-
-    executions = [lifecycle.execute_active("runtime_skill", {"value": 1}) for _ in range(3)]
-    final = executions[-1]
-    assert final.rollback is not None
-    assert final.status == "FAILED"
-    assert lifecycle.registry.active("runtime_skill")["version"] == 1
-    assert lifecycle.registry.get_version("runtime_skill", 2)["status"] == "ROLLED_BACK"
-    assert lifecycle.registry.get_version("runtime_skill", 2)["candidate"]["status"] == "ROLLED_BACK"
-    metrics = store.get_skill_metrics("runtime-v2")
-    assert metrics is not None
-    assert metrics["rollback_count"] == 1
-    assert final.experience_id
-    assert store.get_experience(final.experience_id) is not None
-    assert reflection.calls == [final.experience_id]
-    assert len(learning.calls) == 1
-    assert any(event["event_type"] == "rollback" for event in lifecycle.registry.events("runtime-v2"))
+    first_result = lifecycle.submit(first, inputs={"value": 1})
+    second_result = lifecycle.submit(second, inputs={"value": 1})
+    assert first_result.approval.approved is False
+    assert second_result.approval.approved is False
+    assert first_result.sandbox.error == "external_sandbox_required"
+    assert second_result.sandbox.error == "external_sandbox_required"
+    assert lifecycle.registry.active("runtime_skill") is None
+    assert reflection.calls == []
+    assert learning.calls == []
     store.close()
 
 
-def test_active_execution_verifies_output_and_records_metrics(tmp_path: Path) -> None:
+def test_active_execution_stays_quarantined_without_external_runtime(tmp_path: Path) -> None:
     store = Store(tmp_path / "agent.sqlite3")
     lifecycle = manager(store)
-    assert lifecycle.submit(candidate("runtime-ok"), inputs={"value": 1}).approval.approved is True
+    assert lifecycle.submit(candidate("runtime-ok"), inputs={"value": 1}).approval.approved is False
     result = lifecycle.execute_active("positive_skill", {"value": 1})
-    assert result.status == "VERIFIED"
-    assert result.runtime.passed is True
-    assert result.cross_verification.passed is True
-    assert result.metrics["executions"] == 1
-    assert result.metrics["successes"] == 1
+    assert result.status == "QUARANTINED"
+    assert result.sandbox.error == "active_skill_not_found"
     store.close()
 
 

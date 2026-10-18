@@ -11,7 +11,7 @@ from private_agent.core.execution import ExecutionContext, GenericExecutor
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.observability import ObservabilityMonitor
 from private_agent.security import ActionRequest, AuditTrail, OwnerPermissionRule, PolicyDecision, SecurityController
-from private_agent.skills.lifecycle import MutationTestingEngine, SandboxResult, SkillLifecycleManager
+from private_agent.skills.lifecycle import MutationReport, MutationTestingEngine, SandboxResult, SkillLifecycleManager
 from private_agent.skills.registry import SkillRegistry
 from private_agent.storage import Store
 from private_agent.tools.contracts import ToolResult
@@ -728,7 +728,7 @@ def test_malformed_persisted_approval_fails_closed(tmp_path: Path) -> None:
     store.close()
 
 
-def test_execute_active_approval_variants_have_zero_side_effects_until_exact_approval(tmp_path: Path) -> None:
+def test_execute_active_remains_quarantined_without_external_sandbox(tmp_path: Path) -> None:
     from test_phase14a7_fail_closed import make_candidate
 
     store = Store(tmp_path / "active-approval-variants.sqlite3")
@@ -740,7 +740,10 @@ def test_execute_active_approval_variants_have_zero_side_effects_until_exact_app
     )
     candidate = make_candidate()
     submitted = lifecycle.submit(candidate, inputs={}, goal="runtime-goal")
-    assert submitted.approval.approved is True
+    assert submitted.approval.status == "QUARANTINED"
+    assert submitted.sandbox.error == "external_sandbox_required"
+    lifecycle.registry.persist_candidate(candidate, status="ACTIVE")
+    candidate.status = "ACTIVE"
 
     class SpySandbox:
         def __init__(self) -> None:
@@ -798,8 +801,9 @@ def test_execute_active_approval_variants_have_zero_side_effects_until_exact_app
         goal="runtime-goal",
         approval_id=valid_pending.approval_id,
     )
-    assert valid.status in {"VERIFIED", "FAILED"}
-    assert spy.calls == 1
+    assert valid.status == "QUARANTINED"
+    assert valid.sandbox.error == "untrusted_sandbox_provider_not_supported"
+    assert spy.calls == 0
 
     stale_action = controller.action_for_skill(
         "runtime-task", "stale", candidate, {"value": 4}, goal="runtime-goal"
@@ -810,9 +814,9 @@ def test_execute_active_approval_variants_have_zero_side_effects_until_exact_app
         {
             "rule_id": "runtime-version-bump",
             "effect": "ALLOW",
-            "scope_type": "GLOBAL",
-            "scope_key": "*",
-            "conditions": {"action_types": ["skill_invocation"]},
+            "scope_type": "TOOL",
+            "scope_key": "unrelated-tool",
+            "conditions": {},
             "reason": "bump policy version for stale approval test",
         },
         actor="owner",
@@ -827,7 +831,7 @@ def test_execute_active_approval_variants_have_zero_side_effects_until_exact_app
         approval_id=stale_pending.approval_id,
     )
     assert stale.status in {"BLOCKED", "QUARANTINED"}
-    assert spy.calls == 1
+    assert spy.calls == 0
     store.close()
 
 
@@ -877,7 +881,9 @@ def test_skill_goal_deny_blocks_execute_active_without_sandbox_call(tmp_path: Pa
     )
     candidate = make_candidate()
     submitted = lifecycle.submit(candidate, inputs={}, goal="allowed-goal")
-    assert submitted.approval.approved is True
+    assert submitted.approval.status == "QUARANTINED"
+    assert submitted.sandbox.error == "external_sandbox_required"
+    lifecycle.registry.persist_candidate(candidate, status="ACTIVE")
 
     class SpySandbox:
         def __init__(self) -> None:
@@ -908,12 +914,13 @@ def test_skill_goal_deny_blocks_execute_active_without_sandbox_call(tmp_path: Pa
     assert spy.calls == 0
 
     allowed = lifecycle.execute_active("fail_closed_skill", {}, task_id="goal-task", goal="allowed-goal")
-    assert allowed.status in {"VERIFIED", "FAILED", "QUARANTINED"}
-    assert spy.calls == 1
+    assert allowed.status == "QUARANTINED"
+    assert allowed.sandbox.error == "untrusted_sandbox_provider_not_supported"
+    assert spy.calls == 0
     store.close()
 
 
-def test_skill_activation_approval_binds_inputs_and_goal(tmp_path: Path) -> None:
+def test_skill_activation_approval_binds_inputs_and_goal(tmp_path: Path, monkeypatch) -> None:
     from test_phase14a7_fail_closed import make_candidate
 
     store = Store(tmp_path / "skill-approval-binding.sqlite3")
@@ -947,9 +954,25 @@ def test_skill_activation_approval_binds_inputs_and_goal(tmp_path: Path) -> None
     assert pending.approval_id
     controller.approval_gate.approve(pending.approval_id, actor="owner")
 
+    passed_mutation = MutationReport(
+        True,
+        1,
+        1,
+        0,
+        1.0,
+        lifecycle.mutation_engine.threshold,
+        reason="trusted_static_test_gate",
+    )
+    monkeypatch.setattr(
+        lifecycle.mutation_engine,
+        "run",
+        lambda _candidate, _runner=None: passed_mutation,
+    )
+
     rejected = lifecycle.submit(candidate, inputs={"value": 2}, goal="approval-goal", approval_id=pending.approval_id)
     assert rejected.approval.approved is False
     assert rejected.sandbox.status == "BLOCKED"
+    assert rejected.sandbox.error.startswith("security_policy_blocked:")
     store.close()
 
 

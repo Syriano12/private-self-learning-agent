@@ -411,7 +411,7 @@ def security_skill(skill_id: str, *, capabilities: list[str] | None = None, meta
     )
 
 
-def test_phase8_approved_skill_still_requires_phase9_approval_for_high_risk_invocation(tmp_path: Path) -> None:
+def test_high_risk_skill_is_quarantined_until_external_sandbox_exists(tmp_path: Path) -> None:
     store = Store(tmp_path / "skill-security.sqlite3")
     controller = SecurityController(store=store)
     lifecycle = SkillLifecycleManager(
@@ -424,15 +424,24 @@ def test_phase8_approved_skill_still_requires_phase9_approval_for_high_risk_invo
         metadata={"required_capabilities": ["NETWORK_ACCESS"], "risk_level": "high"},
     )
     submitted = lifecycle.submit(candidate, inputs={"value": 1})
-    assert submitted.approval.approved is True
-    blocked = lifecycle.execute_active("security_skill", {"value": 1})
+    assert submitted.approval.approved is False
+    assert submitted.approval.status == "QUARANTINED"
+    assert submitted.mutation.reason == "external_sandbox_required"
+    assert submitted.sandbox.error == "external_sandbox_required"
+    lifecycle.registry.persist_candidate(candidate, status="ACTIVE")
+    blocked = lifecycle.execute_active("security_skill", {"value": 1}, task_id="high-risk-task")
     assert blocked.status == "BLOCKED"
     assert blocked.sandbox.status == "BLOCKED"
-    assert candidate.implementation is safe_skill_impl
     request = store.all_approval_requests()[-1]
     controller.approval_gate.approve(request["approval_id"])
-    allowed = lifecycle.execute_active("security_skill", {"value": 1}, approval_id=request["approval_id"])
-    assert allowed.status == "VERIFIED"
+    allowed = lifecycle.execute_active(
+        "security_skill",
+        {"value": 1},
+        task_id="high-risk-task",
+        approval_id=request["approval_id"],
+    )
+    assert allowed.status == "QUARANTINED"
+    assert allowed.sandbox.error == "external_sandbox_unavailable"
     store.close()
 
 

@@ -7,6 +7,7 @@ from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import PlanStep, TaskPlan
 from private_agent.security import SecurityController
 from private_agent.skills.lifecycle import (
+    MutationReport,
     MutationTestingEngine,
     RuntimeVerificationReport,
     SandboxResult,
@@ -128,7 +129,9 @@ def test_skill_execution_fails_closed_without_calling_sandbox(tmp_path: Path) ->
     )
     candidate = make_candidate()
     submitted = lifecycle.submit(candidate, inputs={})
-    assert submitted.approval.approved is True
+    assert submitted.approval.status == "QUARANTINED"
+    assert submitted.sandbox.error == "external_sandbox_required"
+    lifecycle.registry.persist_candidate(candidate, status="ACTIVE")
 
     spy = SpySandbox()
     lifecycle.sandbox = spy
@@ -165,7 +168,9 @@ def test_orchestrator_default_path_has_an_initialized_security_boundary(tmp_path
     store.close()
 
 
-def test_skill_submit_fails_closed_before_sandbox_when_activation_is_denied(tmp_path: Path) -> None:
+def test_skill_submit_fails_closed_before_sandbox_when_activation_is_denied(
+    tmp_path: Path, monkeypatch,
+) -> None:
     store = Store(tmp_path / "skill-submit-boundary.sqlite3")
     controller = SecurityController(store=store)
     lifecycle = SkillLifecycleManager(
@@ -190,6 +195,20 @@ def test_skill_submit_fails_closed_before_sandbox_when_activation_is_denied(tmp_
     )
     spy = SpySandbox()
     lifecycle.sandbox = spy
+    passed_mutation = MutationReport(
+        True,
+        1,
+        1,
+        0,
+        1.0,
+        lifecycle.mutation_engine.threshold,
+        reason="trusted_static_test_gate",
+    )
+    monkeypatch.setattr(
+        lifecycle.mutation_engine,
+        "run",
+        lambda _candidate, _runner=None: passed_mutation,
+    )
 
     submitted = lifecycle.submit(candidate, inputs={})
 
