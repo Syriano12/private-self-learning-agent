@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from private_agent.core.observation import Observation
+from private_agent.core.experience import sanitize_value
 
 
 VERIFICATION_STATUSES = {"VERIFIED", "FAILED", "INSUFFICIENT", "BLOCKED"}
@@ -26,7 +29,7 @@ class VerificationResult:
         return self.status == "VERIFIED"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = sanitize_value({
             "status": self.status,
             "verified": self.verified,
             "reason": self.reason,
@@ -36,7 +39,14 @@ class VerificationResult:
             # Kept for compatibility with the Phase 1/2 result shape.
             "criteria": self.details.get("criteria", {}),
             "errors": self.details.get("errors", []),
-        }
+        })
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification_result_not_json_safe") from exc
+        if len(encoded.encode("utf-8")) > 128 * 1024:
+            raise ValueError("verification_result_too_large")
+        return payload
 
 
 class Verifier(Protocol):
@@ -99,6 +109,10 @@ class GenericVerifier:
 
 class WebResearchVerifier:
     name = "web_research"
+    MAX_SOURCES = 128
+    MAX_SOURCE_TEXT = 64_000
+    MAX_REQUIRED_TERMS = 32
+    MAX_SOURCE_URL = 2_048
 
     def verify(self, observation: Observation, criteria: dict[str, Any]) -> VerificationResult:
         if observation.execution_status == "blocked":
@@ -149,18 +163,37 @@ class WebResearchVerifier:
                 details={"code": "no_sources", "criteria": criteria},
             )
 
-        minimum_sources = int(criteria.get("minimum_sources", 2))
+        raw_minimum_sources = criteria.get("minimum_sources", 2)
+        if isinstance(raw_minimum_sources, bool) or not isinstance(raw_minimum_sources, int) or raw_minimum_sources < 1:
+            raise ValueError("minimum_sources_invalid")
+        minimum_sources = raw_minimum_sources
         require_non_empty_content = criteria.get("require_non_empty_content", True)
+        if not isinstance(require_non_empty_content, bool):
+            raise ValueError("require_non_empty_content_invalid")
+        required_terms = criteria.get("required_terms", [])
+        if (
+            not isinstance(required_terms, list)
+            or len(required_terms) > self.MAX_REQUIRED_TERMS
+            or any(not isinstance(term, str) or not term.strip() or len(term) > 256 for term in required_terms)
+        ):
+            raise ValueError("required_terms_invalid")
+        if len(sources) > self.MAX_SOURCES:
+            raise ValueError("sources_too_large")
         valid_sources: list[dict[str, Any]] = []
         invalid_sources: list[dict[str, Any]] = []
+        valid_texts: list[str] = []
         for source in sources:
             if not isinstance(source, dict):
                 invalid_sources.append({"reason": "source_not_object"})
                 continue
             text = source.get("text")
             url = source.get("url")
-            if not url:
+            if not isinstance(url, str) or not url or len(url) > self.MAX_SOURCE_URL:
                 invalid_sources.append({"reason": "url_missing", "source": source})
+                continue
+            parsed_url = urlparse(url)
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc or parsed_url.username or parsed_url.password:
+                invalid_sources.append({"reason": "url_invalid", "url": url})
                 continue
             if require_non_empty_content and not isinstance(text, str):
                 invalid_sources.append({"reason": "text_missing", "url": url})
@@ -168,7 +201,11 @@ class WebResearchVerifier:
             if require_non_empty_content and not text.strip():
                 invalid_sources.append({"reason": "text_empty", "url": url})
                 continue
+            if isinstance(text, str) and len(text) > self.MAX_SOURCE_TEXT:
+                invalid_sources.append({"reason": "text_too_large", "url": url})
+                continue
             valid_sources.append({"url": url, "title": source.get("title", ""), "content_length": len(text or "")})
+            valid_texts.append(text if isinstance(text, str) else "")
 
         evidence = [
             {"type": "source_count", "value": len(sources)},
@@ -189,8 +226,7 @@ class WebResearchVerifier:
                 },
             )
 
-        required_terms = criteria.get("required_terms", [])
-        searchable = " ".join(str(source.get("text", "")) for source in sources).lower()
+        searchable = " ".join(valid_texts).lower()
         missing_terms = [term for term in required_terms if str(term).lower() not in searchable]
         if missing_terms:
             return VerificationResult(
@@ -268,5 +304,12 @@ class VerifierRegistry:
                 "Verifier returned a malformed result",
                 verifier_type=name,
                 details={"code": "malformed_verification_result"},
+            )
+        if observation.execution_status != "success" and result.status == "VERIFIED":
+            return VerificationResult(
+                "BLOCKED" if observation.execution_status == "blocked" else "FAILED",
+                "Verification cannot succeed when execution did not succeed",
+                verifier_type=name,
+                details={"code": "verification_requires_successful_execution", "execution_status": observation.execution_status},
             )
         return result

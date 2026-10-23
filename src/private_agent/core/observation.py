@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from private_agent.core.execution import StepResult
+from private_agent.core.experience import sanitize_value
+
+
+MAX_OBSERVATION_BYTES = 128 * 1024
 
 
 @dataclass
@@ -31,7 +36,14 @@ class Observation:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = sanitize_value(asdict(self))
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("observation_not_json_safe") from exc
+        if len(encoded.encode("utf-8")) > MAX_OBSERVATION_BYTES:
+            raise ValueError("observation_too_large")
+        return payload
 
 
 @dataclass

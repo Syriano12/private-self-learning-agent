@@ -17,6 +17,8 @@ _SECRET_PATTERNS = (
 
 def sanitize_value(value: Any, *, key: str = "") -> Any:
     lowered = key.lower()
+    if lowered == "authorization_decision" and value in {"ALLOW", "DENY", "UNKNOWN"}:
+        return value
     if any(part in lowered for part in _SENSITIVE_KEY_PARTS):
         return _REDACTED
     if isinstance(value, dict):

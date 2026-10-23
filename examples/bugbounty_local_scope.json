@@ -1,0 +1,22 @@
+{
+  "program_id": "local-fixture-benchmark",
+  "authorization_reference": "local-only-fixture-authorization",
+  "issued_at": "2025-01-01T00:00:00+00:00",
+  "expires_at": "2099-01-01T00:00:00+00:00",
+  "assets": [
+    {
+      "asset_id": "fixture-api",
+      "host": "fixture.local",
+      "path_prefix": "/api/v1",
+      "methods": ["GET"],
+      "active_allowed": true
+    }
+  ],
+  "excluded_hosts": [],
+  "prohibited_methods": ["DELETE", "PATCH", "PUT", "POST"],
+  "permitted_methods": ["GET"],
+  "permitted_identities": ["alice", "bob", "admin"],
+  "permitted_resources": ["order-alice", "order-bob", "comment-bob", "report-admin"],
+  "active_testing": true,
+  "ambiguous": false
+}

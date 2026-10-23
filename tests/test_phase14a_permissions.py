@@ -36,7 +36,7 @@ def test_new_database_runs_monotonic_migration_and_creates_owner_tables(tmp_path
     path = tmp_path / "fresh.sqlite3"
     store = Store(path)
     versions = [row["schema_version"] for row in store.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5, 6, 7]
     assert store.db.execute("SELECT name FROM sqlite_master WHERE name = 'owner_permission_rules'").fetchone()
     assert store.db.execute("SELECT name FROM sqlite_master WHERE name = 'owner_policy_audit'").fetchone()
     store.close()
@@ -52,7 +52,7 @@ def test_existing_schema_v1_is_upgraded_on_reopen(tmp_path: Path) -> None:
     first.close()
 
     upgraded = Store(path)
-    assert [row["schema_version"] for row in upgraded.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")] == [1, 2, 3, 4]
+    assert [row["schema_version"] for row in upgraded.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")] == [1, 2, 3, 4, 5, 6, 7]
     assert upgraded.db.execute("SELECT name FROM sqlite_master WHERE name = 'owner_permission_rules'").fetchone()
     upgraded.close()
 

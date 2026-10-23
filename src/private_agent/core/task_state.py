@@ -55,12 +55,20 @@ def utc_now() -> str:
 
 
 def canonical_fingerprint(value: Any) -> str:
-    serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    serialized = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
 
 
 def plan_fingerprint(plan: dict[str, Any]) -> str:
-    return canonical_fingerprint(plan)
+    return canonical_fingerprint(sanitize_value(plan))
+
+
+def _contains_redacted(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_redacted(key) or _contains_redacted(item) for key, item in value.items())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_redacted(item) for item in value)
+    return isinstance(value, str) and "[REDACTED]" in value
 
 
 def action_fingerprint(*, plan_version: int, step_id: str, tool: str, inputs: dict[str, Any]) -> str:
@@ -123,8 +131,12 @@ class TaskState:
         return state
 
     @classmethod
-    def create_queued(cls, task_id: str, goal: str) -> "TaskState":
+    def create_queued(cls, task_id: str, goal: str, *, context: dict[str, Any] | None = None) -> "TaskState":
         state = cls(task_id=task_id, goal=goal, status="QUEUED", current_phase="QUEUED")
+        if context is not None:
+            if not isinstance(context, dict):
+                raise StateIntegrityError("task_context_must_be_object")
+            state.context = dict(context)
         state.checkpoint("TASK_QUEUED", phase="QUEUED", successful=True)
         return state
 
@@ -246,7 +258,17 @@ class TaskState:
     def set_plan(self, plan: dict[str, Any], *, version: int | None = None) -> None:
         if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list) or not plan["steps"]:
             raise StateIntegrityError("plan_required_for_persistence")
-        self.plan = sanitize_value(plan)
+        # Keep the in-memory plan for the current, already-authorized run, but
+        # persist only its sanitized projection.  A later reload detects the
+        # redacted marker and refuses to execute it as if it were the original
+        # input; callers must create a fresh authorized plan instead.
+        try:
+            json.dumps(sanitize_value(plan), ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise StateIntegrityError("plan_not_json_safe") from exc
+        # JSON round-tripping detaches nested planner objects without invoking
+        # arbitrary __deepcopy__ hooks from an untrusted provider.
+        self.plan = json.loads(json.dumps(plan, ensure_ascii=False, allow_nan=False))
         self.plan_version = int(version if version is not None else self.plan_version + 1)
         self.plan_fingerprint = plan_fingerprint(self.plan)
         actions = plan_actions(self.plan, self.plan_version)
@@ -309,6 +331,8 @@ class TaskState:
             raise StateIntegrityError("task_identity_required")
         if not isinstance(self.plan, dict):
             raise StateIntegrityError("plan_must_be_object")
+        if _contains_redacted(self.plan):
+            raise StateIntegrityError("redacted_execution_input_requires_resolution")
         if self.plan:
             if self.plan_version < 1 or not self.plan_fingerprint:
                 raise StateIntegrityError("plan_version_and_fingerprint_required")
@@ -339,6 +363,8 @@ class TaskState:
     def safe_pending_steps(self) -> list[dict[str, Any]]:
         if not self.plan:
             return []
+        if _contains_redacted(self.plan):
+            raise StateIntegrityError("redacted_execution_input_requires_resolution")
         completed = set(self.completed_actions)
         result = []
         for raw in self.plan.get("steps", []):

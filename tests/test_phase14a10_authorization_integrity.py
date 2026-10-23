@@ -595,7 +595,7 @@ def test_audit_failure_consumes_receipt_and_does_not_retry_side_effect() -> None
     assert side_effects["count"] == 1
 
 
-def test_concurrent_decision_mutation_cannot_change_trusted_policy_version(tmp_path: Path) -> None:
+def test_concurrent_decision_mutation_cannot_change_trusted_policy_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = Store(tmp_path / "concurrent-decision-mutation.sqlite3")
     controller = SecurityController(store=store)
     tool = CountingTool()
@@ -628,7 +628,7 @@ def test_concurrent_decision_mutation_cannot_change_trusted_policy_version(tmp_p
             assert mutation_done.wait(timeout=5)
         return signed
 
-    controller._authorization_signature = synchronized_signature
+    monkeypatch.setattr(SecurityController, "_authorization_signature", staticmethod(synchronized_signature))
 
     def mutate_decision() -> None:
         assert signature_ready.wait(timeout=5)
@@ -720,7 +720,6 @@ def test_malformed_persisted_approval_fails_closed(tmp_path: Path) -> None:
     payload = request.to_dict()
     payload["expires_at"] = "not-a-timestamp"
     store.save_approval_request(payload)
-    controller.approval_gate._requests.clear()
     rejected = controller.authorize(action, approval_id=request.approval_id, boundary=True)
     assert rejected.allowed is False
     assert rejected.decision == "REQUIRE_APPROVAL"
@@ -729,7 +728,7 @@ def test_malformed_persisted_approval_fails_closed(tmp_path: Path) -> None:
 
 
 def test_execute_active_remains_quarantined_without_external_sandbox(tmp_path: Path) -> None:
-    from test_phase14a7_fail_closed import make_candidate
+    from tests.test_phase14a7_fail_closed import make_candidate
 
     store = Store(tmp_path / "active-approval-variants.sqlite3")
     controller = SecurityController(store=store)
@@ -870,7 +869,7 @@ def test_policy_change_during_tool_execution_is_detected_before_success_audit(tm
 
 
 def test_skill_goal_deny_blocks_execute_active_without_sandbox_call(tmp_path: Path) -> None:
-    from test_phase14a7_fail_closed import make_candidate
+    from tests.test_phase14a7_fail_closed import make_candidate
 
     store = Store(tmp_path / "skill-goal-boundary.sqlite3")
     controller = SecurityController(store=store)
@@ -921,7 +920,7 @@ def test_skill_goal_deny_blocks_execute_active_without_sandbox_call(tmp_path: Pa
 
 
 def test_skill_activation_approval_binds_inputs_and_goal(tmp_path: Path, monkeypatch) -> None:
-    from test_phase14a7_fail_closed import make_candidate
+    from tests.test_phase14a7_fail_closed import make_candidate
 
     store = Store(tmp_path / "skill-approval-binding.sqlite3")
     controller = SecurityController(store=store)

@@ -375,6 +375,7 @@ class BackgroundWorker:
 
     def run_once(self) -> dict[str, Any]:
         """Claim and process at most one task, returning a serializable result."""
+        self._reconcile_approved_waiting_tasks()
         claim = self.store.claim_next_task(
             self.worker_id,
             lease_ttl_seconds=self.lease_ttl_seconds,
@@ -393,6 +394,21 @@ class BackgroundWorker:
                 "processed": False,
                 "task_id": task_id,
                 "error_code": str(claim.get("error_code", "lease_expired_execution_unknown")),
+            }
+        if claim.get("kind") != "CLAIMED":
+            task_id = str(claim.get("task_id", ""))
+            status = str(claim.get("queue_status") or claim.get("kind") or "BLOCKED")
+            self._emit_event(
+                "worker_non_executable_claim",
+                task_id=task_id,
+                status=status,
+                error_code=str(claim.get("error_code", "queue_state_not_executable")),
+            )
+            return {
+                "status": status,
+                "processed": False,
+                "task_id": task_id,
+                "error_code": str(claim.get("error_code", "queue_state_not_executable")),
             }
 
         task_id = str(claim["task_id"])
@@ -420,6 +436,24 @@ class BackgroundWorker:
             raise RuntimeError("worker_result_missing")
         return result
 
+    def _reconcile_approved_waiting_tasks(self) -> None:
+        """Recover approval transitions persisted just before a process stop.
+
+        This is intentionally a queue-only transition. It does not approve,
+        resume, or execute an action; the worker still re-enters the normal
+        orchestrator and execution-boundary checks after claiming the task.
+        """
+        for task_id in self.store.waiting_approval_task_ids(limit=100):
+            try:
+                self.store.requeue_waiting_approval_task(task_id)
+            except QueueLeaseLost:
+                # Another worker/recovery path won the transition.
+                continue
+            except ValueError as exc:
+                if str(exc) in {"approval_not_approved", "task_not_waiting_approval"}:
+                    continue
+                raise
+
     def _process_claim(
         self,
         claim: dict[str, Any],
@@ -429,7 +463,13 @@ class BackgroundWorker:
         try:
             try:
                 with self.store.lease_context(task_id, str(claim["lease_id"]), self.worker_id):
-                    result = self.orchestrator.run(str(claim["goal"]), task_id=task_id)
+                    task_payload = self.store.get_task_state(task_id)
+                    task_context = None
+                    if isinstance(task_payload, dict):
+                        persisted_state = TaskState.from_dict(task_payload)
+                        if persisted_state.context.get("task_kind") == "bug_bounty":
+                            task_context = dict(persisted_state.context)
+                    result = self.orchestrator.run(str(claim["goal"]), task_id=task_id, task_context=task_context)
                     heartbeat.raise_if_lost()
                     payload = self.store.get_task_state(task_id)
                     heartbeat.raise_if_lost()

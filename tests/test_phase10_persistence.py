@@ -162,7 +162,7 @@ def test_resume_after_crash_like_interruption_fails_closed_as_execution_unknown(
     restarted_store.close()
 
 
-def test_execution_unknown_can_only_retry_after_explicit_not_executed_observation(tmp_path: Path) -> None:
+def test_execution_unknown_stays_blocked_without_trusted_not_executed_attestation(tmp_path: Path) -> None:
     tool = DurableTool("safe")
 
     def interrupt(checkpoint: str, state: dict) -> None:
@@ -181,9 +181,109 @@ def test_execution_unknown_can_only_retry_after_explicit_not_executed_observatio
     assert blocked["final_status"] == "BLOCKED"
     assert restarted_store.get_task_state(task_id)["status"] == "EXECUTION_UNKNOWN"
     assert tool.calls == 0
-    result = restarted.resume_task(task_id, unknown_resolutions={key: {"decision": "retry", "observed_not_executed": True}})
-    assert result["final_status"] == "COMPLETED"
-    assert tool.calls == 1
+    record = restarted_store.get_task_state(task_id)["action_records"][key]
+    result = restarted.resume_task(
+        task_id,
+        unknown_resolutions={
+            key: {
+                "decision": "retry",
+                "observed_not_executed": True,
+                "binding": {
+                    "task_id": task_id,
+                    "action_key": key,
+                    "step_id": record["step_id"],
+                    "tool_name": record["tool_name"],
+                    "input_fingerprint": record["input_fingerprint"],
+                },
+            }
+        },
+    )
+    assert result["final_status"] == "BLOCKED"
+    assert restarted_store.get_task_state(task_id)["status"] == "BLOCKED"
+    assert tool.calls == 0
+    restarted_store.close()
+
+
+def test_execution_unknown_rejects_cross_tool_resolution_binding(tmp_path: Path) -> None:
+    tool = DurableTool("safe")
+
+    def interrupt(checkpoint: str, state: dict) -> None:
+        if checkpoint == "BEFORE_EXECUTION":
+            raise TaskInterrupted("interrupted")
+
+    store, first = make_agent(tmp_path / "unknown-forged-binding.sqlite3", tool, hook=interrupt)
+    with pytest.raises(TaskInterrupted):
+        first.run("forged resolution")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    key = next(iter(store.get_task_state(task_id)["action_records"]))
+    store.close()
+
+    restarted_store = Store(tmp_path / "unknown-forged-binding.sqlite3")
+    restarted = Orchestrator(restarted_store, registry(tool), planner=StubPlanner([step("safe")]))
+    restarted.resume_task(task_id)
+    record = restarted_store.get_task_state(task_id)["action_records"][key]
+    result = restarted.resume_task(
+        task_id,
+        unknown_resolutions={
+            key: {
+                "decision": "retry",
+                "observed_not_executed": True,
+                "binding": {
+                    "task_id": task_id,
+                    "action_key": key,
+                    "step_id": record["step_id"],
+                    "tool_name": "different-tool",
+                    "input_fingerprint": record["input_fingerprint"],
+                },
+            }
+        },
+    )
+
+    assert result["final_status"] == "BLOCKED"
+    assert restarted_store.get_task_state(task_id)["status"] == "BLOCKED"
+    assert tool.calls == 0
+    restarted_store.close()
+
+
+def test_execution_unknown_rejects_unattested_verified_resolution(tmp_path: Path) -> None:
+    tool = DurableTool("safe")
+
+    def interrupt(checkpoint: str, state: dict) -> None:
+        if checkpoint == "BEFORE_EXECUTION":
+            raise TaskInterrupted("interrupted")
+
+    store, first = make_agent(tmp_path / "unknown-unattested-verified.sqlite3", tool, hook=interrupt)
+    with pytest.raises(TaskInterrupted):
+        first.run("unattested verified resolution")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    key = next(iter(store.get_task_state(task_id)["action_records"]))
+    store.close()
+
+    restarted_store = Store(tmp_path / "unknown-unattested-verified.sqlite3")
+    restarted = Orchestrator(restarted_store, registry(tool), planner=StubPlanner([step("safe")]))
+    restarted.resume_task(task_id)
+    record = restarted_store.get_task_state(task_id)["action_records"][key]
+    result = restarted.resume_task(
+        task_id,
+        unknown_resolutions={
+            key: {
+                "decision": "verified",
+                "binding": {
+                    "task_id": task_id,
+                    "action_key": key,
+                    "step_id": record["step_id"],
+                    "tool_name": record["tool_name"],
+                    "input_fingerprint": record["input_fingerprint"],
+                },
+                "observation": {"task_id": task_id, "step_id": record["step_id"]},
+                "verification": {"status": "VERIFIED", "evidence": [{"type": "caller_claim"}]},
+            }
+        },
+    )
+
+    assert result["final_status"] == "BLOCKED"
+    assert restarted_store.get_task_state(task_id)["status"] == "BLOCKED"
+    assert tool.calls == 0
     restarted_store.close()
 
 

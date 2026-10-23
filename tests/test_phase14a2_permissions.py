@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from private_agent.security import ActionRequest, OwnerPermissionRule, SecurityController
-from private_agent.storage import Store
+from private_agent.storage import Store, UnsupportedSchemaVersion
 
 from tests.test_phase12_api import (
     APITestTool,
@@ -125,7 +126,7 @@ def test_schema_v3_marker_gap_is_repaired_without_inconsistent_objects(tmp_path:
 
     reopened = Store(path)
     versions = [row["schema_version"] for row in reopened.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5, 6, 7]
     for object_type, name in (
         ("table", "owner_permission_rules"),
         ("table", "owner_policy_audit"),
@@ -157,3 +158,44 @@ def test_locked_sqlite_version_allocation_fails_closed_without_partial_data(tmp_
         first.db.rollback()
         first.close()
         second.close()
+
+
+def test_migration_failure_rolls_back_all_new_schema_steps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "migration-rollback.sqlite3"
+    original = Store._apply_migration
+
+    def fail_at_queue(store: Store, version: int) -> None:
+        if version == 4:
+            raise RuntimeError("injected_migration_failure")
+        original(store, version)
+
+    monkeypatch.setattr(Store, "_apply_migration", fail_at_queue)
+    with pytest.raises(RuntimeError, match="injected_migration_failure"):
+        Store(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("SELECT schema_version FROM task_state_schema").fetchall() == []
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+            "('owner_permission_rules', 'owner_policy_state', 'task_queue')"
+        ).fetchall() == []
+    finally:
+        connection.close()
+
+    monkeypatch.undo()
+    reopened = Store(path)
+    assert [row["schema_version"] for row in reopened.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")] == [1, 2, 3, 4, 5, 6, 7]
+    reopened.close()
+
+
+def test_schema5_rejects_wrong_index_definition_on_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "index-drift.sqlite3"
+    store = Store(path)
+    store.db.execute("DROP INDEX idx_knowledge_claims_freshness")
+    store.db.execute("CREATE INDEX idx_knowledge_claims_freshness ON knowledge_claims(claim_id)")
+    store.db.commit()
+    store.close()
+
+    with pytest.raises(UnsupportedSchemaVersion, match="invalid_index:idx_knowledge_claims_freshness"):
+        Store(path)

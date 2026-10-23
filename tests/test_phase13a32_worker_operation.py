@@ -232,6 +232,8 @@ def test_approval_required_task_waits_then_executes_after_owner_approval(tmp_pat
         assert waiting.json()["status"] == "WAITING_APPROVAL"
         assert tool.calls == 0
         approval_id = next(iter(store.get_task_state(task_id)["approval_ids"].values()))
+        assert worker.stop(timeout=2.0)
+        first_thread.join(timeout=2.0)
         approved = client.post(f"/api/v1/approvals/{approval_id}/approve", json={}, headers=auth_headers())
         assert approved.status_code == 200, approved.text
         store.requeue_waiting_approval_task(task_id)

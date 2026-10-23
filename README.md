@@ -6,6 +6,8 @@
 
 الإصدار `0.1.0` يتضمن طبقة LLM محايدة مع Gemini REST، ومخططاً منظماً مدفوعاً بـLLM مع تحقق حتمي للخطة، وسجل أدوات، وبحثاً متعدد المصادر، واستخراج نص، وتخزين SQLite منفصلاً للمهام والتجارب والمعرفة، واسترجاع تجارب تشغيلية حتمي محدود السياق، ومحرك Reflection يستخرج أنماطاً منظمة مدعومة بالأدلة، ومحرك LearningEngine يحول الـInsights إلى استراتيجيات منظمة قابلة للاسترجاع، وتحققاً من الأدلة، وتسجيل الفشل وإعادة المحاولة. عند غياب `GEMINI_API_KEY` يُستخدم مسار توافق محدود؛ ويمكن لهذا المسار استخدام الاستراتيجيات المتعلمة حتمياً مع بقاء الخطة خاضعة للتحقق والصلاحيات.
 
+يوجد الآن scaffold محلي لتطبيق Android/Expo في [`mobile/`](mobile/README.md). التطبيق يستعمل API المصادق عليه فقط، ويعرض المهام والموافقات والتدقيق والأدوات للقراءة، مع استئناف صريح للمهام القابلة للاستئناف ومنع إعادة تنفيذ `EXECUTION_UNKNOWN`. لم يُبنَ APK بعد لأن Expo/Android SDK غير متوفرين في بيئة التطوير الحالية ولم تُثبت dependencies.
+
 ## التثبيت
 
 ```bash
@@ -14,7 +16,7 @@ python -m venv .venv
 python -m pip install -e '.[test]'
 ```
 
-في Termux يمكن تثبيت Python من مستودع Termux ثم استخدام البيئة الافتراضية. لا توجد حاجة إلى Docker أو systemd في هذا الإصدار.
+في Termux يمكن تثبيت Python من مستودع Termux ثم استخدام البيئة الافتراضية. لا يحتاج التشغيل المحلي إلى Docker أو systemd؛ أما التشغيل المستمر على خادم مخصص فله حزمة systemd وreverse proxy موثقة في Phase 30 أدناه.
 
 ## التشغيل
 
@@ -23,15 +25,41 @@ private-agent run "ابحث عن 5 مشاريع مفتوحة المصدر يمك
 private-agent serve --host 127.0.0.1 --port 8000
 ```
 
-واجهة API: `GET /health`، و`GET /tools`، و`POST /tasks/run` مع جسم JSON مثل `{"goal":"..."}`.
+للاستخدام التشغيلي المحلي، شغّل API والعامل المستمر في العملية نفسها:
+
+```bash
+export AGENT_DB_PATH="/tmp/vulnora-agent.sqlite3"
+export AGENT_REQUIRE_OWNER_AUTH=1
+export AGENT_OWNER_EMAIL="ashbm1995@gmail.com"
+export AGENT_COOKIE_SECURE=0 # loopback development only
+private-agent serve --with-worker --host 127.0.0.1 --port 8000
+```
+
+Initialize the owner once, before starting the owner-authenticated service, with the interactive CLI. It never accepts a password argument or stores the password in the repository:
+
+```bash
+private-agent auth init-owner --database /tmp/vulnora-agent.sqlite3
+```
+
+ينشئ `POST /api/v1/tasks` مهمة `QUEUED` محفوظة أولًا، ثم يعالجها العامل، وتصبح الموافقة المطلوبة قابلة لإعادة الإدراج تلقائيًا بعد موافقة المالك. لا تعني استجابة الإنشاء أن المهمة اكتملت؛ استخدم `GET /api/v1/tasks/{task_id}`.
+
+واجهة API الأساسية: `GET /health` و`GET /ready` و`GET /api/v1/tools` و`POST /api/v1/tasks`. المسار القديم `POST /tasks/run` محفوظ للتوافق ويظل مصادقًا عليه.
+
+واجهة Vulnora المستقلة موجودة في المستودع الشقيق `/home/ubuntu/agentctrl`. شغّلها بـ`VITE_AGENT_API_BASE_URL=http://127.0.0.1:8000/api/v1 pnpm dev` ثم سجّل الدخول بحساب المالك أو بحساب OPERATOR/VIEWER المدار من المالك. يدعم التكامل task history والموافقات والأدلة وBug Bounty عبر `/api/v1/bug-bounty/tasks`، بينما يبقى API مصدر الحقيقة.
+
+لا يفتح CLI منفذًا خارجيًا افتراضيًا، ولا يبدأ هذا الأمر scanner أو sandbox غير متحقق. تشغيل `httpx`/`nuclei` يحتاج طلبًا صريحًا، نطاقًا مكتوبًا، موافقة المالك، signed release provenance مع signer fingerprint، وOCI sandbox متحققًا؛ في البيئة الحالية تبقى الأدوات محجوبة بـ`scanner_sandbox_unavailable`. استخدم `--host 127.0.0.1` أثناء التطوير المحلي. راجع [`docs/PHASE26_TRUSTED_RUNTIME.md`](docs/PHASE26_TRUSTED_RUNTIME.md)، [`docs/PHASE27_ISOLATED_RUNTIME_PROVISIONING.md`](docs/PHASE27_ISOLATED_RUNTIME_PROVISIONING.md)، و[`docs/PHASE28_PORTABLE_RUNTIME_KIT.md`](docs/PHASE28_PORTABLE_RUNTIME_KIT.md).
+
+## Phase 30 — حزمة نشر OCI واستعادة SQLite
+
+أضيفت حزمة تشغيل مراجَعة في [`deploy/production/README.md`](deploy/production/README.md)، تشمل systemd لتشغيل API والعامل على loopback، وNginx لـHTTPS وsame-origin API، ونموذج بيئة إنتاجي بلا أسرار، وأداة نسخ/استعادة SQLite ذرية في [`scripts/sqlite_backup.py`](scripts/sqlite_backup.py). هذه الملفات لا تنشئ موارد OCI ولا تثبّت شيئًا ولا تفعّل الماسحات؛ لا تزال `RuntimeActivationProof` وعمليات `httpx`/`nuclei` محجوبة حتى اجتياز قبول OCI المعزول الفعلي.
 
 ## متغيرات البيئة
 
-`AGENT_DB_PATH` يحدد قاعدة البيانات، و`AGENT_HTTP_TIMEOUT` مهلة HTTP، و`AGENT_MAX_ATTEMPTS` عدد محاولات التعافي. يستخدم المخطط `AGENT_LLM_PROVIDER` و`GEMINI_MODEL` و`AGENT_LLM_TIMEOUT` وإعدادات retry/backoff المقابلة. يجب توفير `GEMINI_API_KEY` محلياً فقط، ولا تُحفظ الأسرار داخل المصدر.
+يحدد `AGENT_REQUIRE_OWNER_AUTH` و`AGENT_OWNER_EMAIL` وضع Owner Authentication، وتستخدم الواجهة جلسات HttpOnly مع CSRF بدل تخزين Bearer في المتصفح. لا تضبط `AGENT_API_TOKEN` في نشر الإنترنت؛ legacy Bearer compatibility مخصص للتوافق المحلي فقط ويُعطّل تلقائيًا بعد تهيئة المالك أو عند تفعيل owner-auth. يحدد `AGENT_DB_PATH` قاعدة البيانات، و`AGENT_HTTP_TIMEOUT` مهلة HTTP، و`AGENT_MAX_ATTEMPTS` عدد محاولات التعافي. تبدأ إعدادات العامل بـ`AGENT_WORKER_*` كما في `.env.example`، وتشمل lease وheartbeat وmaximum execution age وpolling/backoff. يمكن ضبط `AGENT_HTTPX_BINARY` و`AGENT_NUCLEI_BINARY` وإعدادات templates وsigned release metadata كما في `.env.example`، لكن غياب signer provenance أو OCI sandbox موثق يؤدي إلى `UNAVAILABLE` ولا يوجد fallback. يستخدم المخطط `AGENT_LLM_PROVIDER` و`GEMINI_MODEL` و`AGENT_LLM_TIMEOUT` وإعدادات retry/backoff المقابلة. يجب توفير `GEMINI_API_KEY` محلياً فقط، ولا تُحفظ الأسرار داخل المصدر.
 
 ## حدود الإصدار
 
-لم تُضف بعد واجهة WhatsApp أو المتصفح التفاعلي أو تنفيذ أوامر نظام عامة أو تشغيل كود غير موثوق أو وظائف Bug Bounty. ستُضاف فقط بعد تثبيت بوابات الأمان والموافقة والاختبارات المستقلة.
+لا توجد واجهة WhatsApp أو تنفيذ أوامر نظام عامة أو تشغيل كود غير موثوق. Bug Bounty deterministic وadapters scanners مقيّدة: النطاق الصريح والموافقة وEvidence Gate إلزامية، وNuclei output يبقى hypothesis. لا يوجد browser automation أو generic live-target connector أو ادعاء مضمون لاكتشاف zero-days. غياب العامل في التشغيل الإلزامي يجعل `/ready` غير جاهز ويرفض إنشاء مهام جديدة بدل تركها عالقة.
 
 ## Phase 7 — Real Self-Learning
 
@@ -380,8 +408,8 @@ APPROVAL_INVALIDATED
 ```text
 HTTP Request
 → request id + typed validation
-→ Bearer authentication
-→ single-owner authorization
+→ Cookie session + CSRF or deprecated local Bearer compatibility
+→ Owner/Operator/Viewer authorization
 → AgentAPIService
 → Orchestrator / Store / SecurityController / ObservabilityMonitor
 ```
@@ -390,15 +418,16 @@ HTTP Request
 
 ### Authentication and authorization
 
-تتطلب كل مسارات `/api/v1/...` و`POST /tasks/run`:
+تتطلب المسارات الحساسة جلسة Cookie صادرة من `/api/v1/auth/login`، مع `X-CSRF-Token` لكل تغيير حالة. تُقبل Bearer compatibility فقط عندما لا يوجد owner-auth state ولا يكون `AGENT_REQUIRE_OWNER_AUTH=1`، ولا يجب استخدامها في نشر الإنترنت:
 
 ```http
-Authorization: Bearer <AGENT_API_TOKEN>
+Cookie: vulnora_session=<HttpOnly session>
+X-CSRF-Token: <matching CSRF cookie for POST/PATCH/DELETE>
 ```
 
-يُقرأ `AGENT_API_TOKEN` من environment/configuration فقط. لا يوجد token افتراضي، ولا bypass لقيم مثل `True` أو `admin` أو `secret` أو `test`. الطلب المفقود أو malformed أو غير الصحيح يعيد `401`، وغياب الإعداد يجعل readiness `503`.
+تُخزّن كلمات المرور باستخدام scrypt salted، وتُخزّن session/CSRF tokens في SQLite كـhashes فقط. لا يوجد public registration أو owner initialization عبر HTTP؛ التهيئة تفاعلية مرة واحدة عبر CLI للبريد المالك المحدد. حالات owner غير السليمة تفشل readiness وتمنع legacy fallback. غياب session أو CSRF أو role المناسب يعيد `401` أو `403`، وغياب إعداد auth يجعل readiness `503`.
 
-المصادقة منفصلة عن authorization. Phase 12 هو single-owner فقط؛ لا يضيف fake multi-tenancy. بعد المصادقة يستطيع المالك قراءة موارده المحلية، لكن `SecurityController` يظل السلطة الوحيدة للـcapabilities/risk/approval/quarantine، ويُعاد فحص security عند execution boundary كما في Phase 9.
+المصادقة منفصلة عن authorization. Owner Authentication & RBAC يدعم OWNER وOPERATOR وVIEWER مع task ownership server-side؛ لا تعتمد حماية الواجهة وحدها. يظل `SecurityController` السلطة الوحيدة للـcapabilities/risk/approval/quarantine، ويُعاد فحص security عند execution boundary كما في Phase 9.
 
 ### Endpoints
 

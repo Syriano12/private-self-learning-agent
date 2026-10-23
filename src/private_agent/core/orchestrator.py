@@ -109,6 +109,7 @@ class Orchestrator:
         *,
         task_id: str | None = None,
         approval_ids: dict[str, str] | None = None,
+        task_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if task_id:
             existing_state = self.store.get_task_state(task_id)
@@ -118,6 +119,10 @@ class Orchestrator:
         approval_ids = approval_ids or {}
         self.recovery.attempts.clear()
         state = TaskState.create(task_id, goal)
+        if task_context is not None:
+            if not isinstance(task_context, dict):
+                raise ValueError("task_context_must_be_object")
+            state.context.update(task_context)
         state.context["attempts"] = 0
         self._checkpoint(state, "TASK_CREATED", phase="TASK_CREATED", successful=True)
         state.checkpoint("TASK_PLANNING", status="PLANNING", phase="PLANNING", successful=True)
@@ -152,7 +157,49 @@ class Orchestrator:
         )
         planning_started = monotonic()
         try:
-            initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
+            if state.context.get("task_kind") == "bug_bounty":
+                request = state.context.get("bugbounty_request")
+                if not isinstance(request, dict):
+                    raise ValueError("bugbounty_request_missing")
+                scanner = request.get("scanner", "deterministic")
+                if scanner == "deterministic":
+                    tool_name = "bugbounty_analysis"
+                    step_input = {
+                        key: request.get(key)
+                        for key in ("scope", "fixture", "urls", "openapi", "source_documents")
+                        if key in request
+                    }
+                    objective = "Run bounded local Bug Bounty analysis"
+                    reason = "Explicit API request routed to the registered local-only analysis contract"
+                    required_fields = ["run", "report"]
+                elif scanner in {"httpx", "nuclei"}:
+                    tool_name = "httpx_recon" if scanner == "httpx" else "nuclei_scan"
+                    step_input = {
+                        "scope": request.get("scope"),
+                        "target": request.get("target"),
+                        "identity": request.get("identity"),
+                        "resource_id": request.get("resource_id"),
+                    }
+                    objective = f"Run bounded {scanner} reconnaissance within the explicit authorized scope"
+                    reason = f"Explicit API request routed to the registered {scanner} adapter; results remain observations"
+                    required_fields = ["scan"]
+                else:
+                    raise ValueError("scanner_type_unsupported")
+                initial_plan = TaskPlan(
+                    goal=goal,
+                    steps=[PlanStep(
+                        id=f"bugbounty-{task_id}",
+                        objective=objective,
+                        tool=tool_name,
+                        input=step_input,
+                        reason=reason,
+                        depends_on=[],
+                        success_criteria={"required_fields": required_fields},
+                    )],
+                    rationale="Specialized Bug Bounty route; normal plan validation and execution authorization remain authoritative",
+                )
+            else:
+                initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
         except Exception as exc:
             self._emit_observability(
                 "PLAN_REJECTED",
@@ -800,35 +847,30 @@ class Orchestrator:
     ) -> bool:
         if isinstance(resolution, str):
             resolution = {"decision": resolution}
+        binding = resolution.get("binding") if isinstance(resolution, dict) else None
+        expected_binding = {
+            "task_id": state.task_id,
+            "action_key": key,
+            "step_id": str(record.get("step_id", "")),
+            "tool_name": str(record.get("tool_name", "")),
+            "input_fingerprint": str(record.get("input_fingerprint", "")),
+        }
+        if not isinstance(binding, dict) or any(
+            binding.get(name) != value for name, value in expected_binding.items()
+        ):
+            return False
         decision = str(resolution.get("decision", resolution.get("status", ""))).lower()
         if decision == "retry":
-            if resolution.get("observed_not_executed") is not True:
-                return False
-            record["status"] = "NOT_STARTED"
-            record["resolution"] = "explicit_observation_not_executed"
-            state.pending_actions = list(dict.fromkeys(state.pending_actions + [key]))
-            state.recovery_state = {"action_key": key, "resolution": "retry"}
-            return True
+            # A caller-controlled ``observed_not_executed`` flag is not proof
+            # that a side effect did not happen.  Until a trusted execution
+            # boundary can issue a task/action-bound attestation, retrying an
+            # EXECUTION_UNKNOWN action remains fail-closed.
+            return False
         if decision == "verified":
-            observation = resolution.get("observation")
-            verification = resolution.get("verification")
-            if not isinstance(observation, dict) or not isinstance(verification, dict):
-                return False
-            if verification.get("status") != "VERIFIED" or not verification.get("evidence"):
-                return False
-            state.observations[key] = observation
-            state.verification_results[key] = verification
-            state.mark_action(
-                key,
-                status="VERIFIED",
-                step_id=str(record.get("step_id", "")),
-                tool_name=str(record.get("tool_name", "")),
-                input_fingerprint=str(record.get("input_fingerprint", "")),
-                observation=observation,
-                verification=verification,
-                resolution="explicit_external_observation",
-            )
-            return True
+            # No trusted attestation channel exists for externally supplied
+            # observations yet.  Binding alone is integrity, not authenticity;
+            # never promote caller-provided evidence to VERIFIED/COMPLETED.
+            return False
         return False
 
     def _resume_execute_state(self, state: TaskState, current_plan: TaskPlan) -> dict[str, Any]:
@@ -1007,7 +1049,7 @@ class Orchestrator:
                     observation=outcome.observation.to_dict(),
                     verification=outcome.verification,
                 )
-                self._save_checkpoint_after(state, "AFTER_VERIFICATION", step.id)
+                self._save_checkpoint_after(state, "AFTER_VERIFICATION", step.id, status="FAILED")
                 if diagnosis is None:
                     diagnosis = FailureDiagnosis(
                         "UNKNOWN_FAILURE", "No diagnosis was produced for an unsuccessful step",

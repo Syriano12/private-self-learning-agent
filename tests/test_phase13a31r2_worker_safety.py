@@ -226,7 +226,10 @@ def test_max_execution_age_stops_renewal_and_marks_unknown(tmp_path: Path) -> No
         worker_id="worker-watchdog",
         lease_ttl_seconds=60,
         heartbeat_interval_seconds=0.01,
-        max_execution_age_seconds=0.08,
+        # The watchdog measures claim age, including planning and security
+        # preflight before the controlled tool call begins. 80ms made this
+        # regression timing-dependent under a full-suite load.
+        max_execution_age_seconds=1.0,
     )
     run_thread = threading.Thread(target=lambda: result_holder.update(result=worker.run_once()))
     run_thread.start()

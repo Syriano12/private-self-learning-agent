@@ -3,12 +3,98 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+import weakref
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 from typing import Any, Callable
 
 from private_agent.core.experience import sanitize_value
 from private_agent.core.recovery import input_fingerprint
+
+
+_WRITE_ONCE_VALUES: weakref.WeakKeyDictionary[Any, weakref.WeakKeyDictionary[Any, Any]] = weakref.WeakKeyDictionary()
+_WRITE_ONCE_UPDATE_TOKEN = object()
+
+
+def _reference_values(descriptor: Any) -> weakref.WeakKeyDictionary[Any, Any]:
+    values = _WRITE_ONCE_VALUES.get(descriptor)
+    if values is None:
+        values = weakref.WeakKeyDictionary()
+        _WRITE_ONCE_VALUES[descriptor] = values
+    return values
+
+
+class _WriteOnceReference:
+    """Descriptor-backed reference that cannot be replaced after construction."""
+
+    __slots__ = ("_error", "_name", "__weakref__")
+
+    def __init__(self, error: str = "security_state_immutable") -> None:
+        self._error = error
+        self._name = "reference"
+
+    def __set_name__(self, owner: type[Any], name: str) -> None:
+        self._name = name
+
+    def __get__(self, instance: Any, owner: type[Any] | None = None) -> Any:
+        if instance is None:
+            # Do not expose a class-level object with a replacement method.
+            return None
+        try:
+            return _reference_values(self)[instance]
+        except KeyError as exc:
+            raise AttributeError(self._name) from exc
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        values = _reference_values(self)
+        if instance in values:
+            raise AttributeError(self._error)
+        values[instance] = value
+
+
+def _replace_write_once_reference(
+    descriptor: _WriteOnceReference,
+    instance: Any,
+    value: Any,
+    *,
+    token: object,
+) -> None:
+    """Internal policy-update hook; the descriptor exposes no replacement method."""
+    if token is not _WRITE_ONCE_UPDATE_TOKEN:
+        raise AttributeError(descriptor._error)
+    values = _reference_values(descriptor)
+    if instance not in values:
+        raise AttributeError(descriptor._name)
+    values[instance] = value
+
+
+class _MonotonicSealFlag:
+    """Allow only the construction transition False -> True."""
+
+    __slots__ = ("_values", "__weakref__")
+
+    def __init__(self) -> None:
+        self._values: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+
+    def __get__(self, instance: Any, owner: type[Any] | None = None) -> bool:
+        if instance is None:
+            return None  # type: ignore[return-value]
+        try:
+            return self._values[instance]
+        except KeyError as exc:
+            raise AttributeError("_security_state_sealed") from exc
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        if instance not in self._values:
+            if value is not False:
+                raise AttributeError("security_state_immutable")
+            self._values[instance] = False
+            return
+        if self._values[instance] is False and value is True:
+            self._values[instance] = True
+            return
+        raise AttributeError("security_state_immutable")
 
 
 CAPABILITIES = {
@@ -217,7 +303,7 @@ class ActionRequest:
         return sanitize_value(asdict(self))
 
 
-@dataclass
+@dataclass(slots=True)
 class SecurityPolicy:
     policy_version: int = 1
     approval_required_risks: list[str] = field(default_factory=lambda: ["HIGH", "CRITICAL"])
@@ -249,6 +335,43 @@ class SecurityPolicy:
             approval_ttl_seconds=int(payload.get("approval_ttl_seconds", 300)),
             allow_skill_activation_without_approval=bool(payload.get("allow_skill_activation_without_approval", True)),
         )
+
+
+class _ImmutableSecurityPolicy:
+    """Authoritative policy snapshot; public callers receive mutable copies."""
+
+    __slots__ = ("__weakref__",)
+
+    policy_version = _WriteOnceReference("security_policy_immutable")
+    approval_required_risks = _WriteOnceReference("security_policy_immutable")
+    medium_requires_approval = _WriteOnceReference("security_policy_immutable")
+    always_approval_capabilities = _WriteOnceReference("security_policy_immutable")
+    denied_capabilities = _WriteOnceReference("security_policy_immutable")
+    quarantined_skill_statuses = _WriteOnceReference("security_policy_immutable")
+    approval_ttl_seconds = _WriteOnceReference("security_policy_immutable")
+    allow_skill_activation_without_approval = _WriteOnceReference("security_policy_immutable")
+
+    def __init__(self, policy: SecurityPolicy) -> None:
+        self.policy_version = int(policy.policy_version)
+        self.approval_required_risks = tuple(policy.approval_required_risks)
+        self.medium_requires_approval = bool(policy.medium_requires_approval)
+        self.always_approval_capabilities = tuple(policy.always_approval_capabilities)
+        self.denied_capabilities = tuple(policy.denied_capabilities)
+        self.quarantined_skill_statuses = tuple(policy.quarantined_skill_statuses)
+        self.approval_ttl_seconds = int(policy.approval_ttl_seconds)
+        self.allow_skill_activation_without_approval = bool(policy.allow_skill_activation_without_approval)
+
+    def to_dict(self) -> dict[str, Any]:
+        return sanitize_value({
+            "policy_version": self.policy_version,
+            "approval_required_risks": list(self.approval_required_risks),
+            "medium_requires_approval": self.medium_requires_approval,
+            "always_approval_capabilities": list(self.always_approval_capabilities),
+            "denied_capabilities": list(self.denied_capabilities),
+            "quarantined_skill_statuses": list(self.quarantined_skill_statuses),
+            "approval_ttl_seconds": self.approval_ttl_seconds,
+            "allow_skill_activation_without_approval": self.allow_skill_activation_without_approval,
+        })
 
 
 OWNER_EFFECTS = {"ALLOW", "DENY", "REQUIRE_APPROVAL"}
@@ -446,13 +569,17 @@ def _provenance_snapshot(provenance: Any) -> Any:
         return ("PolicyDecision", _freeze_value(provenance.to_dict()))
     if isinstance(provenance, ApprovalRequest):
         return ("ApprovalRequest", _freeze_value(provenance.to_dict()))
-    if isinstance(provenance, SecurityPolicy):
+    if isinstance(provenance, (SecurityPolicy, _ImmutableSecurityPolicy)):
         return ("SecurityPolicy", _freeze_value(provenance.to_dict()))
     return ("identity", id(provenance))
 
 
 class PolicyEngine:
     """Deterministic policy authority; it never consumes free-form LLM approval text."""
+
+    store = _WriteOnceReference("policy_store_immutable")
+    _policy = _WriteOnceReference("policy_authority_immutable")
+    __slots__ = ("__weakref__",)
 
     def __init__(self, policy: SecurityPolicy | None = None, *, store: Any | None = None) -> None:
         self.store = store
@@ -463,8 +590,20 @@ class PolicyEngine:
                     policy = SecurityPolicy.from_dict(json.loads(row["policy_json"]))
                 except (TypeError, ValueError, KeyError) as exc:
                     raise ValueError("corrupted_security_policy") from exc
-        self.policy = policy or SecurityPolicy()
+        # Keep the authoritative policy private.  The public property returns
+        # a defensive snapshot so callers cannot mutate authorization rules in
+        # place without the monotonic update path and its audit event.
+        self._policy = _ImmutableSecurityPolicy(SecurityPolicy.from_dict((policy or SecurityPolicy()).to_dict()))
         self._persist_policy()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_policy" and hasattr(self, "_policy"):
+            raise AttributeError("policy_authority_immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def policy(self) -> SecurityPolicy:
+        return SecurityPolicy.from_dict(self._policy.to_dict())
 
     def _owner_rules(self) -> list[dict[str, Any]]:
         if self.store is None or not hasattr(self.store, "owner_permission_rules"):
@@ -534,8 +673,8 @@ class PolicyEngine:
 
     def _current_policy_version(self) -> int:
         if self.store is not None and hasattr(self.store, "latest_owner_policy_version"):
-            return max(self.policy.policy_version, int(self.store.latest_owner_policy_version()))
-        return self.policy.policy_version
+            return max(self._policy.policy_version, int(self.store.latest_owner_policy_version()))
+        return self._policy.policy_version
 
     def evaluate(self, action: ActionRequest) -> PolicyDecision:
         requested = set(action.requested_capabilities)
@@ -593,9 +732,15 @@ class PolicyEngine:
         return self._decision(action, "ALLOW", risk, reasons)
 
     def update_policy(self, policy: SecurityPolicy) -> SecurityPolicy:
-        if policy.policy_version <= self.policy.policy_version:
+        if policy.policy_version <= self._policy.policy_version:
             raise ValueError("policy_version_must_increase")
-        self.policy = policy
+        descriptor = type(self).__dict__["_policy"]
+        _replace_write_once_reference(
+            descriptor,
+            self,
+            _ImmutableSecurityPolicy(SecurityPolicy.from_dict(policy.to_dict())),
+            token=_WRITE_ONCE_UPDATE_TOKEN,
+        )
         self._persist_policy()
         return self.policy
 
@@ -641,7 +786,7 @@ class PolicyEngine:
 
     def _persist_policy(self) -> None:
         if self.store is not None and hasattr(self.store, "save_security_policy"):
-            self.store.save_security_policy(self.policy.to_dict())
+            self.store.save_security_policy(self._policy.to_dict())
 
 
 @dataclass
@@ -672,8 +817,23 @@ class ApprovalRequest:
         return sanitize_value(asdict(self))
 
 
+_APPROVAL_STATE: weakref.WeakKeyDictionary[Any, dict[str, ApprovalRequest]] = weakref.WeakKeyDictionary()
+_APPROVAL_STATE_LOCK = threading.RLock()
+
+
+def _approval_records(gate: Any) -> dict[str, ApprovalRequest]:
+    with _APPROVAL_STATE_LOCK:
+        records = _APPROVAL_STATE.get(gate)
+        if records is None:
+            records = {}
+            _APPROVAL_STATE[gate] = records
+        return records
+
+
 class ApprovalGate:
     """Explicit human approval state machine with exact action binding and expiration."""
+
+    __slots__ = ("store", "event_logger", "policy_version_provider", "__weakref__")
 
     SENSITIVE = {"send_message", "publish", "payment", "delete_data", "account_change", "external_irreversible"}
 
@@ -687,10 +847,26 @@ class ApprovalGate:
         self.store = store
         self.event_logger = event_logger
         self.policy_version_provider = policy_version_provider
-        self._requests: dict[str, ApprovalRequest] = {}
+
+    @property
+    def _requests(self) -> MappingProxyType:
+        """Expose only detached read-only views for legacy introspection."""
+        with _APPROVAL_STATE_LOCK:
+            return MappingProxyType(
+                {approval_id: self._public_view(request) for approval_id, request in _approval_records(self).items()}
+            )
+
+    def _publish(self, request: ApprovalRequest) -> None:
+        with _APPROVAL_STATE_LOCK:
+            _approval_records(self)[request.approval_id] = ApprovalRequest(**request.to_dict())
 
     def set_policy_version_provider(self, provider: Callable[[], int]) -> None:
         self.policy_version_provider = provider
+
+    @staticmethod
+    def _public_view(request: ApprovalRequest) -> ApprovalRequest:
+        """Return a detached view so callers cannot mutate the authoritative request."""
+        return ApprovalRequest(**request.to_dict())
 
     def request(self, action: ActionRequest, decision: PolicyDecision, *, ttl_seconds: int) -> ApprovalRequest:
         now = datetime.now(timezone.utc)
@@ -710,10 +886,10 @@ class ApprovalGate:
             actor=action.actor,
             goal=action.goal,
         )
-        self._requests[request.approval_id] = request
         self._persist(request, enforce_lease=True)
-        self._emit("APPROVAL_REQUESTED", request)
-        return request
+        self._publish(request)
+        self._emit("APPROVAL_REQUESTED", self._public_view(request))
+        return self._public_view(request)
 
     def approve(self, approval_id: str, *, actor: str = "human") -> ApprovalRequest:
         request = self._get(approval_id)
@@ -724,8 +900,9 @@ class ApprovalGate:
         request.decided_at = _now()
         request.actor = actor
         self._persist(request)
-        self._emit("APPROVAL_GRANTED", request)
-        return request
+        self._publish(request)
+        self._emit("APPROVAL_GRANTED", self._public_view(request))
+        return self._public_view(request)
 
     def deny(self, approval_id: str, *, actor: str = "human") -> ApprovalRequest:
         request = self._get(approval_id)
@@ -736,8 +913,9 @@ class ApprovalGate:
         request.decided_at = _now()
         request.actor = actor
         self._persist(request)
-        self._emit("APPROVAL_DENIED", request)
-        return request
+        self._publish(request)
+        self._emit("APPROVAL_DENIED", self._public_view(request))
+        return self._public_view(request)
 
     def cancel(self, approval_id: str, *, actor: str = "system") -> ApprovalRequest:
         request = self._get(approval_id)
@@ -748,8 +926,9 @@ class ApprovalGate:
         request.decided_at = _now()
         request.actor = actor
         self._persist(request)
-        self._emit("APPROVAL_CANCELLED", request)
-        return request
+        self._publish(request)
+        self._emit("APPROVAL_CANCELLED", self._public_view(request))
+        return self._public_view(request)
 
     def get(self, approval_id: str) -> ApprovalRequest | None:
         try:
@@ -757,7 +936,9 @@ class ApprovalGate:
         except KeyError:
             return None
         self._expire_if_needed(request)
-        return request
+        # Public callers receive a detached view.  Security internals use
+        # _get() so a caller cannot turn PENDING into APPROVED in place.
+        return self._public_view(request)
 
     def valid_for(
         self,
@@ -779,6 +960,17 @@ class ApprovalGate:
         request = self.get(approval_id)
         if request is None:
             return False
+        return self._bound_request(request, action, policy_version, risk_level)
+
+    def _bound_request(
+        self,
+        request: ApprovalRequest,
+        action: ActionRequest,
+        policy_version: int,
+        risk_level: str | None = None,
+    ) -> bool:
+        """Check a controller-held request without refreshing its identity."""
+        self._expire_if_needed(request)
         if request.legacy or not risk_level:
             return False
         if self.policy_version_provider is None:
@@ -818,9 +1010,9 @@ class ApprovalGate:
             status="PENDING",
             legacy=True,
         )
-        self._requests[request.approval_id] = request
         self._persist(request)
-        return request
+        self._publish(request)
+        return self._public_view(request)
 
     def allow(
         self,
@@ -831,28 +1023,44 @@ class ApprovalGate:
         risk_level: str | None = None,
     ) -> bool:
         """Legacy helper; fail closed unless exact binding and current version are supplied."""
-        self._expire_if_needed(request)
-        if request.status != "APPROVED" or action is None or policy_version is None or not risk_level:
+        if action is None or policy_version is None or not risk_level:
+            return False
+        try:
+            current = self._get(request.approval_id)
+        except KeyError:
+            return False
+        self._expire_if_needed(current)
+        if current.status != "APPROVED":
             return False
         return self.bound_for(request.approval_id, action, policy_version, risk_level)
 
     def _get(self, approval_id: str) -> ApprovalRequest:
-        if approval_id in self._requests:
-            return self._requests[approval_id]
         if self.store is not None and hasattr(self.store, "get_approval_request"):
             payload = self.store.get_approval_request(approval_id)
-            if payload:
-                required_binding_fields = {
-                    "approval_id", "task_id", "action_id", "tool_or_skill",
-                    "requested_capabilities", "risk_level", "input_fingerprint",
-                    "policy_version", "requested_at", "expires_at", "goal",
-                }
-                if not required_binding_fields.issubset(payload):
-                    raise KeyError(f"incomplete_approval_binding:{approval_id}")
-                request = ApprovalRequest(**payload)
-                self._requests[approval_id] = request
-                return request
+            if not payload:
+                raise KeyError(f"approval_not_found:{approval_id}")
+            required_binding_fields = {
+                "approval_id", "task_id", "action_id", "tool_or_skill",
+                "requested_capabilities", "risk_level", "input_fingerprint",
+                "policy_version", "requested_at", "expires_at", "goal",
+            }
+            if not required_binding_fields.issubset(payload):
+                raise KeyError(f"incomplete_approval_binding:{approval_id}")
+            request = ApprovalRequest(**payload)
+            self._publish(request)
+            return self._public_view(request)
+        with _APPROVAL_STATE_LOCK:
+            request = _approval_records(self).get(approval_id)
+            if request is not None:
+                return self._public_view(request)
         raise KeyError(f"approval_not_found:{approval_id}")
+
+    def _is_current(self, request: ApprovalRequest) -> bool:
+        try:
+            current = self._get(request.approval_id)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return current.to_dict() == request.to_dict()
 
     def _expire_if_needed(self, request: ApprovalRequest) -> None:
         if request.status not in {"PENDING", "APPROVED"}:
@@ -867,10 +1075,24 @@ class ApprovalGate:
             request.status = "EXPIRED"
             request.decided_at = _now()
             self._persist(request)
-            self._emit("APPROVAL_EXPIRED", request)
+            self._publish(request)
+            self._emit("APPROVAL_EXPIRED", self._public_view(request))
 
     def _persist(self, request: ApprovalRequest, *, enforce_lease: bool = False) -> None:
         if self.store is not None and hasattr(self.store, "save_approval_request"):
+            try:
+                from private_agent.storage import Store
+
+                if isinstance(self.store, Store):
+                    if request.status == "PENDING":
+                        self.store.save_approval_request(request.to_dict(), enforce_lease=enforce_lease)
+                    else:
+                        self.store._save_approval_transition(
+                            request.to_dict(), gate=self, enforce_lease=enforce_lease
+                        )
+                    return
+            except (ImportError, TypeError):
+                pass
             self.store.save_approval_request(request.to_dict(), enforce_lease=enforce_lease)
 
     def _emit(self, event_type: str, request: ApprovalRequest) -> None:
@@ -1145,7 +1367,7 @@ class AuditTrail:
             elif event_type == "ACTION_BLOCKED" and owner._is_observed_block_provenance(provenance):
                 if metadata is None or metadata.get("provenance_kind") not in {None, "observed_only", "trusted_authorization"}:
                     raise ValueError("observed_block_provenance_mismatch")
-            elif event_type == "POLICY_CHANGED" and isinstance(provenance, SecurityPolicy):
+            elif event_type == "POLICY_CHANGED" and isinstance(provenance, (SecurityPolicy, _ImmutableSecurityPolicy)):
                 if action.action_type != "policy_update" or provenance.policy_version != policy_version:
                     raise ValueError("policy_change_provenance_mismatch")
             else:
@@ -1266,12 +1488,12 @@ class AuditTrail:
                 raise ValueError("approval_invalidation_status_mismatch")
             return
 
-        if isinstance(provenance, SecurityPolicy):
+        if isinstance(provenance, (SecurityPolicy, _ImmutableSecurityPolicy)):
             if (
                 claim.event_type != "POLICY_CHANGED"
                 or claim.decision != "ALLOW"
                 or claim.action.action_type != "policy_update"
-                or self._security_owner.policy_engine.policy is not provenance
+                or self._security_owner.policy_engine._policy is not provenance
                 or provenance.policy_version != claim.policy_version
             ):
                 raise ValueError("policy_change_provenance_mismatch")
@@ -1479,14 +1701,33 @@ class AuditTrail:
 class SecurityController:
     """Policy and approval control plane used both before planning execution and at the boundary."""
 
+    store = _WriteOnceReference()
+    audit = _WriteOnceReference()
+    policy_engine = _WriteOnceReference()
+    approval_gate = _WriteOnceReference()
+    _operation_binding_token = _WriteOnceReference()
+    _receipt_lookup = _WriteOnceReference()
+    _receipt_factory = _WriteOnceReference()
+    _security_state_sealed = _MonotonicSealFlag()
+
+    __slots__ = (
+        "_authorization_evidence",
+        "_authorization_evidence_lock",
+        "_execution_inflight",
+        "_observed_block_provenance",
+        "_issued_policy_decisions",
+        "__weakref__",
+    )
+
     def __setattr__(self, name: str, value: Any) -> None:
         if getattr(self, "_security_state_sealed", False) and name in {
             "audit",
             "policy_engine",
             "approval_gate",
             "_receipt_lookup",
-            "_new_execution_receipt",
+            "_receipt_factory",
             "_operation_binding_token",
+            "_security_state_sealed",
         }:
             raise AttributeError("security_state_immutable")
         object.__setattr__(self, name, value)
@@ -1534,7 +1775,7 @@ class SecurityController:
             return receipt
 
         self._receipt_lookup = lookup_receipt
-        self._new_execution_receipt = issue_receipt
+        self._receipt_factory = issue_receipt
         if audit_trail is None:
             self.audit = AuditTrail(
                 store=store,
@@ -1562,6 +1803,9 @@ class SecurityController:
         )
         if hasattr(self.approval_gate, "set_policy_version_provider"):
             self.approval_gate.set_policy_version_provider(self.policy_engine._current_policy_version)
+        bind_gate = getattr(store, "_bind_approval_gate", None)
+        if callable(bind_gate):
+            bind_gate(self.approval_gate, owner=self)
         self._security_state_sealed = True
 
     def _accept_audit_provenance(
@@ -1633,8 +1877,7 @@ class SecurityController:
             return same_policy_decision or approved_policy_decision
 
         if isinstance(provenance, ApprovalRequest):
-            current = self.approval_gate._requests.get(provenance.approval_id)
-            if current is not provenance:
+            if not self.approval_gate._is_current(provenance):
                 return False
             if provenance.legacy:
                 return event_type in {
@@ -1646,19 +1889,19 @@ class SecurityController:
                 }
             if event_type == "APPROVAL_INVALIDATED":
                 return provenance.approval_id == approval_id and provenance.policy_version <= policy_version
-            return self.approval_gate.bound_for(
-                provenance.approval_id,
+            return self.approval_gate._bound_request(
+                provenance,
                 action,
                 policy_version,
                 risk_level,
             )
 
-        if isinstance(provenance, SecurityPolicy):
+        if isinstance(provenance, (SecurityPolicy, _ImmutableSecurityPolicy)):
             return (
                 event_type == "POLICY_CHANGED"
                 and action.task_id == "policy"
                 and action.tool_or_skill == "SecurityPolicy"
-                and self.policy_engine.policy is provenance
+                and self.policy_engine._policy is provenance
                 and provenance.policy_version == policy_version
             )
 
@@ -1767,9 +2010,9 @@ class SecurityController:
             return decision
         if decision.decision == "REQUIRE_APPROVAL":
             if approval_id:
-                request = self.approval_gate.get(approval_id)
-                if request and self.approval_gate.bound_for(
-                    approval_id,
+                request = self.approval_gate._get(approval_id)
+                if request and self.approval_gate._bound_request(
+                    request,
                     action,
                     decision.policy_version,
                     decision.risk_level,
@@ -1893,7 +2136,7 @@ class SecurityController:
                     request = self.approval_gate.request(action, decision, ttl_seconds=self.policy_engine.policy.approval_ttl_seconds)
                     decision.approval_id = request.approval_id
                 else:
-                    request = self.approval_gate.get(approval_id)
+                    request = self.approval_gate._get(approval_id)
                     if request is not None:
                         self.audit._write_security_claim(
                             self.audit._issue_security_claim(
@@ -2163,7 +2406,7 @@ class SecurityController:
         try:
             result = operation()
         except Exception as exc:
-            receipt = self._new_execution_receipt(
+            receipt = self._receipt_factory(
                 action,
                 decision,
                 success=False,
@@ -2185,7 +2428,7 @@ class SecurityController:
             except Exception as exc:
                 success = False
                 metadata = {"result_validation_exception": type(exc).__name__}
-        receipt = self._new_execution_receipt(
+        receipt = self._receipt_factory(
             action,
             decision,
             success=success,
@@ -2390,7 +2633,9 @@ class SecurityController:
         goal: str = "",
     ) -> ActionRequest:
         metadata = candidate.metadata if isinstance(getattr(candidate, "metadata", {}), dict) else {}
-        raw = list(metadata.get("required_capabilities", []) or [])
+        raw = list(getattr(candidate, "declared_capabilities", []) or [])
+        if not raw:
+            raw = list(metadata.get("required_capabilities", []) or [])
         mapped = {
             "network": "NETWORK_ACCESS",
             "filesystem": "WRITE_WORKSPACE",
@@ -2459,7 +2704,7 @@ class SecurityController:
                 risk_level="LOW",
                 policy_version=updated.policy_version,
                 actor=actor,
-                provenance=updated,
+                provenance=self.policy_engine._policy,
             )
         )
         return updated

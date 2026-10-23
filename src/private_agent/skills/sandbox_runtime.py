@@ -138,6 +138,8 @@ class SandboxAttestation:
 
 
 _ADAPTER_ATTESTATION = object()
+_RUNTIME_ACTIVATION_TOKEN = object()
+_SCANNER_EXECUTION_BOUNDARY_TOKEN = object()
 
 
 class SandboxRuntimeAdapter(ABC):
@@ -260,6 +262,77 @@ def validate_sandbox_result(
     if result.command_manifest_digest != spec.command_manifest_digest:
         raise SandboxUnavailable("sandbox_result_manifest_mismatch")
     return result
+
+
+class RuntimeActivationProof:
+    """Opaque proof issued only by a built-in, verified execution adapter.
+
+    The public constructor is disabled deliberately.  A boolean, environment
+    variable, runtime name, or self-reported attestation cannot activate a
+    scanner.  The second private token binds activation to a future scanner
+    execution boundary rather than to metadata inspection alone.
+    """
+
+    __slots__ = (
+        "runtime_identity",
+        "image_digest",
+        "command_manifest_digest",
+        "_runtime_token",
+        "_execution_token",
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TypeError("runtime_activation_proof_private")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        del name, value
+        raise AttributeError("runtime_activation_proof_immutable")
+
+    @classmethod
+    def _from_verified_execution(
+        cls,
+        spec: SandboxSpec,
+        report: RuntimeCapabilityReport,
+        attestation: SandboxAttestation,
+        *,
+        runtime_token: object,
+        execution_token: object,
+    ) -> "RuntimeActivationProof":
+        if runtime_token is not _RUNTIME_ACTIVATION_TOKEN or execution_token is not _SCANNER_EXECUTION_BOUNDARY_TOKEN:
+            raise ValueError("runtime_activation_factory_forbidden")
+        validate_attestation(spec, report, attestation)
+        proof = object.__new__(cls)
+        object.__setattr__(proof, "runtime_identity", spec.runtime_identity)
+        object.__setattr__(proof, "image_digest", spec.image_digest)
+        object.__setattr__(proof, "command_manifest_digest", spec.command_manifest_digest)
+        object.__setattr__(proof, "_runtime_token", _RUNTIME_ACTIVATION_TOKEN)
+        object.__setattr__(proof, "_execution_token", _SCANNER_EXECUTION_BOUNDARY_TOKEN)
+        return proof
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self._runtime_token is _RUNTIME_ACTIVATION_TOKEN
+            and self._execution_token is _SCANNER_EXECUTION_BOUNDARY_TOKEN
+        )
+
+    def matches(self, spec: SandboxSpec) -> bool:
+        return (
+            self.ready
+            and type(spec) is SandboxSpec
+            and self.runtime_identity == spec.runtime_identity
+            and self.image_digest == spec.image_digest
+            and self.command_manifest_digest == spec.command_manifest_digest
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runtime_identity": self.runtime_identity,
+            "image_digest": self.image_digest,
+            "command_manifest_digest": self.command_manifest_digest,
+            "ready": self.ready,
+        }
 
 
 class ExternalSandboxRunner:

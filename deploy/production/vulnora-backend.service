@@ -1,0 +1,36 @@
+[Unit]
+Description=Vulnora Agent API and controlled background worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vulnora
+Group=vulnora
+WorkingDirectory=/opt/vulnora/backend
+EnvironmentFile=/etc/vulnora/backend.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/vulnora/backend/.venv/bin/python -m private_agent.cli serve --with-worker --host 127.0.0.1 --port 8123
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/vulnora
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

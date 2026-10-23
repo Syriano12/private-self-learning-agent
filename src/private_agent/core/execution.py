@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any
 
+from private_agent.core.experience import sanitize_value
 from private_agent.core.planner import PlanStep, TaskPlan
 from private_agent.storage import QueueLeaseLost
 from private_agent.tools.contracts import ToolError, ToolResult, contract_errors, validate_schema_value
@@ -81,14 +83,21 @@ class StepResult:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = sanitize_value({
             "step_id": self.step_id,
             "tool_name": self.tool_name,
             "status": self.status,
             "output": self.output,
             "error": self.error.to_dict() if self.error else None,
             "metadata": self.metadata,
-        }
+        })
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("step_result_not_json_safe") from exc
+        if len(encoded.encode("utf-8")) > 128 * 1024:
+            raise ValueError("step_result_too_large")
+        return payload
 
 
 class GenericExecutor:
@@ -111,12 +120,54 @@ class GenericExecutor:
         context: ExecutionContext | None = None,
     ) -> list[StepResult]:
         execution_context = context or ExecutionContext(security_controller=self.security_controller)
+        ordered_steps, dependency_error = self._dependency_order(plan.steps)
+        if dependency_error is not None:
+            return [
+                StepResult.blocked(
+                    step.id,
+                    step.tool,
+                    "invalid_plan_dependencies",
+                    dependency_error,
+                )
+                for step in plan.steps
+            ]
         results: list[StepResult] = []
-        for step in plan.steps:
+        for step in ordered_steps:
             result = self.execute_step(step, execution_context)
             results.append(result)
             execution_context.previous_results[step.id] = result
         return results
+
+    @staticmethod
+    def _dependency_order(steps: list[PlanStep]) -> tuple[list[PlanStep], str | None]:
+        by_id: dict[str, PlanStep] = {}
+        for step in steps:
+            if not isinstance(step.id, str) or not step.id or not isinstance(step.tool, str) or not step.tool:
+                return [], "step_identity_invalid"
+            if not isinstance(step.depends_on, list) or any(not isinstance(item, str) or not item for item in step.depends_on):
+                return [], f"step_dependencies_invalid:{step.id}"
+            if step.id in by_id:
+                return [], f"duplicate_step_id:{step.id}"
+            by_id[step.id] = step
+        for step in steps:
+            for dependency in step.depends_on:
+                if dependency not in by_id:
+                    return [], f"missing_step_dependency:{dependency}"
+
+        remaining = dict(by_id)
+        ordered: list[PlanStep] = []
+        while remaining:
+            ready = [
+                step
+                for step in remaining.values()
+                if all(dependency in {item.id for item in ordered} for dependency in step.depends_on)
+            ]
+            if not ready:
+                return [], "cyclic_step_dependencies"
+            for step in sorted(ready, key=lambda item: steps.index(item)):
+                ordered.append(step)
+                remaining.pop(step.id)
+        return ordered, None
 
     def execute_step(self, step: PlanStep, context: ExecutionContext | None = None) -> StepResult:
         execution_context = context or ExecutionContext(security_controller=self.security_controller)

@@ -28,37 +28,38 @@ class SkillRegistry:
 
     def create(self, name: str, description: str, implementation: str, source_knowledge: list[str] | None = None) -> Skill:
         skill = Skill(name, 1, description, implementation, 0.5, 0.0, False, source_knowledge or [], [])
-        self.store.db.execute(
-            "INSERT OR REPLACE INTO skills VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                skill.name,
-                skill.version,
-                skill.description,
-                skill.implementation,
-                skill.confidence,
-                skill.success_rate,
-                int(skill.enabled),
-                json.dumps(skill.source_knowledge),
-                json.dumps(skill.tests),
-                now(),
-            ),
-        )
-        self.store.db.commit()
+        with self.store._db_lock, self.store.db:
+            self.store.db.execute(
+                "INSERT OR REPLACE INTO skills VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    skill.name,
+                    skill.version,
+                    skill.description,
+                    skill.implementation,
+                    skill.confidence,
+                    skill.success_rate,
+                    int(skill.enabled),
+                    json.dumps(skill.source_knowledge),
+                    json.dumps(skill.tests),
+                    now(),
+                ),
+            )
         return skill
 
     def enable(self, name: str, version: int = 1) -> None:
-        self.store.db.execute("UPDATE skills SET enabled=1 WHERE name=? AND version=?", (name, version))
-        self.store.db.commit()
+        with self.store._db_lock, self.store.db:
+            self.store.db.execute("UPDATE skills SET enabled=1 WHERE name=? AND version=?", (name, version))
 
     def disable(self, name: str, version: int = 1) -> None:
-        self.store.db.execute("UPDATE skills SET enabled=0 WHERE name=? AND version=?", (name, version))
-        self.store.db.commit()
+        with self.store._db_lock, self.store.db:
+            self.store.db.execute("UPDATE skills SET enabled=0 WHERE name=? AND version=?", (name, version))
 
     def list_enabled(self) -> list[dict[str, Any]]:
-        return [
-            dict(row)
-            for row in self.store.db.execute("SELECT * FROM skills WHERE enabled=1 ORDER BY name, version").fetchall()
-        ]
+        with self.store._db_lock:
+            return [
+                dict(row)
+                for row in self.store.db.execute("SELECT * FROM skills WHERE enabled=1 ORDER BY name, version").fetchall()
+            ]
 
     def persist_candidate(
         self,
@@ -136,22 +137,22 @@ class SkillRegistry:
             self.persist_candidate(candidate, approval=approval, status="ACTIVE")
         else:
             self.store.update_skill_status(candidate.skill_id, "ACTIVE")
-        self.store.db.execute(
-            "INSERT OR REPLACE INTO skills VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                candidate.name,
-                int(candidate.version),
-                candidate.description,
-                candidate.entry_point,
-                float(getattr(candidate, "confidence", 1.0)),
-                0.0,
-                1,
-                json.dumps(candidate.provenance, ensure_ascii=False),
-                json.dumps(candidate.tests, ensure_ascii=False),
-                now(),
-            ),
-        )
-        self.store.db.commit()
+        with self.store._db_lock, self.store.db:
+            self.store.db.execute(
+                "INSERT OR REPLACE INTO skills VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    candidate.name,
+                    int(candidate.version),
+                    candidate.description,
+                    candidate.entry_point,
+                    float(getattr(candidate, "confidence", 1.0)),
+                    0.0,
+                    1,
+                    json.dumps(candidate.provenance, ensure_ascii=False),
+                    json.dumps(candidate.tests, ensure_ascii=False),
+                    now(),
+                ),
+            )
         self.store.save_skill_event(
             candidate.skill_id,
             "activated",
@@ -179,9 +180,9 @@ class SkillRegistry:
         previous_row = max(previous, key=lambda row: int(row["version"]))
         self.store.update_skill_status(current["skill_id"], "ROLLED_BACK")
         self.store.update_skill_status(previous_row["skill_id"], "ACTIVE")
-        self.store.db.execute("UPDATE skills SET enabled=0 WHERE name=? AND version=?", (name, int(current["version"])))
-        self.store.db.execute("UPDATE skills SET enabled=1 WHERE name=? AND version=?", (name, int(previous_row["version"])))
-        self.store.db.commit()
+        with self.store._db_lock, self.store.db:
+            self.store.db.execute("UPDATE skills SET enabled=0 WHERE name=? AND version=?", (name, int(current["version"])))
+            self.store.db.execute("UPDATE skills SET enabled=1 WHERE name=? AND version=?", (name, int(previous_row["version"])))
         self.store.save_skill_event(
             current["skill_id"],
             "rollback",
