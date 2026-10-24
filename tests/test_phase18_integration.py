@@ -4,9 +4,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from private_agent.api import AgentAPIService, build_api_service, create_app
+from private_agent.core.knowledge import KnowledgeValidationError
 from private_agent.worker import BackgroundWorker
 from tests.test_phase12_api import API_TOKEN, auth_headers, make_service
 
@@ -72,6 +74,52 @@ def test_bug_bounty_endpoints_reject_generic_task_ids(tmp_path: Path) -> None:
         assert client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=auth_headers()).status_code == 404
         assert client.get(f"/api/v1/bug-bounty/tasks/{task_id}/findings", headers=auth_headers()).status_code == 404
     store.close()
+
+
+def test_queue_worker_accepts_valid_goal_longer_than_knowledge_query_limit(tmp_path: Path) -> None:
+    tool = __import__("tests.test_phase12_api", fromlist=["APITestTool"]).APITestTool("safe")
+    service, store, _ = make_service(tmp_path, tool)
+    worker = BackgroundWorker(
+        service.orchestrator,
+        worker_id="phase18-long-goal",
+        poll_interval_seconds=0.01,
+        idle_poll_interval_seconds=0.01,
+    )
+    application = create_app(service=service, worker=worker)
+    goal = "authorized local assessment " + ("detail " * 180)
+    try:
+        with TestClient(application, raise_server_exceptions=False) as client:
+            created = client.post("/api/v1/tasks", json={"goal": goal}, headers=auth_headers(key="phase18-long-goal"))
+            assert created.status_code == 201, created.text
+            task_id = created.json()["task_id"]
+            assert _wait_for(lambda: store.get_task_state(task_id)["status"] in {"COMPLETED", "FAILED"})
+            state = store.get_task_state(task_id)
+            assert len(goal) > 1024
+            assert state["status"] == "COMPLETED"
+    finally:
+        store.close()
+
+
+def test_task_goal_boundary_rejects_wrong_type_and_oversized_value(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, __import__("tests.test_phase12_api", fromlist=["APITestTool"]).APITestTool("safe"))
+    try:
+        with pytest.raises(ValueError, match="goal_must_be_string"):
+            store.create_queued_task(123)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="goal_too_long"):
+            store.create_queued_task("x" * 4001)
+        assert store.db.execute("SELECT COUNT(*) AS count FROM task_queue").fetchone()["count"] == 0
+    finally:
+        store.close()
+
+
+def test_knowledge_query_keeps_bounded_input_validation(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, __import__("tests.test_phase12_api", fromlist=["APITestTool"]).APITestTool("safe"))
+    try:
+        assert store.search_knowledge("x" * 4000) == []
+        with pytest.raises(KnowledgeValidationError, match="knowledge_query_invalid"):
+            store.search_knowledge("x" * 4001)
+    finally:
+        store.close()
 
 
 def test_required_stopped_worker_rejects_creation_before_lifespan(tmp_path: Path) -> None:

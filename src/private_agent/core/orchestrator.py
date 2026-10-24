@@ -16,6 +16,7 @@ from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
 from private_agent.core.task_state import (
+    MAX_TASK_GOAL_LENGTH,
     StateIntegrityError,
     TaskState,
     TERMINAL_STATUSES,
@@ -115,6 +116,13 @@ class Orchestrator:
             existing_state = self.store.get_task_state(task_id)
             if existing_state is not None and existing_state.get("status") != "QUEUED":
                 return self.resume_task(task_id, approval_ids=approval_ids)
+        if not isinstance(goal, str):
+            raise ValueError("goal_must_be_string")
+        goal = goal.strip()
+        if not goal:
+            raise ValueError("goal_required")
+        if len(goal) > MAX_TASK_GOAL_LENGTH:
+            raise ValueError("goal_too_long")
         task_id = task_id or str(uuid.uuid4())
         approval_ids = approval_ids or {}
         self.recovery.attempts.clear()

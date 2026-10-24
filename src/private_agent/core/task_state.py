@@ -10,6 +10,7 @@ from private_agent.core.experience import sanitize_value
 
 
 STATE_VERSION = 1
+MAX_TASK_GOAL_LENGTH = 4000
 TASK_STATUSES = {
     "CREATED",
     "QUEUED",

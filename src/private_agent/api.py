@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from private_agent.core.llm import build_provider
 from private_agent.core.orchestrator import Orchestrator
-from private_agent.core.task_state import TASK_STATUSES, StateIntegrityError, TaskState
+from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH, TASK_STATUSES, StateIntegrityError, TaskState
 from private_agent.auth import (
     ACTIVE,
     CSRF_COOKIE_NAME,
@@ -94,7 +94,7 @@ class APIModel(BaseModel):
 
 
 class TaskCreateRequest(APIModel):
-    goal: str = Field(min_length=1, max_length=4000)
+    goal: str = Field(min_length=1, max_length=MAX_TASK_GOAL_LENGTH)
 
     @field_validator("goal")
     @classmethod

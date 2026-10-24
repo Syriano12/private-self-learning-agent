@@ -21,6 +21,7 @@ from private_agent.core.knowledge import (
 )
 from private_agent.bugbounty.models import safe_json
 from private_agent.core.experience import sanitize_value
+from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH
 
 
 _DATABASE_LOCKS_GUARD = threading.Lock()
@@ -1076,8 +1077,13 @@ class Store:
         """Atomically create a QUEUED state, checkpoint, queue row, and idempotency record."""
         from private_agent.core.task_state import TaskState
 
-        if not goal or not goal.strip():
+        if not isinstance(goal, str):
+            raise ValueError("goal_must_be_string")
+        goal = goal.strip()
+        if not goal:
             raise ValueError("goal_required")
+        if len(goal) > MAX_TASK_GOAL_LENGTH:
+            raise ValueError("goal_too_long")
         if max_attempts < 1:
             raise ValueError("max_attempts_invalid")
         if idempotency_key is not None and not request_fingerprint:
@@ -1125,7 +1131,7 @@ class Store:
                     self.db.commit()
                     return {"task_id": str(existing["task_id"]), "replayed": True}
 
-            state = TaskState.create_queued(task_id or str(uuid.uuid4()), goal.strip(), context=context_payload)
+            state = TaskState.create_queued(task_id or str(uuid.uuid4()), goal, context=context_payload)
             payload = state.to_dict()
             stamp = now()
             self._persist_task_state_in_transaction(payload, "TASK_QUEUED")
@@ -2373,7 +2379,7 @@ class Store:
         return results[:limit]
 
     def search_knowledge(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        if not isinstance(query, str) or not query.strip() or len(query) > 1024:
+        if not isinstance(query, str) or not query.strip() or len(query) > MAX_TASK_GOAL_LENGTH:
             raise KnowledgeValidationError("knowledge_query_invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
             raise KnowledgeValidationError("knowledge_query_limit_invalid")
