@@ -72,7 +72,8 @@ def test_gemini_provider_returns_structured_json_and_sends_prompt_and_schema() -
         assert body["systemInstruction"]["parts"][0]["text"] == "system"
         assert body["contents"][0]["parts"][0]["text"] == "user"
         assert body["generationConfig"]["responseMimeType"] == "application/json"
-        assert body["generationConfig"]["responseSchema"] == {"type": "object"}
+        assert body["generationConfig"]["responseJsonSchema"] == {"type": "object"}
+        assert "responseSchema" not in body["generationConfig"]
         return httpx.Response(
             200,
             json={
@@ -86,7 +87,7 @@ def test_gemini_provider_returns_structured_json_and_sends_prompt_and_schema() -
         system_prompt="system", user_prompt="user", response_schema={"type": "object"}
     )
     assert response.data == {"ok": True}
-    assert response.model == "gemini-2.0-flash"
+    assert response.model == "gemini-2.5-flash"
     assert response.usage["totalTokenCount"] == 12
 
 
@@ -100,6 +101,51 @@ def test_gemini_provider_rejects_malformed_structured_json() -> None:
 
     with pytest.raises(LLMStructuredOutputError, match="malformed JSON"):
         provider_with_handler(handler).generate_json(system_prompt="s", user_prompt="u", response_schema={})
+
+
+def test_gemini_provider_sends_json_schema_without_unsupported_response_schema_wrapper() -> None:
+    observed: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.update(json.loads(request.content)["generationConfig"])
+        return httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]}}]},
+            request=request,
+        )
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "steps": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": False},
+            }
+        },
+        "required": ["steps"],
+        "additionalProperties": False,
+    }
+    response = provider_with_handler(handler).generate_json(system_prompt="s", user_prompt="u", response_schema=schema)
+
+    assert response.data == {"ok": True}
+    assert observed["responseMimeType"] == "application/json"
+    assert observed["responseJsonSchema"] == schema
+    assert "responseSchema" not in observed
+
+
+def test_gemini_schema_rejection_is_not_converted_to_a_fake_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"status": "INVALID_ARGUMENT", "message": "Unknown name additionalProperties"}},
+            request=request,
+        )
+
+    with pytest.raises(LLMHTTPError, match="Gemini request rejected") as caught:
+        provider_with_handler(handler, max_retries=0).generate_json(
+            system_prompt="s", user_prompt="u", response_schema={"type": "object"}
+        )
+    assert caught.value.status_code == 400
 
 
 def test_gemini_provider_retries_429_and_honors_retry_after() -> None:

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
 
+from private_agent.core.llm import GeminiProvider, LLMConfig
+from private_agent.core.planner import Planner
 from private_agent.storage import KnowledgeItem, QueueLeaseLost, Store
 from private_agent.worker import BackgroundWorker
 from tests.test_phase12_api import APITestTool, make_service
@@ -201,6 +205,39 @@ def test_failure_before_execution_is_failed_without_tool_side_effect(tmp_path: P
     assert result["error_code"] == "worker_failed"
     assert service.orchestrator.tools._tools["safe"].calls == 0
     assert store.get_task_state(created["task_id"])["status"] == "FAILED"
+    assert store.task_queue_record(created["task_id"])["queue_status"] == "FAILED"
+    store.close()
+
+
+def test_gemini_planner_failure_is_failed_without_fake_plan_or_tool_side_effect(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert "responseJsonSchema" in body["generationConfig"]
+        assert "responseSchema" not in body["generationConfig"]
+        return httpx.Response(
+            400,
+            json={"error": {"status": "INVALID_ARGUMENT", "message": "schema rejected"}},
+            request=request,
+        )
+
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    service.orchestrator.planner = Planner(
+        GeminiProvider(
+            LLMConfig(api_key="test-key", max_retries=0),
+            transport=httpx.MockTransport(handler),
+            sleep_fn=lambda _: None,
+        )
+    )
+    created = store.create_queued_task("provider failure must not fabricate a plan")
+
+    result = BackgroundWorker(service.orchestrator, worker_id="worker-gemini-failure").run_once()
+
+    assert result["status"] == "FAILED"
+    assert result["error_code"] == "worker_failed"
+    state = store.get_task_state(created["task_id"])
+    assert state["status"] == "FAILED"
+    assert state["plan"] == {}
+    assert service.orchestrator.tools._tools["safe"].calls == 0
     assert store.task_queue_record(created["task_id"])["queue_status"] == "FAILED"
     store.close()
 

@@ -47,7 +47,7 @@ class LLMStructuredOutputError(LLMResponseError):
 @dataclass(frozen=True)
 class LLMConfig:
     provider: str = "gemini"
-    model: str = "gemini-2.0-flash"
+    model: str = "gemini-2.5-flash"
     api_key: str = ""
     timeout: float = 30.0
     max_retries: int = 2
@@ -145,7 +145,11 @@ class GeminiProvider(LLMProvider):
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseSchema": response_schema,
+                # responseSchema is the OpenAPI Schema field and rejects
+                # JSON-Schema keywords such as additionalProperties. The
+                # REST API's responseJsonSchema field accepts this schema;
+                # Planner.validate remains the authoritative strict validator.
+                "responseJsonSchema": response_schema,
             },
         }
         url = self.endpoint.format(model=self.config.model)
@@ -234,7 +238,7 @@ def build_provider(environ: Mapping[str, str] | None = None) -> LLMProvider:
 
     config = LLMConfig(
         provider=provider_name,
-        model=values.get("GEMINI_MODEL", "gemini-2.0-flash"),
+        model=values.get("GEMINI_MODEL", "gemini-2.5-flash"),
         api_key=values.get("GEMINI_API_KEY", ""),
         timeout=as_float("AGENT_LLM_TIMEOUT", "30"),
         max_retries=as_int("AGENT_LLM_MAX_RETRIES", "2"),
