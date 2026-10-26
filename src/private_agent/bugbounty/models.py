@@ -114,6 +114,15 @@ def _publicize_references(value: Any, *, key: str = "") -> Any:
     return value
 
 
+def _host_pattern_matches(pattern: str, host: str) -> bool:
+    if pattern == host:
+        return True
+    if not pattern.startswith("*."):
+        return False
+    suffix = pattern[1:]
+    return host.endswith(suffix) and host != pattern[2:] and host.count(".") >= pattern.count(".")
+
+
 def semantic_normalize(value: Any, *, key: str = "") -> Any:
     """Normalize responses while ignoring documented dynamic fields only."""
     if isinstance(value, Mapping):
@@ -169,6 +178,8 @@ class ScopeAsset:
         host = _bounded_text(self.host.lower(), field_name="host")
         if "://" in host or "/" in host or " " in host:
             raise ValueError("host_must_be_hostname")
+        if "*" in host and (not host.startswith("*.") or host.count("*") != 1 or len(host) <= 2):
+            raise ValueError("host_wildcard_invalid")
         object.__setattr__(self, "host", host)
         path = self.path_prefix or "/"
         if not path.startswith("/") or len(path) > 512:
@@ -292,7 +303,7 @@ class ScopeDefinition:
         twice_decoded_path = unquote(path)
         if "\\" in path or any(segment in {".", ".."} for segment in path.split("/")) or "\\" in twice_decoded_path or any(segment in {".", ".."} for segment in twice_decoded_path.split("/")):
             return ScopeDecision.DENIED, "path_traversal_not_permitted"
-        if host in set(self.excluded_hosts):
+        if any(_host_pattern_matches(pattern, host) for pattern in self.excluded_hosts):
             return ScopeDecision.DENIED, "host_excluded"
         method = method.upper()
         if method in self.prohibited_methods or method not in self.permitted_methods:
@@ -315,7 +326,7 @@ class ScopeDefinition:
             return ScopeDecision.DENIED, "resource_not_authorized"
         for asset in self.assets:
             prefix_matches = asset.path_prefix == "/" or path == asset.path_prefix or path.startswith(asset.path_prefix + "/")
-            if asset.host == host and prefix_matches and method in asset.methods:
+            if _host_pattern_matches(asset.host, host) and prefix_matches and method in asset.methods:
                 if asset.ports and effective_port not in asset.ports:
                     continue
                 if not asset.ports and effective_port not in {80, 443}:

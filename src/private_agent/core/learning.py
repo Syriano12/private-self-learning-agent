@@ -186,6 +186,7 @@ class LearningEngine:
             "failure_types": sorted(set(insight.failure_types or [])),
         }
         pattern = insight.pattern
+        extra_metadata: dict[str, Any] = {}
         if pattern == "successful_recovery_alternative":
             failed_tool = str(insight.condition.get("failed_tool", ""))
             alternative_tool = str(insight.condition.get("alternative_tool", ""))
@@ -212,6 +213,27 @@ class LearningEngine:
             preferred_action = {"type": "require_alternative_or_verification"}
             avoided_action = {"type": "avoid_unverified_retry", "tool": failed_tool}
             positive = False
+        elif pattern == "bugbounty_review_feedback":
+            vulnerability_class = str(insight.condition.get("vulnerability_class", "")).strip()
+            decision = str(insight.condition.get("review_decision", "")).strip()
+            if not vulnerability_class or decision not in {"CONFIRM", "REFUTE", "INCONCLUSIVE", "DUPLICATE"}:
+                return None
+            condition = {
+                **condition_base,
+                "vulnerability_class": vulnerability_class,
+                "review_decision": decision,
+                "tools": ["bugbounty_analysis"],
+            }
+            preferred_action = {"type": "require_evidence_review", "vulnerability_class": vulnerability_class}
+            avoided_action = {"type": "auto_confirm_finding"}
+            positive = decision == "CONFIRM"
+            extra_metadata = {
+                "review_id": str(insight.metadata.get("review_id", ""))[:128],
+                "finding_id": str(insight.metadata.get("finding_id", ""))[:128],
+                "evidence_sha256": str(insight.metadata.get("evidence_sha256", ""))[:128],
+                "verified_outcome": bool(insight.metadata.get("verified_outcome", False)),
+                "non_authoritative": True,
+            }
         else:
             return None
 
@@ -247,6 +269,7 @@ class LearningEngine:
                 "conflicting_experience_ids": conflict_ids,
                 "evidence_count": len(support_ids),
                 "positive_guidance": positive,
+                **extra_metadata,
             },
         )
 

@@ -274,6 +274,7 @@ class WebResearchTool:
         max_redirects: int = MAX_REDIRECTS,
         transport: httpx.BaseTransport | None = None,
         resolver: Callable[[str], tuple[str, ...]] | None = None,
+        url_validator: Callable[[str], str] | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("research_timeout_invalid")
@@ -286,6 +287,7 @@ class WebResearchTool:
         self.max_redirects = int(max_redirects)
         self._transport = transport
         self._resolver = resolver or _default_resolver
+        self._url_validator = url_validator
 
     def _request_bounded(self, url: str) -> _BoundedResponse:
         current = url
@@ -299,6 +301,8 @@ class WebResearchTool:
         ) as client:
             for redirect_count in range(self.max_redirects + 1):
                 _validate_public_url(current, self._resolver)
+                if self._url_validator is not None:
+                    self._url_validator(current)
                 with client.stream("GET", current) as response:
                     if response.status_code in _REDIRECT_STATUSES:
                         location = response.headers.get("location")

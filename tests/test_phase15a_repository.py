@@ -224,6 +224,17 @@ def test_default_application_registers_repository_tools_without_elevating_networ
     agent.store.close()
 
 
+def test_default_application_profile_does_not_register_external_web_research(tmp_path, monkeypatch):
+    from private_agent.api import build_orchestrator
+
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "local-only.sqlite3"))
+    monkeypatch.setenv("AGENT_ENABLE_EXTERNAL_RESEARCH", "1")
+    agent = build_orchestrator()
+    with pytest.raises(KeyError):
+        agent.tools.get("web_research")
+    agent.store.close()
+
+
 @pytest.mark.parametrize("filename", [".netrc", ".npmrc", ".pypirc", ".git-credentials"])
 def test_committed_credential_files_are_never_surfaced(repository, filename):
     (repository / filename).write_text("machine host login user password opaque-committed-value", encoding="utf-8")

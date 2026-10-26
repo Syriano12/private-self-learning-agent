@@ -10,6 +10,9 @@ from typing import Any, Callable
 
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.task_state import TaskState
+from private_agent.bugbounty.programs import ProgramAnalysisRepository
+from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus
+from private_agent.bugbounty.stage_execution import ResearchStageExecutor, StageExecutionOutcome
 from private_agent.storage import QueueLeaseLost, Store
 
 
@@ -148,9 +151,13 @@ class BackgroundWorker:
         idle_poll_interval_seconds: float = 1.0,
         error_backoff_seconds: float = 1.0,
         event_logger: WorkerEventLogger | None = None,
+        stage_executor: ResearchStageExecutor | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.store: Store = orchestrator.store
+        self.research_stages = ResearchStageRepository(self.store)
+        self.program_analyses = ProgramAnalysisRepository(self.store)
+        self.stage_executor = stage_executor or ResearchStageExecutor()
         self.worker_id = str(worker_id or f"worker-{uuid.uuid4()}")
         self.lease_ttl_seconds = int(lease_ttl_seconds)
         if self.lease_ttl_seconds < 1:
@@ -318,6 +325,7 @@ class BackgroundWorker:
                     self._emit_event(
                         "worker_result",
                         task_id=task_id,
+                        stage_id=str(result.get("stage_id", "")),
                         status=status,
                         processed=bool(result.get("processed")),
                         error_code=str(result.get("error_code", "")),
@@ -381,6 +389,9 @@ class BackgroundWorker:
             lease_ttl_seconds=self.lease_ttl_seconds,
         )
         if claim is None:
+            stage_result = self._run_one_research_stage()
+            if stage_result is not None:
+                return stage_result
             return {"status": "NO_TASK", "processed": False, "task_id": ""}
         if claim.get("kind") == "EXECUTION_UNKNOWN":
             task_id = str(claim["task_id"])
@@ -435,6 +446,97 @@ class BackgroundWorker:
         if result is None:
             raise RuntimeError("worker_result_missing")
         return result
+
+    def _run_one_research_stage(self) -> dict[str, Any] | None:
+        claim = self.research_stages.claim_next(self.worker_id, lease_ttl_seconds=self.lease_ttl_seconds)
+        if claim is None:
+            return None
+        stage_id = str(claim["stage_id"])
+        owner_user_id = str(claim["owner_user_id"])
+        stage = self.research_stages.get(stage_id, owner_user_id=owner_user_id)
+        if stage is None:
+            self.research_stages.mark_unknown_if_owned(claim, reason="stage_record_missing")
+            return {
+                "status": "STAGE_UNKNOWN",
+                "processed": False,
+                "task_id": "",
+                "stage_id": stage_id,
+                "error_code": "stage_record_missing",
+            }
+        self._emit_event(
+            "worker_stage_claimed",
+            stage_id=stage_id,
+            stage_type=stage.stage_type,
+            attempt_count=int(claim.get("attempt_count", 1)),
+        )
+        analysis = self.program_analyses.get(
+            str(claim["analysis_id"]),
+            owner_user_id=owner_user_id,
+            is_owner=True,
+        )
+        started = time.monotonic()
+        try:
+            outcome = self.stage_executor.execute(stage, analysis)
+            if time.monotonic() - started > stage.budget.timeout_seconds:
+                outcome = StageExecutionOutcome(
+                    ResearchStageStatus.UNKNOWN.value,
+                    {},
+                    {},
+                    "stage_timeout",
+                    "Stage exceeded its bounded execution time",
+                )
+            finished = self.research_stages.finish_claim(
+                claim,
+                outcome.status,
+                result=outcome.result,
+                partial_result=outcome.partial_result,
+                error_code=outcome.error_code,
+                error_message=outcome.error_message,
+            )
+        except ValueError as exc:
+            if str(exc) == "stage_lease_lost":
+                self.research_stages.mark_unknown_if_owned(claim, reason="stage_lease_lost")
+                return {
+                    "status": "STAGE_LEASE_LOST",
+                    "processed": False,
+                    "task_id": "",
+                    "stage_id": stage_id,
+                    "error_code": "stage_lease_lost",
+                }
+            self.research_stages.mark_unknown_if_owned(claim, reason="stage_worker_failed")
+            return {
+                "status": "STAGE_FAILED",
+                "processed": True,
+                "task_id": "",
+                "stage_id": stage_id,
+                "error_code": "stage_worker_failed",
+                "error": str(exc),
+            }
+        except Exception as exc:
+            self.research_stages.mark_unknown_if_owned(claim, reason="stage_worker_failed")
+            return {
+                "status": "STAGE_UNKNOWN",
+                "processed": False,
+                "task_id": "",
+                "stage_id": stage_id,
+                "error_code": "stage_worker_failed",
+                "error": str(exc),
+            }
+        status = "STAGE_" + finished.stage_status
+        self._emit_event(
+            "worker_stage_result",
+            stage_id=stage_id,
+            stage_type=finished.stage_type,
+            status=status,
+            error_code=finished.error_code,
+        )
+        return {
+            "status": status,
+            "processed": True,
+            "task_id": "",
+            "stage_id": stage_id,
+            "error_code": finished.error_code,
+        }
 
     def _reconcile_approved_waiting_tasks(self) -> None:
         """Recover approval transitions persisted just before a process stop.

@@ -126,7 +126,7 @@ def test_schema_v3_marker_gap_is_repaired_without_inconsistent_objects(tmp_path:
 
     reopened = Store(path)
     versions = [row["schema_version"] for row in reopened.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     for object_type, name in (
         ("table", "owner_permission_rules"),
         ("table", "owner_policy_audit"),
@@ -185,7 +185,7 @@ def test_migration_failure_rolls_back_all_new_schema_steps(tmp_path: Path, monke
 
     monkeypatch.undo()
     reopened = Store(path)
-    assert [row["schema_version"] for row in reopened.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")] == [1, 2, 3, 4, 5, 6, 7]
+    assert [row["schema_version"] for row in reopened.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     reopened.close()
 
 

@@ -8,6 +8,10 @@ from .validation import build_independent_corpus, evaluate_independent_corpus, v
 from .cross_application import build_cross_application_corpus, evaluate_cross_application_corpus
 from .scanners import ActiveScanResult, HttpxAdapter, NucleiAdapter, ScanStatus, ScannerLimits, TrustedTemplateSet
 from .trusted_tools import ToolVerificationResult, ToolVerificationStatus, TrustedToolInstallSpec, load_tool_spec_from_environment, verify_tool_installation
+from .programs import ProgramAnalysis, ProgramAnalysisRepository, ProgramAnalysisStatus, ProgramSource, analyze_program, canonical_program_url
+from .research import ResearchStage, ResearchStageRepository, ResearchStageStatus, ResearchStageType, StageBudget
+from .reviews import FindingReview, FindingReviewDecision, FindingReviewRepository
+from .stage_execution import ResearchStageExecutor, StageExecutionOutcome
 
 __all__ = [
     "BugBountyAgent",
@@ -47,4 +51,20 @@ __all__ = [
     "validate_confirmed_evidence",
     "load_tool_spec_from_environment",
     "verify_tool_installation",
+    "ProgramAnalysis",
+    "ProgramAnalysisRepository",
+    "ProgramAnalysisStatus",
+    "ProgramSource",
+    "analyze_program",
+    "canonical_program_url",
+    "ResearchStage",
+    "ResearchStageRepository",
+    "ResearchStageStatus",
+    "ResearchStageType",
+    "StageBudget",
+    "FindingReview",
+    "FindingReviewDecision",
+    "FindingReviewRepository",
+    "ResearchStageExecutor",
+    "StageExecutionOutcome",
 ]

@@ -38,12 +38,17 @@ from private_agent.auth import (
     ROLE_VIEWER,
     SESSION_COOKIE_NAME,
 )
-from private_agent.bugbounty.models import Finding, FindingState, ScopeDefinition, public_reference, reconcile_bug_bounty_metrics, safe_json
+from private_agent.bugbounty.models import Finding, FindingState, ScopeDefinition, public_reference, reconcile_bug_bounty_metrics, safe_json, validate_confirmed_evidence
+from private_agent.bugbounty.learning import BugBountyLearningService
+from private_agent.bugbounty.local_evidence import normalize_research_input
+from private_agent.bugbounty.programs import ProgramAnalysisRepository, analyze_program
+from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType, StageBudget
+from private_agent.bugbounty.reviews import FindingReview, FindingReviewDecision, FindingReviewRepository
 from private_agent.observability import ObservabilityMonitor, safe_metadata
 from private_agent.security import ApprovalRequest, SecurityController
 from private_agent.storage import QueueLeaseLost, Store
 from private_agent.bugbounty.trusted_tools import load_tool_spec_from_environment
-from private_agent.tools.research import ToolRegistry, WebResearchTool
+from private_agent.tools.research import ToolRegistry
 from private_agent.tools.scanners import HttpxReconTool, NucleiScanTool, build_scanner_limits
 from private_agent.worker import BackgroundWorker
 
@@ -177,6 +182,107 @@ class ResumeRequest(APIModel):
             if not key or not approval_id or len(key) > 256 or len(approval_id) > 256:
                 raise ValueError("approval_ids_invalid")
         return value
+
+
+class ProgramAnalysisRequest(APIModel):
+    program_url: str = Field(min_length=8, max_length=2048)
+    policy_text: str = Field(default="", max_length=128_000)
+    source_type: str = Field(default="user_provided_policy", min_length=1, max_length=64)
+
+
+class ProgramAnalysisResponse(APIModel):
+    analysis_id: str
+    program_url: str
+    source: dict[str, Any]
+    status: str
+    scope_proposal: dict[str, Any] | None = None
+    exclusions: list[str] = Field(default_factory=list)
+    ambiguities: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    created_at: str
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
+
+
+class ResearchStageRequest(APIModel):
+    stage_type: str
+    budget: dict[str, Any] = Field(default_factory=dict)
+    input_payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("stage_type")
+    @classmethod
+    def valid_stage_type(cls, value: str) -> str:
+        try:
+            return ResearchStageType(value).value
+        except ValueError as exc:
+            raise ValueError("stage_type_invalid") from exc
+
+    @field_validator("budget")
+    @classmethod
+    def valid_budget(cls, value: dict[str, Any]) -> dict[str, Any]:
+        StageBudget.from_value(value)
+        return safe_json(value)
+
+    @field_validator("input_payload")
+    @classmethod
+    def valid_input_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("stage_input_payload_object_required")
+        return value
+
+    @model_validator(mode="after")
+    def validate_stage_input(self) -> "ResearchStageRequest":
+        self.input_payload = normalize_research_input(self.stage_type, self.input_payload)
+        return self
+
+
+class ResearchStageResponse(APIModel):
+    stage_id: str
+    analysis_id: str
+    stage_type: str
+    stage_status: str
+    budget: dict[str, int]
+    partial_result: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+    error_code: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    created_at: str
+    updated_at: str
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
+
+
+class FindingReviewRequest(APIModel):
+    decision: str
+    duplicate_of: str = Field(default="", max_length=128)
+    note: str = Field(default="", max_length=2000)
+
+    @field_validator("decision")
+    @classmethod
+    def valid_decision(cls, value: str) -> str:
+        try:
+            return FindingReviewDecision(value).value
+        except ValueError as exc:
+            raise ValueError("finding_review_decision_invalid") from exc
+
+
+class FindingReviewResponse(APIModel):
+    review_id: str
+    task_id: str
+    finding_id: str
+    decision: str
+    duplicate_of: str = ""
+    note: str = ""
+    evidence_sha256: str = ""
+    evidence_validated: bool = False
+    actor_user_id: str = ""
+    created_at: str
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
 
 
 class ApprovalActionRequest(APIModel):
@@ -695,6 +801,227 @@ class AgentAPIService:
             raise APIError(401, "unauthenticated", "Authentication is required")
         return LoginResponse(user=self.auth_user_response(user), expires_at=self.auth_manager.session_expiry(principal))
 
+    def analyze_program(
+        self,
+        payload: ProgramAnalysisRequest,
+        *,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> ProgramAnalysisResponse:
+        try:
+            analysis = analyze_program(payload.program_url, payload.policy_text, source_type=payload.source_type)
+            stored = ProgramAnalysisRepository(self.store).save(
+                analysis,
+                owner_user_id=self._owner_user_id(principal),
+            )
+        except (TypeError, ValueError) as exc:
+            raise APIError(422, str(exc), "Program policy could not be analyzed") from exc
+        self.observability.emit(
+            "OBSERVATION_COMPLETED",
+            correlation_id=request_id,
+            component="bugbounty",
+            metadata={"analysis_id": stored.analysis_id, "status": stored.status},
+        )
+        return ProgramAnalysisResponse(**stored.to_dict(), request_id=request_id)
+
+    def get_program_analysis(
+        self,
+        analysis_id: str,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str = "",
+    ) -> ProgramAnalysisResponse:
+        analysis_id = _safe_id(analysis_id, "analysis_id")
+        payload = ProgramAnalysisRepository(self.store).get(
+            analysis_id,
+            owner_user_id=self._owner_user_id(principal),
+            is_owner=principal is not None and principal.role == ROLE_OWNER,
+        )
+        if payload is None:
+            raise APIError(404, "program_analysis_not_found", "Program analysis was not found")
+        return ProgramAnalysisResponse(**payload, request_id=request_id)
+
+    def list_program_analyses(
+        self,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        limit: int = 50,
+    ) -> list[ProgramAnalysisResponse]:
+        try:
+            payloads = ProgramAnalysisRepository(self.store).list(
+                owner_user_id=self._owner_user_id(principal),
+                is_owner=principal is not None and principal.role == ROLE_OWNER,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise APIError(422, str(exc), "Program analysis limit is invalid") from exc
+        return [ProgramAnalysisResponse(**payload) for payload in payloads]
+
+    def create_research_stage(
+        self,
+        analysis_id: str,
+        payload: ResearchStageRequest,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str = "",
+    ) -> ResearchStageResponse:
+        analysis_id = _safe_id(analysis_id, "analysis_id")
+        owner = principal is not None and principal.role == ROLE_OWNER
+        analysis = ProgramAnalysisRepository(self.store).get(analysis_id, owner_user_id=self._owner_user_id(principal), is_owner=owner)
+        if analysis is None:
+            raise APIError(404, "program_analysis_not_found", "Program analysis was not found")
+        try:
+            stage = ResearchStageRepository(self.store).create(
+                analysis_id,
+                payload.stage_type,
+                owner_user_id=self._owner_user_id(principal),
+                budget=StageBudget.from_value(payload.budget),
+                input_payload=payload.input_payload,
+            )
+        except (TypeError, ValueError) as exc:
+            raise APIError(422, str(exc), "Research stage could not be created") from exc
+        return ResearchStageResponse(**stage.to_dict(), request_id=request_id)
+
+    def list_research_stages(
+        self,
+        analysis_id: str,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str = "",
+    ) -> list[ResearchStageResponse]:
+        analysis_id = _safe_id(analysis_id, "analysis_id")
+        owner = principal is not None and principal.role == ROLE_OWNER
+        analysis = ProgramAnalysisRepository(self.store).get(analysis_id, owner_user_id=self._owner_user_id(principal), is_owner=owner)
+        if analysis is None:
+            raise APIError(404, "program_analysis_not_found", "Program analysis was not found")
+        stages = ResearchStageRepository(self.store).list(analysis_id, owner_user_id=self._owner_user_id(principal), is_owner=owner)
+        return [ResearchStageResponse(**stage.to_dict(), request_id=request_id) for stage in stages]
+
+    def get_research_stage(
+        self,
+        stage_id: str,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str = "",
+    ) -> ResearchStageResponse:
+        stage_id = _safe_id(stage_id, "stage_id")
+        owner = principal is not None and principal.role == ROLE_OWNER
+        stage = ResearchStageRepository(self.store).get(stage_id, owner_user_id=self._owner_user_id(principal), is_owner=owner)
+        if stage is None:
+            raise APIError(404, "research_stage_not_found", "Research stage was not found")
+        return ResearchStageResponse(**stage.to_dict(), request_id=request_id)
+
+    def cancel_research_stage(
+        self,
+        stage_id: str,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str = "",
+    ) -> ResearchStageResponse:
+        stage_id = _safe_id(stage_id, "stage_id")
+        owner = principal is not None and principal.role == ROLE_OWNER
+        try:
+            stage = ResearchStageRepository(self.store).cancel(stage_id, owner_user_id=self._owner_user_id(principal), is_owner=owner)
+        except KeyError as exc:
+            raise APIError(404, "research_stage_not_found", "Research stage was not found") from exc
+        except ValueError as exc:
+            raise APIError(409, str(exc), "Research stage cannot be cancelled") from exc
+        return ResearchStageResponse(**stage.to_dict(), request_id=request_id)
+
+    def _finding_for_review(self, task_id: str, finding_id: str, principal: AuthenticatedPrincipal | None) -> tuple[TaskState, dict[str, Any], Finding]:
+        self._assert_task_access(task_id, principal)
+        state = self._state(task_id)
+        if state.context.get("task_kind") != "bug_bounty":
+            raise APIError(404, "bug_bounty_task_not_found", "Bug Bounty task not found", task_id=task_id)
+        output = self._bug_bounty_output(state) or {}
+        run = output.get("run") if isinstance(output.get("run"), dict) else {}
+        scan = output.get("scan") if isinstance(output.get("scan"), dict) else {}
+        candidates = run.get("findings", []) if isinstance(run.get("findings", []), list) else scan.get("candidate_findings", [])
+        raw = next((item for item in candidates if isinstance(item, dict) and str(item.get("finding_id", "")) == finding_id), None)
+        if raw is None:
+            raise APIError(404, "finding_not_found", "Finding was not found", task_id=task_id)
+        try:
+            finding = Finding.from_dict(raw)
+        except (TypeError, ValueError) as exc:
+            raise APIError(409, "finding_untrusted", "Finding failed integrity validation", task_id=task_id) from exc
+        return state, raw, finding
+
+    def review_bug_bounty_finding(
+        self, task_id: str, finding_id: str, payload: FindingReviewRequest,
+        *, principal: AuthenticatedPrincipal | None = None, request_id: str = "",
+    ) -> FindingReviewResponse:
+        task_id = _safe_id(task_id, "task_id")
+        finding_id = _safe_id(finding_id, "finding_id")
+        if principal is None or principal.role != ROLE_OWNER:
+            raise APIError(403, "owner_review_required", "Only the owner may review findings", task_id=task_id)
+        _state, raw, finding = self._finding_for_review(task_id, finding_id, principal)
+        actor_user_id = principal.user_id or "legacy-owner"
+        reviews = FindingReviewRepository(self.store).list_for_task(task_id, owner_user_id=principal.user_id, is_owner=True)
+        if payload.decision == FindingReviewDecision.DUPLICATE.value:
+            target = payload.duplicate_of.strip()
+            if not target or target == finding_id:
+                raise APIError(422, "duplicate_target_required", "A different finding is required as the duplicate target", task_id=task_id)
+            candidates = (_state.result or {}).get("step_results", []) if isinstance(_state.result, dict) else []
+            target_exists = any(
+                isinstance(step, dict) and isinstance(step.get("output"), dict)
+                and any(isinstance(item, dict) and str(item.get("finding_id", "")) == target for item in (step["output"].get("run", {}) or {}).get("findings", []) if isinstance((step["output"].get("run", {}) or {}).get("findings", []), list))
+                for step in candidates
+            )
+            if not target_exists:
+                raise APIError(422, "duplicate_target_not_found", "Duplicate target must be another finding in this task", task_id=task_id)
+        evidence_validated = False
+        evidence_digest = ""
+        if payload.decision == FindingReviewDecision.CONFIRM.value:
+            if finding.state not in {FindingState.REPORT_READY, FindingState.HUMAN_REVIEWED}:
+                raise APIError(409, "finding_not_report_ready", "Only an Evidence Gate validated finding may be confirmed", task_id=task_id)
+            errors = validate_confirmed_evidence(finding, target_state=finding.state)
+            evidence_digest = finding.validated_evidence_sha256
+            evidence_validated = not errors and finding.validation_status == "VALIDATED" and evidence_digest == finding._evidence_digest()
+            if not evidence_validated:
+                raise APIError(409, "finding_evidence_not_validated", "Finding evidence has not passed the Evidence Gate", task_id=task_id)
+        try:
+            review = FindingReview.create(
+                task_id, finding_id, actor_user_id, payload.decision,
+                duplicate_of=payload.duplicate_of.strip(), note=payload.note,
+                evidence_sha256=evidence_digest, evidence_validated=evidence_validated,
+                actor_user_id=actor_user_id,
+            )
+            review = FindingReviewRepository(self.store).save(review, is_owner=True)
+        except (TypeError, ValueError) as exc:
+            raise APIError(422, str(exc), "Finding review could not be saved", task_id=task_id) from exc
+        try:
+            learned = BugBountyLearningService(self.store).apply_review(review, finding)
+            self.store.save_audit_event({
+                "event_id": f"LEARNING-{review.review_id}", "timestamp": review.created_at,
+                "event_type": "BUGBOUNTY_LEARNING_UPDATED", "task_id": review.task_id,
+                "action_id": review.finding_id, "actor": review.actor_user_id,
+                "tool_or_skill": "bugbounty.learning", "capabilities": [],
+                "risk_level": "LOW", "policy_version": 0, "approval_id": "",
+                "decision": review.decision, "reason": "owner_review_advisory_learning",
+                "learning": {"strategy_ids": [item.strategy_id for item in learned], "non_authoritative": True},
+            }, requires_lease=False)
+        except (TypeError, ValueError, KeyError):
+            self.store.save_audit_event({
+                "event_id": f"LEARNING-REJECTED-{review.review_id}", "timestamp": review.created_at,
+                "event_type": "BUGBOUNTY_LEARNING_REJECTED", "task_id": review.task_id,
+                "action_id": review.finding_id, "actor": review.actor_user_id,
+                "tool_or_skill": "bugbounty.learning", "capabilities": [],
+                "risk_level": "NOTICE", "policy_version": 0, "approval_id": "",
+                "decision": review.decision, "reason": "learning_contract_rejected",
+                "learning": {"non_authoritative": True},
+            }, requires_lease=False)
+        return FindingReviewResponse(**review.to_dict(), request_id=request_id)
+
+    def list_finding_reviews(
+        self, task_id: str, *, principal: AuthenticatedPrincipal | None = None, request_id: str = "",
+    ) -> list[FindingReviewResponse]:
+        task_id = _safe_id(task_id, "task_id")
+        self._assert_task_access(task_id, principal)
+        reviews = FindingReviewRepository(self.store).list_for_task(
+            task_id, owner_user_id=self._owner_user_id(principal), is_owner=principal is not None and principal.role == ROLE_OWNER,
+        )
+        return [FindingReviewResponse(**review.to_dict(), request_id=request_id) for review in reviews]
+
     def list_users_response(self) -> list[AuthUserResponse]:
         return [self.auth_user_response(user) for user in self.auth_manager.list_users()]
 
@@ -1030,6 +1357,12 @@ class AgentAPIService:
         output = self._bug_bounty_output(state) or {}
         run = output.get("run") if isinstance(output.get("run"), dict) else None
         safe_run, report_suppressed = self._sanitize_bug_bounty_run(run) if run is not None else (None, False)
+        if safe_run is not None:
+            safe_run["finding_reviews"] = [
+                review.to_dict() for review in FindingReviewRepository(self.store).list_for_task(
+                    task_id, owner_user_id=self._owner_user_id(principal), is_owner=principal is not None and principal.role == ROLE_OWNER,
+                )
+            ]
         scan = output.get("scan") if isinstance(output.get("scan"), dict) else None
         safe_scan = self._sanitize_bug_bounty_scan(scan) if scan is not None else None
         limitations = list(safe_run.get("limitations", [])) if safe_run else []
@@ -1265,7 +1598,9 @@ class AgentAPIService:
 def build_orchestrator() -> Orchestrator:
     store = Store(os.getenv("AGENT_DB_PATH", "data/agent.sqlite3"))
     registry = ToolRegistry()
-    registry.register(WebResearchTool(timeout=float(os.getenv("AGENT_HTTP_TIMEOUT", "15"))))
+    # Local/Termux operation is fail-closed: approval or an environment flag
+    # must not enable a network-capable tool. Registration belongs to a future
+    # independently verified runtime boundary, not to this application profile.
     from private_agent.tools.bugbounty import BugBountyAnalysisTool
 
     registry.register(BugBountyAnalysisTool(store))
@@ -1646,6 +1981,82 @@ def create_app(
         return response
 
     @router.post(
+        "/bug-bounty/programs/analyze",
+        response_model=ProgramAnalysisResponse,
+        dependencies=[Depends(_require_roles(ROLE_OWNER, ROLE_OPERATOR)), Depends(_csrf_protect)],
+    )
+    def analyze_bug_bounty_program(
+        request: Request,
+        payload: ProgramAnalysisRequest,
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> ProgramAnalysisResponse:
+        return service.analyze_program(payload, request_id=_request_id(request), principal=principal)
+
+    @router.get("/bug-bounty/programs", response_model=list[ProgramAnalysisResponse])
+    def list_bug_bounty_programs(
+        limit: int = Query(default=50, ge=1, le=100),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> list[ProgramAnalysisResponse]:
+        return service.list_program_analyses(principal=principal, limit=limit)
+
+    @router.get("/bug-bounty/programs/{analysis_id}", response_model=ProgramAnalysisResponse)
+    def get_bug_bounty_program(
+        request: Request,
+        analysis_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> ProgramAnalysisResponse:
+        return service.get_program_analysis(analysis_id, principal=principal, request_id=_request_id(request))
+
+    @router.post(
+        "/bug-bounty/programs/{analysis_id}/stages",
+        response_model=ResearchStageResponse,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(_require_roles(ROLE_OWNER, ROLE_OPERATOR)), Depends(_csrf_protect)],
+    )
+    def create_research_stage(
+        request: Request,
+        payload: ResearchStageRequest,
+        analysis_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> ResearchStageResponse:
+        return service.create_research_stage(analysis_id, payload, principal=principal, request_id=_request_id(request))
+
+    @router.get("/bug-bounty/programs/{analysis_id}/stages", response_model=list[ResearchStageResponse])
+    def list_research_stages(
+        request: Request,
+        analysis_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> list[ResearchStageResponse]:
+        return service.list_research_stages(analysis_id, principal=principal, request_id=_request_id(request))
+
+    @router.get("/bug-bounty/research-stages/{stage_id}", response_model=ResearchStageResponse)
+    def get_research_stage(
+        request: Request,
+        stage_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> ResearchStageResponse:
+        return service.get_research_stage(stage_id, principal=principal, request_id=_request_id(request))
+
+    @router.post(
+        "/bug-bounty/research-stages/{stage_id}/cancel",
+        response_model=ResearchStageResponse,
+        dependencies=[Depends(_require_roles(ROLE_OWNER, ROLE_OPERATOR)), Depends(_csrf_protect)],
+    )
+    def cancel_research_stage(
+        request: Request,
+        stage_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> ResearchStageResponse:
+        return service.cancel_research_stage(stage_id, principal=principal, request_id=_request_id(request))
+
+    @router.post(
         "/bug-bounty/tasks",
         response_model=TaskCreateResponse,
         status_code=status.HTTP_201_CREATED,
@@ -1729,6 +2140,32 @@ def create_app(
     ) -> MetricsResponse:
         request.state.task_id = task_id
         return service.task_metrics(task_id, principal=principal)
+
+    @router.post(
+        "/bug-bounty/tasks/{task_id}/findings/{finding_id}/review",
+        response_model=FindingReviewResponse,
+        dependencies=[Depends(_require_roles(ROLE_OWNER)), Depends(_csrf_protect)],
+    )
+    def review_bug_bounty_finding(
+        request: Request,
+        payload: FindingReviewRequest,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        finding_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> FindingReviewResponse:
+        request.state.task_id = task_id
+        return service.review_bug_bounty_finding(task_id, finding_id, payload, principal=principal, request_id=_request_id(request))
+
+    @router.get("/bug-bounty/tasks/{task_id}/reviews", response_model=list[FindingReviewResponse])
+    def list_finding_reviews(
+        request: Request,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> list[FindingReviewResponse]:
+        request.state.task_id = task_id
+        return service.list_finding_reviews(task_id, principal=principal, request_id=_request_id(request))
 
     @router.get("/bug-bounty/tasks/{task_id}", response_model=BugBountyTaskResponse)
     def bug_bounty_task(

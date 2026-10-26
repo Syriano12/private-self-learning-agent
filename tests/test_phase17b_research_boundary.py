@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from private_agent.tools.research import WebResearchTool, _PinnedNetworkBackend, _validate_public_url
+from private_agent.bugbounty.passive_research import PassiveResearchAdapter
 
 
 def _tool(handler, *, max_response_bytes: int = 1024) -> WebResearchTool:
@@ -78,6 +79,27 @@ def test_fetch_success_redacts_redirect_query_values() -> None:
     assert result["status"] == 200
     assert result["url"] == "https://public.example/"
     assert "secret-value" not in str(result)
+
+
+def test_passive_adapter_rejects_redirect_outside_source_allowlist() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://example.com/outside"})
+
+    result = PassiveResearchAdapter(
+        transport=httpx.MockTransport(handler),
+        resolver=lambda _host: ("93.184.216.34",),
+    ).collect(
+        [{"source_type": "hackerone_security", "url": "https://hackerone.com/security"}],
+        max_items=1,
+        max_output_bytes=8_000,
+    )
+    assert calls == ["https://hackerone.com/security"]
+    assert result["network_accessed"] is True
+    assert result["retrievals"][0]["status_code"] is None
+    assert result["retrievals"][0]["error"] == "fetch_failed"
 
 
 def test_search_does_not_expose_internal_fetch_url() -> None:

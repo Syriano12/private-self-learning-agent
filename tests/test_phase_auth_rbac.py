@@ -57,17 +57,21 @@ def test_owner_initialization_is_one_time_and_email_bound(tmp_path: Path) -> Non
     store.close()
 
 
-def test_schema_v7_reopens_with_auth_and_task_ownership_tables(tmp_path: Path) -> None:
-    path = tmp_path / "schema-v7.sqlite3"
+def test_schema_v11_reopens_with_auth_ownership_research_and_review_tables(tmp_path: Path) -> None:
+    path = tmp_path / "schema-v8.sqlite3"
     store = Store(path)
     versions = [row["schema_version"] for row in store.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_users'").fetchone()
+    assert store.db.execute("SELECT 1 FROM pragma_table_info('bugbounty_research_stages') WHERE name = 'lease_id'").fetchone()
+    assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_research_stages_claim'").fetchone()
     store.close()
     reopened = Store(path)
     assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_sessions'").fetchone()
     assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_events'").fetchone()
     assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_owners'").fetchone()
+    assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bugbounty_research_stages'").fetchone()
+    assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bugbounty_finding_reviews'").fetchone()
     reopened.close()
 
 

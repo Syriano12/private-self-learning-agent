@@ -183,6 +183,61 @@ def test_vulnora_bug_bounty_task_uses_real_queue_worker_and_report(tmp_path: Pat
     service.store.close()
 
 
+def test_owner_finding_review_requires_evidence_gate_and_is_audited(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finding-review.sqlite3"
+    monkeypatch.setenv("AGENT_DB_PATH", str(db_path))
+    monkeypatch.setenv("AGENT_API_TOKEN", API_TOKEN)
+    service = build_api_service(token=API_TOKEN)
+    worker = BackgroundWorker(service.orchestrator, worker_id="phase18-finding-review", poll_interval_seconds=0.01, idle_poll_interval_seconds=0.02)
+    application = create_app(service=service, worker=worker)
+
+    with TestClient(application, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/v1/bug-bounty/tasks", json={"scope": _scope(), "fixture": "idor_horizontal"},
+            headers=auth_headers(key="phase18-finding-review"),
+        )
+        assert created.status_code == 201, created.text
+        task_id = created.json()["task_id"]
+        assert _wait_for(lambda: client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=auth_headers()).json().get("status") in {"COMPLETED", "FAILED"})
+        body = client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=auth_headers()).json()
+        finding_id = body["run"]["findings"][0]["finding_id"]
+        confirmed = client.post(
+            f"/api/v1/bug-bounty/tasks/{task_id}/findings/{finding_id}/review",
+            json={"decision": "CONFIRM", "note": "owner review of validated local fixture"},
+            headers=auth_headers(key="phase18-finding-review"),
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["evidence_validated"] is True
+        confirmed_review = confirmed.json()
+        learned = [
+            item for item in service.orchestrator.learning_memory.list()
+            if item.metadata.get("review_id") == confirmed_review["review_id"]
+        ]
+        assert len(learned) == 1
+        assert learned[0].metadata["verified_outcome"] is True
+        assert learned[0].preferred_action["type"] == "require_evidence_review"
+        assert learned[0].avoided_action["type"] == "auto_confirm_finding"
+        assert learned[0].metadata["non_authoritative"] is True
+        reviews = client.get(f"/api/v1/bug-bounty/tasks/{task_id}/reviews", headers=auth_headers())
+        assert reviews.status_code == 200 and reviews.json()[0]["decision"] == "CONFIRM"
+        assert any(event.get("event_type") == "BUGBOUNTY_FINDING_REVIEW" for event in service.store.all_audit_events(task_id=task_id))
+
+        second = client.post(
+            "/api/v1/bug-bounty/tasks", json={"scope": _scope(), "fixture": "idor_horizontal"},
+            headers=auth_headers(key="phase18-finding-review-second"),
+        )
+        assert second.status_code == 201, second.text
+        second_task_id = second.json()["task_id"]
+        assert _wait_for(
+            lambda: client.get(f"/api/v1/bug-bounty/tasks/{second_task_id}", headers=auth_headers()).json().get("status") in {"COMPLETED", "FAILED"}
+        )
+        second_state = service.store.get_task_state(second_task_id)
+        assert second_state is not None
+        reused = second_state["context"].get("learned_strategies_used", [])
+        assert any(item.get("metadata", {}).get("review_id") == confirmed_review["review_id"] for item in reused)
+    service.store.close()
+
+
 def test_explicit_cors_allowlist_never_allows_wildcard(tmp_path: Path, monkeypatch) -> None:
     service, store, _ = make_service(tmp_path, __import__("tests.test_phase12_api", fromlist=["APITestTool"]).APITestTool("safe"))
     monkeypatch.setenv("AGENT_ALLOWED_ORIGINS", "https://vulnora.example")

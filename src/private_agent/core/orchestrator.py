@@ -147,7 +147,7 @@ class Orchestrator:
             for strategy in self.learning_memory.retrieve_relevant(
                 {
                     "goal": goal,
-                    "task_type": "general",
+                    "task_type": "bug_bounty" if state.context.get("task_kind") == "bug_bounty" else "general",
                     "tools": [metadata["name"] for metadata in self.tools.available()],
                 },
                 limit=5,

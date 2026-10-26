@@ -85,7 +85,7 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 11
 
 _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
     2: {
@@ -158,6 +158,35 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
             "task_id": "TEXT", "user_id": "TEXT", "created_at": "TEXT",
         },
     },
+    8: {
+        "bugbounty_program_analyses": {
+            "analysis_id": "TEXT", "owner_user_id": "TEXT", "analysis_json": "TEXT", "created_at": "TEXT",
+        },
+        "bugbounty_research_stages": {
+            "stage_id": "TEXT", "analysis_id": "TEXT", "owner_user_id": "TEXT", "stage_type": "TEXT",
+            "stage_status": "TEXT", "budget_json": "TEXT", "partial_result_json": "TEXT", "result_json": "TEXT",
+            "error_code": "TEXT", "started_at": "TEXT", "finished_at": "TEXT", "created_at": "TEXT", "updated_at": "TEXT",
+        },
+    },
+    9: {
+        "bugbounty_finding_reviews": {
+            "review_id": "TEXT", "task_id": "TEXT", "finding_id": "TEXT", "owner_user_id": "TEXT",
+            "decision": "TEXT", "duplicate_of": "TEXT", "note": "TEXT", "evidence_sha256": "TEXT",
+            "evidence_validated": "INTEGER", "actor_user_id": "TEXT", "created_at": "TEXT",
+        },
+    },
+    10: {
+        "bugbounty_research_stages": {
+            "attempt_count": "INTEGER", "max_attempts": "INTEGER", "lease_id": "TEXT", "worker_id": "TEXT",
+            "lease_acquired_at": "TEXT", "lease_expires_at": "TEXT", "last_error_code": "TEXT",
+            "last_error_message": "TEXT",
+        },
+    },
+    11: {
+        "bugbounty_research_stages": {
+            "input_json": "TEXT",
+        },
+    },
 }
 
 _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -175,6 +204,12 @@ _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
     "idx_auth_sessions_expiry": ("expires_at", "revoked_at"),
     "idx_auth_events_created": ("created_at",),
     "idx_task_owners_user": ("user_id", "created_at", "task_id"),
+    "idx_program_analysis_owner": ("owner_user_id", "created_at"),
+    "idx_research_stages_analysis": ("analysis_id", "created_at", "stage_id"),
+    "idx_research_stages_owner": ("owner_user_id", "updated_at", "stage_id"),
+    "idx_finding_reviews_task": ("task_id", "finding_id", "created_at", "review_id"),
+    "idx_finding_reviews_owner": ("owner_user_id", "created_at", "review_id"),
+    "idx_research_stages_claim": ("stage_status", "lease_expires_at", "created_at", "stage_id"),
 }
 
 
@@ -328,6 +363,27 @@ class Store:
                 ("table", "task_owners"),
                 ("index", "idx_task_owners_user"),
             )
+        if version == 8:
+            return (
+                ("table", "bugbounty_program_analyses"),
+                ("table", "bugbounty_research_stages"),
+                ("index", "idx_program_analysis_owner"),
+                ("index", "idx_research_stages_analysis"),
+                ("index", "idx_research_stages_owner"),
+            )
+        if version == 9:
+            return (
+                ("table", "bugbounty_finding_reviews"),
+                ("index", "idx_finding_reviews_task"),
+                ("index", "idx_finding_reviews_owner"),
+            )
+        if version == 10:
+            return (
+                ("table", "bugbounty_research_stages"),
+                ("index", "idx_research_stages_claim"),
+            )
+        if version == 11:
+            return (("table", "bugbounty_research_stages"),)
         return ()
 
     def _assert_migration_objects(self, version: int) -> None:
@@ -366,6 +422,7 @@ class Store:
                 "auth_users": ("CHECK (ROLE IN ('OWNER', 'OPERATOR', 'VIEWER'))", "CHECK (STATUS IN ('ACTIVE', 'DISABLED'))"),
                 "auth_sessions": ("FOREIGN KEY (USER_ID)",),
                 "task_owners": ("FOREIGN KEY (TASK_ID)", "FOREIGN KEY (USER_ID)"),
+                "bugbounty_finding_reviews": ("CHECK (EVIDENCE_VALIDATED IN (0, 1))",),
             }.get(name, ())
                 for fragment in required_fragments:
                     if fragment not in table_sql:
@@ -568,7 +625,10 @@ class Store:
                     ),
                     tuple(name for _, name in self._required_objects(version)),
                 ).fetchone()
-                if existing_objects is not None:
+                # Migration 10 alters the table created by migration 8, so the
+                # table's pre-existence is expected and must not short-circuit
+                # the ALTER statements below.
+                if existing_objects is not None and version not in {10, 11}:
                     self._assert_migration_objects(version)
                 self._apply_migration(version)
                 self._assert_migration_objects(version)
@@ -795,6 +855,77 @@ class Store:
             )""")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_owners_user ON task_owners(user_id, created_at, task_id)")
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (7, now()))
+            return
+        if version == 8:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS bugbounty_program_analyses (
+              analysis_id TEXT PRIMARY KEY,
+              owner_user_id TEXT NOT NULL,
+              analysis_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS bugbounty_research_stages (
+              stage_id TEXT PRIMARY KEY,
+              analysis_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              stage_type TEXT NOT NULL,
+              stage_status TEXT NOT NULL,
+              budget_json TEXT NOT NULL,
+              partial_result_json TEXT NOT NULL,
+              result_json TEXT NOT NULL,
+              error_code TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              finished_at TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (analysis_id) REFERENCES bugbounty_program_analyses(analysis_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_program_analysis_owner ON bugbounty_program_analyses(owner_user_id, created_at)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_research_stages_analysis ON bugbounty_research_stages(analysis_id, created_at, stage_id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_research_stages_owner ON bugbounty_research_stages(owner_user_id, updated_at, stage_id)")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (8, now()))
+            return
+        if version == 9:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS bugbounty_finding_reviews (
+              review_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              finding_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              decision TEXT NOT NULL,
+              duplicate_of TEXT NOT NULL DEFAULT '',
+              note TEXT NOT NULL DEFAULT '',
+              evidence_sha256 TEXT NOT NULL DEFAULT '',
+              evidence_validated INTEGER NOT NULL DEFAULT 0 CHECK (evidence_validated IN (0, 1)),
+              actor_user_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_finding_reviews_task ON bugbounty_finding_reviews(task_id, finding_id, created_at, review_id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_finding_reviews_owner ON bugbounty_finding_reviews(owner_user_id, created_at, review_id)")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (9, now()))
+            return
+        if version == 10:
+            for column, definition in (
+                ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("max_attempts", "INTEGER NOT NULL DEFAULT 1"),
+                ("lease_id", "TEXT NOT NULL DEFAULT ''"),
+                ("worker_id", "TEXT NOT NULL DEFAULT ''"),
+                ("lease_acquired_at", "TEXT NOT NULL DEFAULT ''"),
+                ("lease_expires_at", "TEXT NOT NULL DEFAULT ''"),
+                ("last_error_code", "TEXT NOT NULL DEFAULT ''"),
+                ("last_error_message", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                self.db.execute(f"ALTER TABLE bugbounty_research_stages ADD COLUMN {column} {definition}")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_research_stages_claim "
+                "ON bugbounty_research_stages(stage_status, lease_expires_at, created_at, stage_id)"
+            )
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (10, now()))
+            return
+        if version == 11:
+            self.db.execute(
+                "ALTER TABLE bugbounty_research_stages ADD COLUMN input_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (11, now()))
             return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
