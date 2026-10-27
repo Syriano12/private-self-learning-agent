@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from private_agent.api import create_app
+from private_agent.api import build_api_service, create_app
 from private_agent.auth import AuthError, AuthManager, hash_password, verify_password
 from private_agent.storage import Store
 from tests.test_phase12_api import APITestTool, make_service
@@ -55,6 +55,46 @@ def test_owner_initialization_is_one_time_and_email_bound(tmp_path: Path) -> Non
     assert row is not None
     assert OWNER_PASSWORD not in str(row["password_hash"])
     store.close()
+
+
+def test_explicit_database_path_is_used_by_api_service_for_owner_login(tmp_path: Path) -> None:
+    database = tmp_path / "termux-data" / "agent.sqlite3"
+    bootstrap = Store(database)
+    AuthManager(bootstrap).initialize_owner(OWNER_EMAIL, OWNER_PASSWORD)
+    bootstrap.close()
+
+    service = build_api_service(database_path=str(database))
+    client = _client(service)
+    response = client.post("/api/v1/auth/login", json={"email": OWNER_EMAIL, "password": OWNER_PASSWORD})
+    assert response.status_code == 200, response.text
+    assert response.json()["user"]["role"] == "OWNER"
+    assert service.store.path == database
+    service.store.close()
+
+
+def test_cli_serve_accepts_explicit_database_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import sys
+    import private_agent.cli as cli
+
+    database = tmp_path / "termux-data" / "agent.sqlite3"
+    captured: dict[str, object] = {}
+
+    class FakeService:
+        orchestrator = object()
+
+    def fake_build_api_service(*, database_path: str | None = None, **_: object) -> FakeService:
+        captured["database_path"] = database_path
+        return FakeService()
+
+    monkeypatch.setattr("private_agent.api.build_api_service", fake_build_api_service)
+    monkeypatch.setattr("private_agent.api.create_app", lambda **kwargs: captured.update(app_kwargs=kwargs) or object())
+    monkeypatch.setattr("uvicorn.run", lambda application, **kwargs: captured.update(uvicorn_kwargs=kwargs))
+    monkeypatch.setattr(sys, "argv", ["private-agent", "serve", "--database", str(database), "--host", "127.0.0.1", "--port", "18123"])
+
+    cli.main()
+
+    assert captured["database_path"] == str(database)
+    assert captured["uvicorn_kwargs"] == {"host": "127.0.0.1", "port": 18123}
 
 
 def test_schema_v11_reopens_with_auth_ownership_research_and_review_tables(tmp_path: Path) -> None:

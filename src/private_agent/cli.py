@@ -16,6 +16,11 @@ def main() -> None:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument(
+        "--database",
+        default=os.getenv("AGENT_DB_PATH", "data/agent.sqlite3"),
+        help="SQLite path shared by owner initialization, API, and worker",
+    )
+    serve.add_argument(
         "--with-worker",
         action="store_true",
         help="start the durable background worker with the API lifecycle",
@@ -78,15 +83,16 @@ def main() -> None:
         import uvicorn
 
         if not args.with_worker:
-            from private_agent.api import create_app
+            from private_agent.api import build_api_service, create_app
 
-            uvicorn.run(create_app(require_worker=True), host=args.host, port=args.port)
+            service = build_api_service(database_path=args.database)
+            uvicorn.run(create_app(service=service, require_worker=True), host=args.host, port=args.port)
             return
 
         from private_agent.api import build_api_service, create_app
         from private_agent.worker import BackgroundWorker
 
-        service = build_api_service()
+        service = build_api_service(database_path=args.database)
         worker = BackgroundWorker(
             service.orchestrator,
             worker_id=args.worker_id or os.getenv("AGENT_WORKER_ID"),

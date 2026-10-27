@@ -1595,8 +1595,8 @@ class AgentAPIService:
         return all(value in ready_values for value in checks.values()), checks
 
 
-def build_orchestrator() -> Orchestrator:
-    store = Store(os.getenv("AGENT_DB_PATH", "data/agent.sqlite3"))
+def build_orchestrator(*, database_path: str | None = None) -> Orchestrator:
+    store = Store(database_path or os.getenv("AGENT_DB_PATH", "data/agent.sqlite3"))
     registry = ToolRegistry()
     # Local/Termux operation is fail-closed: approval or an environment flag
     # must not enable a network-capable tool. Registration belongs to a future
@@ -1650,8 +1650,8 @@ def build_orchestrator() -> Orchestrator:
     )
 
 
-def build_api_service(*, token: str | None = None) -> AgentAPIService:
-    return AgentAPIService(build_orchestrator(), token=token)
+def build_api_service(*, token: str | None = None, database_path: str | None = None) -> AgentAPIService:
+    return AgentAPIService(build_orchestrator(database_path=database_path), token=token)
 
 
 def _service(request: Request) -> AgentAPIService:

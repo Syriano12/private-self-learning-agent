@@ -28,18 +28,21 @@ private-agent serve --host 127.0.0.1 --port 8000
 للاستخدام التشغيلي المحلي، شغّل API والعامل المستمر في العملية نفسها:
 
 ```bash
-export AGENT_DB_PATH="/tmp/vulnora-agent.sqlite3"
+cd ~/private-self-learning-agent
+export AGENT_DB_PATH="$PWD/data/agent.sqlite3"
 export AGENT_REQUIRE_OWNER_AUTH=1
 export AGENT_OWNER_EMAIL="ashbm1995@gmail.com"
 export AGENT_COOKIE_SECURE=0 # loopback development only
-private-agent serve --with-worker --host 127.0.0.1 --port 8000
 ```
 
-Initialize the owner once, before starting the owner-authenticated service, with the interactive CLI. It never accepts a password argument or stores the password in the repository:
+Initialize the owner once, before starting the owner-authenticated service, with the interactive CLI. Use the same explicit path for both commands; this avoids creating the owner in one relative `data/` directory and starting the server against another one:
 
 ```bash
-private-agent auth init-owner --database /tmp/vulnora-agent.sqlite3
+private-agent auth init-owner --database "$AGENT_DB_PATH" --email "$AGENT_OWNER_EMAIL"
+private-agent serve --with-worker --host 127.0.0.1 --port 8123 --database "$AGENT_DB_PATH"
 ```
+
+The initialization command prompts twice and never accepts a password argument or stores the password in the repository. If the owner has already been initialized, do not run it again; preserve the existing database and password.
 
 ينشئ `POST /api/v1/tasks` مهمة `QUEUED` محفوظة أولًا، ثم يعالجها العامل، وتصبح الموافقة المطلوبة قابلة لإعادة الإدراج تلقائيًا بعد موافقة المالك. لا تعني استجابة الإنشاء أن المهمة اكتملت؛ استخدم `GET /api/v1/tasks/{task_id}`.
 
