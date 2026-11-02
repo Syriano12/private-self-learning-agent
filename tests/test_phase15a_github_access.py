@@ -11,6 +11,8 @@ from private_agent.tools.github_access import (
     parse_repository,
     validate_repository_path,
 )
+from private_agent.tools.repository import RepositoryInspector
+from private_agent.tools.repository_snapshot import RepositorySnapshot
 
 
 
@@ -95,10 +97,104 @@ def test_public_repository_is_anonymous_pinned_and_read_from_indexed_blob() -> N
     assert view.tree(limit=200) == {
         "files": [{"path": "README.md", "type": "file", "size": 5, "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
         "truncated": False,
+        "excluded": [],
+        "exclusions_truncated": False,
     }
     assert view.read("README.md") == b"hello"
     assert all("authorization" not in request.headers for request in calls)
     assert sum(request.url.path.endswith("/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") for request in calls) == 1
+
+
+def test_github_http_client_does_not_trust_ambient_proxy_environment(monkeypatch) -> None:
+    import private_agent.tools.github_access as github_module
+
+    seen_client_options = []
+    real_client = httpx.Client
+
+    def capture_client(*args, **kwargs):
+        seen_client_options.append(dict(kwargs))
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(github_module.httpx, "Client", capture_client)
+    routes = public_routes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = routes.get(request.url.path)
+        assert payload is not None
+        return response(request, json=payload)
+
+    GitHubAccess(transport=httpx.MockTransport(handler)).open("acme/demo", ref="main")
+    assert seen_client_options
+    assert all(options.get("trust_env") is False for options in seen_client_options)
+
+
+def test_public_github_repository_adapter_blocks_sensitive_files_directly() -> None:
+    routes = public_routes()
+    tree = routes["/repos/acme/demo/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    tree["tree"].extend([
+        {"path": ".env", "type": "blob", "size": 6, "sha": "c" * 40},
+        {"path": "cache.sqlite3-journal", "type": "blob", "size": 7, "sha": "d" * 40},
+    ])
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        payload = routes.get(request.url.path)
+        assert payload is not None
+        return response(request, json=payload)
+
+    view = GitHubAccess(transport=httpx.MockTransport(handler)).open("acme/demo", ref="main")
+    listing = view.tree()
+    assert [item["path"] for item in listing["files"]] == ["README.md"]
+    assert {"path": ".env", "reason": "sensitive_path"} in listing["excluded"]
+    assert {"path": "cache.sqlite3-journal", "reason": "sensitive_path"} in listing["excluded"]
+    for path in (".env", "cache.sqlite3-journal"):
+        with pytest.raises(RepositoryAccessError) as error:
+            view.read(path)
+        assert error.value.code == "sensitive_path"
+    assert not any("/git/blobs/" in path for path in calls)
+
+
+def test_github_evidence_ref_requires_an_inspector_issued_snapshot() -> None:
+    routes = public_routes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = routes.get(request.url.path)
+        assert payload is not None
+        return response(request, json=payload)
+
+    inspector = RepositoryInspector(github_access=GitHubAccess(transport=httpx.MockTransport(handler)))
+    output = inspector.inspect("read_repository_file", {
+        "repository": "acme/demo", "ref": "main", "path": "README.md",
+    })
+    reference = inspector.validate_evidence_ref(output["data"]["evidence_ref"], output["snapshot"])
+    assert reference.commit == "a" * 40
+
+    forged_snapshot = RepositorySnapshot.create(
+        repository="acme/demo",
+        source="github_api",
+        commit="a" * 40,
+        files=[{"path": "README.md", "sha256": "0" * 64, "size_bytes": 5, "line_count": 1}],
+        tree_manifest=[{"path": "README.md", "size_bytes": 5, "object_sha": "b" * 40}],
+    )
+    with pytest.raises(RepositoryAccessError) as raised:
+        inspector.verify_snapshot(forged_snapshot)
+    assert raised.value.code == "snapshot_source_unverified"
+
+
+def test_truncated_github_tree_names_unlisted_remainder() -> None:
+    routes = public_routes()
+    routes["/repos/acme/demo/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]["truncated"] = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = routes.get(request.url.path)
+        assert payload is not None
+        return response(request, json=payload)
+
+    view = GitHubAccess(transport=httpx.MockTransport(handler)).open("acme/demo", ref="main")
+    tree = view.tree()
+    assert tree["truncated"] is True
+    assert {"path": "[TREE_REMAINDER]", "reason": "github_tree_truncated"} in tree["excluded"]
 
 
 def test_allowlisted_private_repository_uses_token_only_after_anonymous_metadata() -> None:
@@ -235,7 +331,7 @@ def test_malformed_base64_and_oversized_indexed_file_fail_without_returning_byte
     assert raised.value.code == "file_too_large"
 
 
-def test_redirect_is_not_followed_and_symlink_or_submodule_is_rejected() -> None:
+def test_redirect_is_not_followed_and_symlink_or_submodule_is_recorded_as_excluded() -> None:
     requests: list[httpx.Request] = []
 
     def redirect_handler(request: httpx.Request) -> httpx.Response:
@@ -247,17 +343,29 @@ def test_redirect_is_not_followed_and_symlink_or_submodule_is_rejected() -> None
     assert raised.value.code == "api_error"
     assert len(requests) == 1
 
+    requested_paths: list[str] = []
+
     def unsafe_tree_handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
         if request.url.path == "/repos/acme/demo":
             return response(request, json={"private": False, "default_branch": "main"})
         if request.url.path.endswith("/commits/main"):
             return response(request, json={"sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"})
-        return response(request, json={"truncated": False, "tree": [{"path": "link", "type": "symlink", "mode": "120000", "size": 1, "sha": "1111111111111111111111111111111111111111"}]})
+        return response(request, json={"truncated": False, "tree": [
+            {"path": "link", "type": "symlink", "mode": "120000", "size": 1, "sha": "1111111111111111111111111111111111111111"},
+            {"path": "vendor", "type": "commit", "mode": "160000", "size": 0, "sha": "2222222222222222222222222222222222222222"},
+            {"path": ".git/config", "type": "blob", "mode": "100644", "size": 12, "sha": "3333333333333333333333333333333333333333"},
+        ]})
 
     view = GitHubAccess(transport=httpx.MockTransport(unsafe_tree_handler)).open("acme/demo")
-    with pytest.raises(RepositoryAccessError) as raised:
-        view.tree()
-    assert raised.value.code == "api_error"
+    tree = view.tree()
+    assert tree["files"] == []
+    assert tree["excluded"] == [
+        {"path": ".git/config", "reason": "git_metadata"},
+        {"path": "link", "reason": "symlink"},
+        {"path": "vendor", "reason": "submodule"},
+    ]
+    assert not any("/git/blobs/" in path for path in requested_paths)
 
 
 def test_redact_removes_token_without_exposing_it_as_a_property() -> None:

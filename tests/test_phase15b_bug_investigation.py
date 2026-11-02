@@ -120,6 +120,24 @@ def test_known_static_defect_produces_cited_root_cause_without_execution(buggy_r
     assert hashlib.sha256((buggy_repository / "src/demo/service.py").read_bytes()).hexdigest() == before
 
 
+def test_bug_investigator_preserves_truncated_source_excerpt_on_evidence_refs(buggy_repository: Path):
+    from private_agent.tools.bug_investigation import BugInvestigator
+    from private_agent.tools.repository import RepositoryInspector
+
+    source = buggy_repository / "src/demo/service.py"
+    source.write_text(source.read_text(encoding="utf-8") + "# filler\n" * 410, encoding="utf-8")
+    inspector = RepositoryInspector(local_repositories={"example/buggy": buggy_repository})
+    report = BugInvestigator(inspector).investigate(
+        repository="example/buggy", ref="", bug_report="Investigate login keyword argument mismatch in validate_token"
+    )
+    read_refs = [
+        item for item in report["evidence"]
+        if item["path"] == "src/demo/service.py" and item["rule_id"] == "buginvestigator.read_only_evidence"
+    ]
+    assert read_refs
+    assert any(item["truncated"] and "source_excerpt_truncated" in item["uncertainty"] for item in read_refs)
+
+
 def test_repository_instructions_are_untrusted_data_and_never_authorize_actions(buggy_repository: Path):
     registry, _ = make_registry(buggy_repository)
     executor = GenericExecutor(registry, SecurityController())
@@ -298,7 +316,7 @@ def test_missing_repository_fails_without_false_success(tmp_path: Path):
 
 
 def test_evidence_is_hashable_unique_and_pinned_to_the_report_revision(buggy_repository: Path):
-    registry, _ = make_registry(buggy_repository)
+    registry, inspector = make_registry(buggy_repository)
     result = GenericExecutor(registry, SecurityController()).execute_step(
         investigate_step(bug_report="login fails because validate_token receives the wrong keyword"),
         ExecutionContext(metadata={"goal": "Investigate a bug in example/buggy"}),
@@ -311,6 +329,12 @@ def test_evidence_is_hashable_unique_and_pinned_to_the_report_revision(buggy_rep
     assert report["evidence"]
     assert all(item["sha256"] and len(item["sha256"]) == 64 for item in report["evidence"])
     assert all(item["revision"] == report["revision"] for item in report["evidence"])
+    assert report["snapshot"]["repository_identity"] == "local_fixture:example/buggy"
+    assert all(
+        inspector.validate_evidence_ref(item, report["snapshot"]).snapshot_id
+        == report["snapshot"]["snapshot_id"]
+        for item in report["evidence"]
+    )
     assert all(item["line_start"] >= 1 and item["line_end"] >= item["line_start"] for item in report["evidence"])
 
 

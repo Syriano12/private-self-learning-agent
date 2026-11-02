@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from typing import Any
 
 from private_agent.tools.contracts import ToolResult, validate_schema_value
 from private_agent.tools.github_access import RepositoryAccessError, parse_repository
+from private_agent.tools.repository_snapshot import CodeEvidenceRef, RepositorySnapshot
 
 
 TOOL_NAME = "investigate_repository_bug"
@@ -42,11 +44,12 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "recommended_next_verification_steps": {"type": "array"},
         "root_cause": {"type": "object"},
         "limitations": {"type": "array"},
+        "snapshot": {"type": "object"},
     },
     "required": [
         "bug_report", "repository", "revision", "source", "investigation_steps", "relevant_files",
         "code_paths", "findings", "hypotheses", "evidence", "missing_evidence",
-        "recommended_next_verification_steps", "root_cause", "limitations",
+        "recommended_next_verification_steps", "root_cause", "limitations", "snapshot",
     ],
     "additionalProperties": False,
 }
@@ -107,6 +110,14 @@ class BugInvestigator:
         line_start: int,
         line_end: int,
         excerpt: str = "",
+        parser_id: str = "none",
+        parser_version: str = "0",
+        rule_id: str = "buginvestigator.read_only_evidence",
+        rule_version: str = "1",
+        symbol_id: str | None = None,
+        evidence_type: str = "static_observation",
+        truncated: bool = False,
+        uncertainty: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         return {
             "repository": repository,
@@ -116,6 +127,14 @@ class BugInvestigator:
             "line_end": max(1, int(line_end)),
             "sha256": str(evidence.get("sha256", "")),
             "excerpt": excerpt[:500],
+            "parser_id": parser_id,
+            "parser_version": parser_version,
+            "rule_id": rule_id,
+            "rule_version": rule_version,
+            "symbol_id": symbol_id,
+            "evidence_type": evidence_type,
+            "truncated": truncated,
+            "uncertainty": list(uncertainty),
         }
 
     @staticmethod
@@ -131,12 +150,23 @@ class BugInvestigator:
 
     def investigate(self, *, repository: str, ref: str, bug_report: str) -> dict[str, Any]:
         clean_report = self._redact(bug_report.strip())
-        metadata = self._call("inspect_repository_metadata", {"repository": repository, "ref": ref})
+        observed_snapshots: list[RepositorySnapshot] = []
+
+        def inspect(operation: str, inputs: dict[str, Any]) -> dict[str, Any]:
+            result = self._call(operation, inputs)
+            value = result.get("snapshot")
+            if isinstance(value, dict):
+                observed_snapshots.append(RepositorySnapshot.from_dict(value))
+            else:
+                raise RepositoryAccessError("snapshot_unavailable")
+            return result
+
+        metadata = inspect("inspect_repository_metadata", {"repository": repository, "ref": ref})
         metadata_data = dict(metadata.get("data") or {})
         canonical_repository = str(metadata.get("repository") or metadata_data.get("repository") or repository)
         source = str(metadata.get("source") or metadata_data.get("source") or "unknown")
         revision = str(metadata.get("commit") or metadata_data.get("commit") or "")
-        pinned_ref = revision or (ref if source != "local_fixture" else "")
+        pinned_ref = revision if source != "local_fixture" else ""
         base = {"repository": canonical_repository}
         if pinned_ref:
             base["ref"] = pinned_ref
@@ -166,8 +196,18 @@ class BugInvestigator:
         search_matches: list[dict[str, Any]] = []
         candidate_paths: list[str] = []
 
-        def add_evidence(evidence: dict[str, Any], *, line_start: int, line_end: int, excerpt: str = "") -> dict[str, Any]:
+        def add_evidence(
+            evidence: dict[str, Any], *, line_start: int, line_end: int, excerpt: str = "",
+            parser_id: str = "none", parser_version: str = "0",
+            rule_id: str = "buginvestigator.read_only_evidence", rule_version: str = "1",
+            symbol_id: str | None = None, evidence_type: str = "static_observation",
+        ) -> dict[str, Any]:
             path = str(evidence.get("path", ""))
+            uncertainty: list[str] = []
+            if evidence.get("redacted"):
+                uncertainty.append("source_content_redacted_line_mapping_uncertain")
+            if evidence.get("truncated"):
+                uncertainty.append("source_excerpt_truncated")
             ref_value = self._evidence_ref(
                 evidence,
                 repository=canonical_repository,
@@ -175,12 +215,20 @@ class BugInvestigator:
                 line_start=line_start,
                 line_end=line_end,
                 excerpt=excerpt,
+                parser_id=parser_id,
+                parser_version=parser_version,
+                rule_id=rule_id,
+                rule_version=rule_version,
+                symbol_id=symbol_id,
+                evidence_type=evidence_type,
+                truncated=bool(evidence.get("truncated", False)),
+                uncertainty=tuple(uncertainty),
             )
             all_evidence.append(ref_value)
             return ref_value
 
         try:
-            structure_result = self._call("inspect_repository_structure", base)
+            structure_result = inspect("inspect_repository_structure", base)
             structure_data = dict(structure_result.get("data") or {})
             steps.append({"step": "structure", "status": "completed", "operation": "inspect_repository_structure"})
             for item in structure_data.get("evidence", []):
@@ -195,7 +243,7 @@ class BugInvestigator:
             limitations.append(f"Structure inspection was unavailable: {exc.code}.")
 
         try:
-            dependency_result = self._call("inspect_repository_dependencies", base)
+            dependency_result = inspect("inspect_repository_dependencies", base)
             dependency_data = dict(dependency_result.get("data") or {})
             steps.append({"step": "dependencies", "status": "completed", "operation": "inspect_repository_dependencies"})
         except RepositoryAccessError as exc:
@@ -205,7 +253,7 @@ class BugInvestigator:
 
         for query in _terms(clean_report):
             try:
-                search_result = self._call("search_repository_code", {**base, "query": query, "limit": 12})
+                search_result = inspect("search_repository_code", {**base, "query": query, "limit": 12})
                 data = dict(search_result.get("data") or {})
                 matches = [item for item in data.get("matches", []) if isinstance(item, dict)]
                 search_matches.extend(matches[:12])
@@ -235,7 +283,7 @@ class BugInvestigator:
         file_payloads: dict[str, dict[str, Any]] = {}
         for path in ordered_candidates:
             try:
-                read_result = self._call("read_repository_file", {**base, "path": path, "line_count": 400, "max_chars": 16000})
+                read_result = inspect("read_repository_file", {**base, "path": path, "line_count": 400, "max_chars": 16000})
                 data = dict(read_result.get("data") or {})
                 if data.get("path"):
                     file_payloads[path] = data
@@ -253,7 +301,10 @@ class BugInvestigator:
             line = int(match.get("line", 1)) if str(match.get("line", "1")).isdigit() else 1
             evidence = evidence_map.get(path)
             if evidence:
-                ref_value = add_evidence(evidence, line_start=line, line_end=line, excerpt=str(match.get("excerpt", "")))
+                ref_value = add_evidence(
+                    evidence, line_start=line, line_end=line, excerpt=str(match.get("excerpt", "")),
+                    rule_id="buginvestigator.literal_search", evidence_type="literal_match",
+                )
                 findings.append({
                     "kind": "observed_search_match",
                     "claim_type": "directly_observed_fact",
@@ -299,7 +350,12 @@ class BugInvestigator:
                         "kind": "function",
                         "line_start": int(node.lineno),
                         "line_end": _line_end(node),
-                        "evidence_refs": [add_evidence(payload, line_start=int(node.lineno), line_end=_line_end(node), excerpt="")],
+                        "evidence_refs": [add_evidence(
+                            payload, line_start=int(node.lineno), line_end=_line_end(node),
+                            parser_id="python.ast", parser_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+                            rule_id="buginvestigator.ast_function_declaration", symbol_id=f"{path}#{node.name}",
+                            evidence_type="ast_symbol",
+                        )],
                     })
                 elif isinstance(node, ast.ClassDef):
                     code_paths.append({
@@ -308,7 +364,12 @@ class BugInvestigator:
                         "kind": "class",
                         "line_start": int(node.lineno),
                         "line_end": _line_end(node),
-                        "evidence_refs": [add_evidence(payload, line_start=int(node.lineno), line_end=_line_end(node), excerpt="")],
+                        "evidence_refs": [add_evidence(
+                            payload, line_start=int(node.lineno), line_end=_line_end(node),
+                            parser_id="python.ast", parser_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+                            rule_id="buginvestigator.ast_class_declaration", symbol_id=f"{path}#{node.name}",
+                            evidence_type="ast_symbol",
+                        )],
                     })
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
@@ -341,8 +402,17 @@ class BugInvestigator:
             if not relevant:
                 continue
             payload = mismatch["payload"]
-            call_ref = add_evidence(payload, line_start=mismatch["call_line"], line_end=mismatch["call_line"], excerpt="")
-            definition_ref = add_evidence(payload, line_start=mismatch["definition_line"], line_end=mismatch["definition_line"], excerpt="")
+            parser_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+            call_ref = add_evidence(
+                payload, line_start=mismatch["call_line"], line_end=mismatch["call_line"],
+                parser_id="python.ast", parser_version=parser_version,
+                rule_id="buginvestigator.static_call_signature_mismatch", evidence_type="static_rule_observation",
+            )
+            definition_ref = add_evidence(
+                payload, line_start=mismatch["definition_line"], line_end=mismatch["definition_line"],
+                parser_id="python.ast", parser_version=parser_version,
+                rule_id="buginvestigator.static_call_signature_mismatch", evidence_type="static_rule_observation",
+            )
             findings.append({
                 "kind": "static_call_signature_mismatch",
                 "claim_type": "directly_observed_fact",
@@ -435,7 +505,20 @@ class BugInvestigator:
         steps.append({"step": "static_analysis", "status": "completed", "operation": "ast_parse_only", "files_analyzed": len(file_payloads)})
         steps.append({"step": "report", "status": "completed", "operation": "structured_diagnostic_assembly"})
 
-        return {
+        try:
+            snapshot = RepositorySnapshot.merge(observed_snapshots)
+            verify_snapshot = getattr(self.inspector, "verify_snapshot", None)
+            if callable(verify_snapshot):
+                snapshot = verify_snapshot(snapshot)
+        except RepositoryAccessError:
+            raise
+        except ValueError as exc:
+            code = str(exc)
+            if code == "source_changed_during_analysis":
+                raise RepositoryAccessError(code) from None
+            raise RepositoryAccessError("snapshot_invalid") from None
+
+        report = {
             "bug_report": clean_report,
             "repository": canonical_repository,
             "revision": revision,
@@ -454,7 +537,38 @@ class BugInvestigator:
             ],
             "root_cause": root_cause,
             "limitations": list(dict.fromkeys(limitations)),
+            "snapshot": snapshot.to_dict(),
         }
+
+        def bind_refs(value: Any) -> Any:
+            if isinstance(value, list):
+                return [bind_refs(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            if {"path", "sha256", "line_start", "line_end", "repository", "revision"}.issubset(value):
+                path = value["path"]
+                record = snapshot.file(path) if isinstance(path, str) else None
+                if record is None or record["sha256"] != value["sha256"]:
+                    raise RepositoryAccessError("source_changed_during_analysis")
+                ref_value = CodeEvidenceRef.create(
+                    snapshot,
+                    path=path,
+                    line_start=value["line_start"],
+                    line_end=value["line_end"],
+                    symbol_id=value.get("symbol_id"),
+                    parser_id=value.get("parser_id", "none"),
+                    parser_version=value.get("parser_version", "0"),
+                    rule_id=value.get("rule_id", "buginvestigator.read_only_evidence"),
+                    rule_version=value.get("rule_version", "1"),
+                    evidence_type=value.get("evidence_type", "static_observation"),
+                    truncated=value.get("truncated", False),
+                    uncertainty=tuple(value.get("uncertainty", [])),
+                ).to_dict()
+                ref_value["excerpt"] = str(value.get("excerpt", ""))[:500]
+                return ref_value
+            return {key: bind_refs(child) for key, child in value.items()}
+
+        return bind_refs(report)
 
 
 class BugInvestigationTool:

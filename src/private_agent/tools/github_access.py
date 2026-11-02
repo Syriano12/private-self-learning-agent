@@ -11,6 +11,8 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from private_agent.tools.repository_paths import sensitive_path
+
 
 _API_BASE = "https://api.github.com"
 _SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
@@ -26,6 +28,7 @@ _SAFE_MESSAGES = {
     "api_error": "GitHub API request failed.",
     "response_too_large": "GitHub API response is too large.",
     "file_too_large": "Repository file is too large.",
+    "sensitive_path": "Sensitive repository paths are unavailable.",
 }
 
 
@@ -203,6 +206,7 @@ class GitHubRepository:
         self._tree_attempted = False
         self._tree_entries: tuple[_FileEntry, ...] = ()
         self._tree_truncated = False
+        self._tree_excluded: tuple[dict[str, str], ...] = ()
         self._tree_error: RepositoryAccessError | None = None
 
     def __repr__(self) -> str:
@@ -240,6 +244,7 @@ class GitHubRepository:
             if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list) or not isinstance(payload.get("truncated"), bool):
                 raise RepositoryAccessError("api_error")
             entries: list[_FileEntry] = []
+            excluded: list[dict[str, str]] = []
             seen: set[str] = set()
             for raw_entry in payload["tree"]:
                 if not isinstance(raw_entry, dict):
@@ -251,12 +256,29 @@ class GitHubRepository:
                     raise RepositoryAccessError("api_error")
                 if mode is not None and not isinstance(mode, str):
                     raise RepositoryAccessError("api_error")
+                path_parts = raw_path.split("/")
+                if (
+                    raw_path.startswith("/") or "\\" in raw_path
+                    or any(ord(char) < 0x20 for char in raw_path)
+                    or any(part in {"", ".", ".."} for part in path_parts)
+                ):
+                    raise RepositoryAccessError("api_error")
+                if ".git" in path_parts:
+                    excluded.append({"path": raw_path, "reason": "git_metadata"})
+                    continue
                 try:
                     path = validate_repository_path(raw_path)
                 except RepositoryAccessError:
                     raise RepositoryAccessError("api_error") from None
-                if entry_type in {"symlink", "commit"} or mode in {"120000", "160000"}:
-                    raise RepositoryAccessError("api_error")
+                if sensitive_path(path):
+                    excluded.append({"path": path, "reason": "sensitive_path"})
+                    continue
+                if entry_type == "symlink" or mode == "120000":
+                    excluded.append({"path": path, "reason": "symlink"})
+                    continue
+                if entry_type == "commit" or mode == "160000":
+                    excluded.append({"path": path, "reason": "submodule"})
+                    continue
                 if entry_type == "tree":
                     continue
                 if entry_type != "blob":
@@ -269,8 +291,16 @@ class GitHubRepository:
                     raise RepositoryAccessError("api_error")
                 seen.add(path)
                 entries.append(_FileEntry(path=path, size=size, sha=sha))
+            if payload["truncated"]:
+                excluded.append({"path": "[TREE_REMAINDER]", "reason": "github_tree_truncated"})
             self._tree_entries = tuple(entries)
             self._tree_truncated = payload["truncated"]
+            ordered_excluded = sorted(excluded, key=lambda item: (item["path"], item["reason"]))
+            if len(ordered_excluded) > 200 and any(item["path"] == "[TREE_REMAINDER]" for item in ordered_excluded):
+                remainder = next(item for item in ordered_excluded if item["path"] == "[TREE_REMAINDER]")
+                without_remainder = [item for item in ordered_excluded if item["path"] != "[TREE_REMAINDER]"]
+                ordered_excluded = sorted([*without_remainder[:199], remainder], key=lambda item: (item["path"], item["reason"]))
+            self._tree_excluded = tuple(ordered_excluded[:200])
         except RepositoryAccessError as exc:
             self._tree_error = exc
             raise
@@ -283,10 +313,14 @@ class GitHubRepository:
             {"path": entry.path, "type": "file", "size": entry.size, "sha": entry.sha}
             for entry in self._tree_entries[:limit]
         ]
-        return {"files": files, "truncated": self._tree_truncated or len(self._tree_entries) > limit}
+        return {"files": files, "truncated": self._tree_truncated or len(self._tree_entries) > limit,
+                "excluded": [dict(item) for item in self._tree_excluded],
+                "exclusions_truncated": len(self._tree_excluded) >= 200}
 
     def read(self, path: str, *, max_bytes: int | None = None) -> bytes:
         validate_repository_path(path)
+        if sensitive_path(path):
+            raise RepositoryAccessError("sensitive_path")
         limit = self._access.max_file_bytes if max_bytes is None else min(self._access.max_file_bytes, max_bytes)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise RepositoryAccessError("file_too_large")
@@ -419,6 +453,7 @@ class GitHubAccess:
             with httpx.Client(
                 timeout=timeout,
                 follow_redirects=False,
+                trust_env=False,
                 transport=self._transport,
             ) as client:
                 with client.stream("GET", url, headers=headers) as response:

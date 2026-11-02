@@ -280,14 +280,22 @@ def test_failed_binary_reads_charge_the_read_attempt_budget(repository, monkeypa
 
 def test_singular_secret_files_are_blocked_and_unsafe_tree_omissions_are_explicit(repository, tmp_path):
     (repository / "secret.json").write_text('{"opaque":"sensitive-unrecognizable-value"}', encoding="utf-8")
+    (repository / "agent.sqlite3").write_text("private database marker", encoding="utf-8")
+    (repository / "agent.sqlite3-journal").write_text("private rollback journal", encoding="utf-8")
     outside = tmp_path / "outside.py"
     outside.write_text("class Hidden:\n    pass\n", encoding="utf-8")
     (repository / "unsafe.py").symlink_to(outside)
     executor, _, _ = make_executor(repository)
     assert run(executor, "read_repository_file", path="secret.json").status == "blocked"
+    assert run(executor, "read_repository_file", path="agent.sqlite3").status == "blocked"
+    assert run(executor, "read_repository_file", path="agent.sqlite3-journal").status == "blocked"
     tree = run(executor, "list_repository_files")
     assert tree.output["data"]["truncated"] is True
     assert "secret.json" not in {item["path"] for item in tree.output["data"]["files"]}
+    assert {"path": "unsafe.py", "reason": "symlink"} in tree.output["snapshot"]["excluded_files"]
+    assert {"path": "agent.sqlite3", "reason": "sensitive_path"} in tree.output["snapshot"]["excluded_files"]
+    assert {"path": "agent.sqlite3-journal", "reason": "sensitive_path"} in tree.output["snapshot"]["excluded_files"]
+    assert "unsafe.py" not in {item["path"] for item in tree.output["snapshot"]["tree_manifest"]}
 
 
 @pytest.mark.parametrize("goal", [
@@ -307,3 +315,206 @@ def test_mixed_sources_are_rejected_instead_of_overdeclaring_local_authority(rep
     from private_agent.tools.github_access import GitHubAccess
     with pytest.raises(ValueError, match="mixed_repository_sources_not_supported"):
         RepositoryInspector(local_repositories={"example/demo": repository}, github_access=GitHubAccess())
+
+
+def test_repository_read_emits_content_bound_snapshot_and_rejects_stale_evidence(repository):
+    from private_agent.tools.repository_snapshot import CodeEvidenceRef
+    from private_agent.tools.github_access import RepositoryAccessError
+
+    inspector = RepositoryInspector(local_repositories={"example/demo": repository})
+    first = inspector.inspect("read_repository_file", {
+        "repository": "example/demo", "path": "src/demo/service.py",
+    })
+    snapshot = first["snapshot"]
+    evidence = first["data"]["evidence_ref"]
+    reference = inspector.validate_evidence_ref(evidence, snapshot)
+
+    assert reference.repository_identity == "local_fixture:example/demo"
+    assert reference.snapshot_id == snapshot["snapshot_id"]
+    assert reference.path == "src/demo/service.py"
+    assert reference.file_sha256 == first["data"]["sha256"]
+    assert reference.line_start == 1
+    with pytest.raises(TypeError):
+        snapshot_object = inspector.verify_snapshot(snapshot)
+        snapshot_object.files[0]["sha256"] = "0" * 64
+    copied_record = snapshot_object.file("src/demo/service.py")
+    assert copied_record is not None
+    copied_record["sha256"] = "0" * 64
+    assert snapshot_object.file("src/demo/service.py")["sha256"] == first["data"]["sha256"]
+
+    repeated = inspector.inspect("read_repository_file", {
+        "repository": "example/demo", "path": "src/demo/service.py",
+    })
+    assert repeated["snapshot"]["snapshot_id"] == snapshot["snapshot_id"]
+    case_variant = inspector.inspect("read_repository_file", {
+        "repository": "Example/Demo", "path": "src/demo/service.py",
+    })
+    assert case_variant["snapshot"]["snapshot_id"] == snapshot["snapshot_id"]
+
+    source = repository / "src/demo/service.py"
+    source.write_text(source.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+    second = inspector.inspect("read_repository_file", {
+        "repository": "example/demo", "path": "src/demo/service.py",
+    })
+    assert second["snapshot"]["snapshot_id"] != snapshot["snapshot_id"]
+    with pytest.raises(ValueError, match="evidence_snapshot_mismatch"):
+        CodeEvidenceRef.from_dict(evidence, second["snapshot"])
+    with pytest.raises(RepositoryAccessError) as error:
+        inspector.validate_evidence_ref(evidence, second["snapshot"])
+    assert error.value.code == "evidence_reference_unverified"
+
+
+def test_repository_read_invalidates_result_when_source_changes_during_analysis(repository, monkeypatch):
+    from private_agent.tools.github_access import RepositoryAccessError
+    from private_agent.tools.local_repository import LocalRepository
+
+    path = repository / "src/demo/service.py"
+    original_read = LocalRepository.read
+    changed = False
+
+    def mutate_after_first_read(view, relative_path, *, max_bytes=None):
+        nonlocal changed
+        value = original_read(view, relative_path, max_bytes=max_bytes)
+        if relative_path == "src/demo/service.py" and not changed:
+            changed = True
+            path.write_text(path.read_text(encoding="utf-8") + "\n# concurrent edit\n", encoding="utf-8")
+        return value
+
+    monkeypatch.setattr(LocalRepository, "read", mutate_after_first_read)
+    inspector = RepositoryInspector(local_repositories={"example/demo": repository})
+    with pytest.raises(RepositoryAccessError) as error:
+        inspector.inspect("read_repository_file", {
+            "repository": "example/demo", "path": "src/demo/service.py",
+        })
+    assert error.value.code == "source_changed_during_analysis"
+
+
+def test_local_snapshot_records_git_commit_without_running_git(tmp_path):
+    root = tmp_path / "git-repo"
+    git_ref = root / ".git/refs/heads/main"
+    git_ref.parent.mkdir(parents=True)
+    (root / "src").mkdir()
+    (root / ".git/HEAD").write_text("ref: refs/heads/main\n", encoding="ascii")
+    commit = "a" * 40
+    git_ref.write_text(commit + "\n", encoding="ascii")
+    (root / "src/module.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    inspector = RepositoryInspector(local_repositories={"example/git-repo": root})
+    output = inspector.inspect("read_repository_file", {
+        "repository": "example/git-repo", "path": "src/module.py",
+    })
+    assert output["snapshot"]["commit"] == commit
+    assert output["snapshot"]["source_revision"] == f"commit:{commit}"
+    assert {"path": ".git", "reason": "git_metadata"} in output["snapshot"]["excluded_files"]
+
+
+def test_snapshot_rejects_traversal_and_reports_large_or_truncated_files(repository, tmp_path):
+    from private_agent.tools.github_access import RepositoryAccessError
+    from private_agent.tools.repository import RepositoryLimits
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must not be read", encoding="utf-8")
+    inspector = RepositoryInspector(local_repositories={"example/demo": repository})
+    with pytest.raises(RepositoryAccessError):
+        inspector.inspect("read_repository_file", {
+            "repository": "example/demo", "path": "../outside.txt",
+        })
+
+    large = repository / "large.txt"
+    large.write_text("L" * 128, encoding="utf-8")
+    bounded = RepositoryInspector(
+        local_repositories={"example/demo": repository},
+        limits=RepositoryLimits(max_file_bytes=64),
+    )
+    listed = bounded.inspect("list_repository_files", {"repository": "example/demo"})
+    assert {item["reason"] for item in listed["snapshot"]["excluded_files"] if item["path"] == "large.txt"} == {"file_too_large"}
+
+    truncated = inspector.inspect("read_repository_file", {
+        "repository": "example/demo", "path": "src/demo/service.py", "max_chars": 8,
+    })
+    assert truncated["data"]["truncated"] is True
+    assert truncated["data"]["evidence_ref"]["truncated"] is True
+    assert truncated["data"]["evidence_ref"]["file_sha256"] == truncated["data"]["sha256"]
+
+
+def test_snapshot_rejects_malformed_serialized_records(repository):
+    from private_agent.tools.repository_snapshot import RepositorySnapshot
+
+    output = RepositoryInspector(local_repositories={"example/demo": repository}).inspect(
+        "read_repository_file", {"repository": "example/demo", "path": "README.md"}
+    )
+    malformed = dict(output["snapshot"])
+    malformed["files"] = ["not-a-file-record"]
+    with pytest.raises(ValueError, match="invalid_snapshot"):
+        RepositorySnapshot.from_dict(malformed)
+    extended = dict(output["snapshot"])
+    extended["unreviewed_field"] = "ignored?"
+    with pytest.raises(ValueError, match="invalid_snapshot_schema"):
+        RepositorySnapshot.from_dict(extended)
+
+    with pytest.raises(ValueError, match="invalid_snapshot_file_size"):
+        RepositorySnapshot.create(
+            repository="example/demo", source="local_fixture",
+            files=[{"path": "huge.txt", "sha256": "a" * 64, "size_bytes": 65537, "line_count": 1}],
+        )
+
+
+def test_file_read_reference_covers_excerpt_and_snapshot_tracks_top_level_truncation(repository, tmp_path):
+    source = repository / "src/demo/cli.py"
+    lines = [f"line_{index}\n" for index in range(1, 6)]
+    source.write_text("".join(lines), encoding="utf-8")
+    inspector = RepositoryInspector(local_repositories={"example/demo": repository})
+    excerpt = inspector.inspect("read_repository_file", {
+        "repository": "example/demo", "path": "src/demo/cli.py", "start_line": 2, "line_count": 2,
+    })
+    reference = excerpt["data"]["evidence_ref"]
+    assert (reference["line_start"], reference["line_end"]) == (2, 3)
+    assert reference["truncated"] is True
+
+    single = tmp_path / "single-source"
+    single.mkdir()
+    (single / "only.py").write_text("needle = 1\n", encoding="utf-8")
+    single_inspector = RepositoryInspector(local_repositories={"example/single": single})
+    search = single_inspector.inspect("search_repository_code", {
+        "repository": "example/single", "query": "needle", "limit": 1,
+    })
+    assert search["data"]["truncated"] is True
+    assert search["snapshot"]["analysis_truncated"] is True
+
+
+def test_deletion_during_snapshot_revalidation_is_reported_as_source_change(repository, monkeypatch):
+    from private_agent.tools.github_access import RepositoryAccessError
+    from private_agent.tools.local_repository import LocalRepository
+
+    path = repository / "src/demo/service.py"
+    original_read = LocalRepository.read
+    calls = 0
+
+    def delete_before_verification(view, relative_path, *, max_bytes=None):
+        nonlocal calls
+        if relative_path == "src/demo/service.py":
+            calls += 1
+            if calls == 2:
+                path.unlink()
+        return original_read(view, relative_path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(LocalRepository, "read", delete_before_verification)
+    inspector = RepositoryInspector(local_repositories={"example/demo": repository})
+    with pytest.raises(RepositoryAccessError) as error:
+        inspector.inspect("read_repository_file", {
+            "repository": "example/demo", "path": "src/demo/service.py",
+        })
+    assert error.value.code == "source_changed_during_analysis"
+
+
+def test_tree_file_limit_records_an_unlisted_remainder(repository):
+    from private_agent.tools.repository import RepositoryLimits
+
+    (repository / "extra.py").write_text("EXTRA = True\n", encoding="utf-8")
+    inspector = RepositoryInspector(
+        local_repositories={"example/demo": repository},
+        limits=RepositoryLimits(max_tree_files=2),
+    )
+    output = inspector.inspect("list_repository_files", {"repository": "example/demo"})
+    assert output["data"]["truncated"] is True
+    assert {"path": "[TREE_REMAINDER]", "reason": "tree_file_limit"} in output["snapshot"]["excluded_files"]
