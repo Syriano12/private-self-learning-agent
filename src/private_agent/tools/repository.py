@@ -49,7 +49,7 @@ def _contains_truncated(value: Any) -> bool:
 @dataclass(frozen=True)
 class RepositoryLimits:
     max_file_bytes: int = 65536
-    max_response_bytes: int = 32768
+    max_response_bytes: int = 65536
     max_tree_files: int = 200
     max_read_files: int = 12
     max_total_read_bytes: int = 131072
@@ -347,22 +347,30 @@ class RepositoryInspector:
                         if record["line_count"] > 0 and 1 <= start <= end <= record["line_count"]:
                             kind = str(value.get("kind", ""))
                             is_ast_declaration = operation == "inspect_repository_structure" and kind in {"declared_symbol", "declared_import"}
-                            parser_id = "python.ast" if is_ast_declaration and path.endswith(".py") else "none"
-                            parser_version = f"{sys.version_info.major}.{sys.version_info.minor}" if parser_id != "none" else "0"
-                            rule_id = f"repository.{operation}.{kind}" if kind else f"repository.{operation}"
-                            symbol = value.get("symbol")
+                            parser_id = value.get("parser_id") or ("python.ast" if is_ast_declaration and path.endswith(".py") else "none")
+                            parser_version = value.get("parser_version") or (f"{sys.version_info.major}.{sys.version_info.minor}" if parser_id != "none" else "0")
+                            rule_id = value.get("rule_id") or (f"repository.{operation}.{kind}" if kind else f"repository.{operation}")
+                            symbol = value.get("symbol_id", value.get("symbol"))
+                            explicit_uncertainty = value.get("uncertainty", [])
+                            if not isinstance(explicit_uncertainty, (list, tuple)):
+                                explicit_uncertainty = []
                             value["evidence_ref"] = CodeEvidenceRef.create(
                                 snapshot,
                                 path=path,
                                 line_start=start,
                                 line_end=end,
-                                symbol_id=f"{path}#{kind}:{symbol}" if isinstance(symbol, str) else None,
+                                column_start=value.get("column_start"),
+                                column_end=value.get("column_end"),
+                                symbol_id=symbol if isinstance(symbol, str) else (f"{path}#{kind}:{symbol}" if isinstance(value.get("symbol"), str) else None),
                                 parser_id=parser_id,
                                 parser_version=parser_version,
                                 rule_id=rule_id[:128],
-                                evidence_type="static_declaration" if is_ast_declaration else "source_observation",
+                                rule_version=str(value.get("rule_version", "1")),
+                                evidence_type=value.get("evidence_type") or ("static_declaration" if is_ast_declaration else "source_observation"),
                                 truncated=bool(value.get("truncated", False)),
                                 uncertainty=(
+                                    list(explicit_uncertainty)
+                                    +
                                     (["source_content_redacted"] if path in redacted_paths else [])
                                     + (["tree_truncated"] if tree_truncated else [])
                                     + (["excerpt_truncated"] if value.get("truncated") else [])

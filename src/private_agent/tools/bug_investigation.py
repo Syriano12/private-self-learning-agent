@@ -43,13 +43,14 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "missing_evidence": {"type": "array"},
         "recommended_next_verification_steps": {"type": "array"},
         "root_cause": {"type": "object"},
+        "python_ast": {"type": "object"},
         "limitations": {"type": "array"},
         "snapshot": {"type": "object"},
     },
     "required": [
         "bug_report", "repository", "revision", "source", "investigation_steps", "relevant_files",
         "code_paths", "findings", "hypotheses", "evidence", "missing_evidence",
-        "recommended_next_verification_steps", "root_cause", "limitations", "snapshot",
+        "recommended_next_verification_steps", "root_cause", "python_ast", "limitations", "snapshot",
     ],
     "additionalProperties": False,
 }
@@ -230,6 +231,10 @@ class BugInvestigator:
         try:
             structure_result = inspect("inspect_repository_structure", base)
             structure_data = dict(structure_result.get("data") or {})
+            python_ast_data = structure_data.get("python_ast", {
+                "parser_id": "python.ast", "parser_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "files": [], "excluded_files": [], "record_count": 0, "truncated": True, "complete": False,
+            })
             steps.append({"step": "structure", "status": "completed", "operation": "inspect_repository_structure"})
             for item in structure_data.get("evidence", []):
                 if isinstance(item, dict) and item.get("path"):
@@ -239,6 +244,10 @@ class BugInvestigator:
                     relevant_files.setdefault(item, {"path": item, "reasons": ["selected by incremental structure inspection"]})
         except RepositoryAccessError as exc:
             structure_data = {}
+            python_ast_data = {
+                "parser_id": "python.ast", "parser_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "files": [], "excluded_files": [], "record_count": 0, "truncated": True, "complete": False,
+            }
             steps.append({"step": "structure", "status": "failed", "operation": "inspect_repository_structure", "error_code": exc.code})
             limitations.append(f"Structure inspection was unavailable: {exc.code}.")
 
@@ -333,6 +342,9 @@ class BugInvestigator:
         static_mismatches: list[dict[str, Any]] = []
         for path, payload in file_payloads.items():
             if not path.endswith(".py"):
+                continue
+            if payload.get("redacted") or payload.get("truncated"):
+                limitations.append(f"Static Python parsing skipped for {path} because source content was redacted or excerpted.")
                 continue
             content = str(payload.get("content", ""))
             try:
@@ -536,6 +548,10 @@ class BugInvestigator:
                 "If the root cause remains unresolved, collect the missing revision, logs, failing input, and dependency/runtime metadata.",
             ],
             "root_cause": root_cause,
+            "python_ast": python_ast_data if isinstance(python_ast_data, dict) else {
+                "parser_id": "python.ast", "parser_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "files": [], "excluded_files": [], "record_count": 0, "truncated": True, "complete": False,
+            },
             "limitations": list(dict.fromkeys(limitations)),
             "snapshot": snapshot.to_dict(),
         }
@@ -555,6 +571,8 @@ class BugInvestigator:
                     path=path,
                     line_start=value["line_start"],
                     line_end=value["line_end"],
+                    column_start=value.get("column_start"),
+                    column_end=value.get("column_end"),
                     symbol_id=value.get("symbol_id"),
                     parser_id=value.get("parser_id", "none"),
                     parser_version=value.get("parser_version", "0"),

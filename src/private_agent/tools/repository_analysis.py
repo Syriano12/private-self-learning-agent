@@ -1,7 +1,6 @@
 """Static evidence extraction only: manifest parsing and syntax analysis, never imports."""
 from __future__ import annotations
 
-import ast
 import json
 import re
 import tomllib
@@ -9,6 +8,13 @@ from pathlib import PurePosixPath
 from typing import Any, Callable
 
 from private_agent.tools.github_access import RepositoryAccessError
+from private_agent.tools.python_ast import (
+    DEFAULT_MAX_RECORDS,
+    PARSER_ID,
+    PARSER_VERSION,
+    analyze_python_source,
+    unavailable_python_file,
+)
 
 MANIFESTS = {"pyproject.toml", "requirements.txt", "package.json", "Cargo.toml", "go.mod", "composer.json"}
 SOURCE_SUFFIXES = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java"}
@@ -92,28 +98,69 @@ def structure(files: list[dict[str, Any]], read: Callable[[str], dict[str, Any]]
     findings = []
     hypotheses = []
     limitations = list(deps["limitations"])
-    for path in candidates[:8]:
+    selected = candidates[:8]
+    python_candidates = [path for path in candidates if PurePosixPath(path).suffix == ".py"]
+    selected_python = {path for path in selected if PurePosixPath(path).suffix == ".py"}
+    excluded_python = [{"file_path": path, "reason": "source_file_limit"}
+                       for path in python_candidates if path not in selected_python]
+    python_ast: dict[str, Any] = {
+        "parser_id": PARSER_ID,
+        "parser_version": PARSER_VERSION,
+        "files": [],
+        "excluded_files": excluded_python[:40],
+        "excluded_files_truncated": len(excluded_python) > 40,
+        "record_count": 0,
+        "truncated": len(excluded_python) > 0,
+        "complete": len(excluded_python) == 0,
+    }
+    if excluded_python:
+        limitations.append("python_ast_source_file_limit")
+
+    for path in selected:
+        is_python = PurePosixPath(path).suffix == ".py"
         try:
             evidence = read(path)
-        except (RepositoryAccessError, ValueError):
+        except (RepositoryAccessError, ValueError) as exc:
             limitations.append(f"source_not_read:{path}")
+            if is_python:
+                reason = exc.code if isinstance(exc, RepositoryAccessError) else "read_failed"
+                python_ast["files"].append(unavailable_python_file(path, reason))
+                python_ast["truncated"] = True
+                python_ast["complete"] = False
             continue
         text = evidence["content"]
-        if PurePosixPath(path).suffix == ".py":
-            try:
-                tree = ast.parse(text)
-            except (SyntaxError, ValueError):
-                limitations.append(f"source_syntax_unparsed:{path}")
+        if is_python:
+            if evidence.get("redacted"):
+                parsed = unavailable_python_file(path, "redacted_source_not_parsed", status="redacted_source_not_parsed")
+            elif python_ast["record_count"] >= DEFAULT_MAX_RECORDS:
+                parsed = unavailable_python_file(path, "ast_record_limit", status="record_limit")
+            else:
+                parsed = analyze_python_source(path, text, max_records=DEFAULT_MAX_RECORDS - python_ast["record_count"])
+            python_ast["files"].append(parsed)
+            python_ast["record_count"] += parsed["record_count"]
+            if parsed["truncated"]:
+                python_ast["truncated"] = True
+                python_ast["complete"] = False
+            if parsed["status"] not in {"parsed", "empty_source"}:
+                python_ast["complete"] = False
+                limitations.append(f"python_ast_{parsed['status']}:{path}")
+            if parsed["status"] not in {"parsed", "parsed_truncated"}:
                 continue
-            for node in tree.body:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    findings.append({"kind": "declared_symbol", "path": path, "line": node.lineno,
-                                     "symbol": node.name, "symbol_type": type(node).__name__})
-                elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                    names = [alias.name for alias in node.names]
-                    module = node.module if isinstance(node, ast.ImportFrom) else ", ".join(names)
-                    findings.append({"kind": "declared_import", "path": path, "line": node.lineno,
-                                     "module": module or "relative", "names": names[:10]})
+            module_record = next((item for item in parsed["symbols"] if item["kind"] == "module"), None)
+            module_id = module_record["symbol_id"] if module_record else None
+            for symbol in parsed["symbols"]:
+                if symbol.get("parent_id") != module_id or symbol.get("kind") not in {"class", "function", "async_function"}:
+                    continue
+                symbol_type = {"class": "ClassDef", "function": "FunctionDef", "async_function": "AsyncFunctionDef"}[symbol["kind"]]
+                findings.append({"kind": "declared_symbol", "path": path, "line": symbol["line_start"],
+                                 "symbol": symbol["name"], "symbol_type": symbol_type})
+            for imported in parsed["imports"]:
+                if imported.get("parent_id") != module_id:
+                    continue
+                names = [item["name"] for item in imported["aliases"]]
+                module = imported.get("module") or ", ".join(names)
+                findings.append({"kind": "declared_import", "path": path, "line": imported["line_start"],
+                                 "module": module or "relative", "names": names[:10]})
             if path in declared_targets:
                 hypotheses.append({"claim": "This module is a likely executable entry boundary based on the manifest declaration.",
                                    "path": path, "basis": "declared_entry_point", "confidence": "hypothesis"})
@@ -136,4 +183,4 @@ def structure(files: list[dict[str, Any]], read: Callable[[str], dict[str, Any]]
             "dependencies": deps["dependencies"], "manifests": deps["manifests"],
             "verified_findings": [item for item in findings if item["kind"] != "source_declaration_candidate"][:80],
             "lexical_candidates": [item for item in findings if item["kind"] == "source_declaration_candidate"][:80],
-            "hypotheses": hypotheses[:12], "limitations": limitations}
+            "hypotheses": hypotheses[:12], "limitations": limitations, "python_ast": python_ast}

@@ -388,7 +388,9 @@ class CodeEvidenceRef:
         if column_start is not None:
             if not isinstance(column_start, int) or isinstance(column_start, bool) or not isinstance(column_end, int) or isinstance(column_end, bool):
                 raise ValueError("invalid_evidence_column_range")
-            if column_start < 1 or column_end < column_start:
+            if column_start < 1 or column_end < 1:
+                raise ValueError("invalid_evidence_column_range")
+            if line_start == line_end and column_end < column_start:
                 raise ValueError("invalid_evidence_column_range")
             if column_end > 65536:
                 raise ValueError("invalid_evidence_column_range")
