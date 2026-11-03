@@ -13,6 +13,10 @@ from typing import Any
 
 from private_agent.tools.contracts import ToolResult, validate_schema_value
 from private_agent.tools.github_access import RepositoryAccessError, parse_repository
+from private_agent.tools.python_ai_contract import (
+    build_ai_analysis_contract,
+    compact_analysis_evidence_registry,
+)
 from private_agent.tools.repository_snapshot import CodeEvidenceRef, RepositorySnapshot
 
 
@@ -44,13 +48,18 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "recommended_next_verification_steps": {"type": "array"},
         "root_cause": {"type": "object"},
         "python_ast": {"type": "object"},
+        "call_graph": {"type": "object"},
+        "data_flow": {"type": "object"},
+        "analysis_evidence_registry": {"type": "object"},
+        "ai_analysis_contract": {"type": "object"},
         "limitations": {"type": "array"},
         "snapshot": {"type": "object"},
     },
     "required": [
         "bug_report", "repository", "revision", "source", "investigation_steps", "relevant_files",
         "code_paths", "findings", "hypotheses", "evidence", "missing_evidence",
-        "recommended_next_verification_steps", "root_cause", "python_ast", "limitations", "snapshot",
+        "recommended_next_verification_steps", "root_cause", "python_ast", "call_graph", "data_flow",
+        "analysis_evidence_registry", "ai_analysis_contract", "limitations", "snapshot",
     ],
     "additionalProperties": False,
 }
@@ -243,6 +252,8 @@ class BugInvestigator:
                 if isinstance(item, str):
                     relevant_files.setdefault(item, {"path": item, "reasons": ["selected by incremental structure inspection"]})
         except RepositoryAccessError as exc:
+            if exc.code == "source_changed_during_analysis":
+                raise
             structure_data = {}
             python_ast_data = {
                 "parser_id": "python.ast", "parser_version": f"{sys.version_info.major}.{sys.version_info.minor}",
@@ -256,6 +267,8 @@ class BugInvestigator:
             dependency_data = dict(dependency_result.get("data") or {})
             steps.append({"step": "dependencies", "status": "completed", "operation": "inspect_repository_dependencies"})
         except RepositoryAccessError as exc:
+            if exc.code == "source_changed_during_analysis":
+                raise
             dependency_data = {}
             steps.append({"step": "dependencies", "status": "failed", "operation": "inspect_repository_dependencies", "error_code": exc.code})
             limitations.append(f"Dependency inspection was unavailable: {exc.code}.")
@@ -273,6 +286,8 @@ class BugInvestigator:
                         candidate_paths.append(path)
                         relevant_files.setdefault(path, {"path": path, "reasons": []})["reasons"].append(f"literal match for {query!r}")
             except RepositoryAccessError as exc:
+                if exc.code == "source_changed_during_analysis":
+                    raise
                 steps.append({"step": "literal_search", "status": "failed", "operation": "search_repository_code", "query": query, "error_code": exc.code})
                 limitations.append(f"Literal search for {query!r} was unavailable: {exc.code}.")
 
@@ -301,6 +316,8 @@ class BugInvestigator:
                     relevant_files.setdefault(path, {"path": path, "reasons": []})["file_evidence"] = ref_value
                     steps.append({"step": "read_candidate", "status": "completed", "operation": "read_repository_file", "path": path})
             except RepositoryAccessError as exc:
+                if exc.code == "source_changed_during_analysis":
+                    raise
                 missing_evidence.append(f"Candidate file {path} was not readable ({exc.code}).")
                 steps.append({"step": "read_candidate", "status": "failed", "operation": "read_repository_file", "path": path, "error_code": exc.code})
 
@@ -552,6 +569,26 @@ class BugInvestigator:
                 "parser_id": "python.ast", "parser_version": f"{sys.version_info.major}.{sys.version_info.minor}",
                 "files": [], "excluded_files": [], "record_count": 0, "truncated": True, "complete": False,
             },
+            "call_graph": structure_data.get("call_graph", {
+                "schema_version": 1, "nodes": [], "edges": [], "truncated": True,
+                "complete": False, "runtime_dispatch_verified": False,
+                "limitations": ["Call graph was unavailable during the bounded investigation."],
+            }),
+            "data_flow": structure_data.get("data_flow", {
+                "schema_version": 1, "nodes": [], "edges": [], "truncated": True,
+                "complete": False, "vulnerability_confirmed": False,
+                "limitations": ["Data-flow analysis was unavailable during the bounded investigation."],
+            }),
+            "analysis_evidence_registry": structure_data.get("analysis_evidence_registry", {
+                "schema_version": 1, "registry_mode": "python_ast_base_plus_additional",
+                "snapshot_id": snapshot.snapshot_id, "references": [], "base_reference_count": 0,
+            }),
+            "ai_analysis_contract": structure_data.get("ai_analysis_contract", {
+                "contract_id": "vulnora.static_analysis.ai_bundle_ref", "schema_version": 1,
+                "provider_independent": True, "snapshot_id": snapshot.snapshot_id,
+                "source_code_included": False, "execution_authority": "none",
+                "finding_validation_authority": "none", "unavailable": True,
+            }),
             "limitations": list(dict.fromkeys(limitations)),
             "snapshot": snapshot.to_dict(),
         }
@@ -586,7 +623,18 @@ class BugInvestigator:
                 return ref_value
             return {key: bind_refs(child) for key, child in value.items()}
 
-        return bind_refs(report)
+        bound_report = bind_refs(report)
+        if bound_report.get("ai_analysis_contract", {}).get("unavailable") is not True:
+            compact_registry = bound_report["analysis_evidence_registry"]
+            compact_registry = compact_analysis_evidence_registry(
+                compact_registry, bound_report["python_ast"], snapshot,
+            )
+            bound_report["analysis_evidence_registry"] = compact_registry
+            bound_report["ai_analysis_contract"] = build_ai_analysis_contract(
+                snapshot, bound_report["python_ast"], bound_report["call_graph"],
+                bound_report["data_flow"], compact_registry,
+            )
+        return bound_report
 
 
 class BugInvestigationTool:

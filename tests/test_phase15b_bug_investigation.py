@@ -120,6 +120,77 @@ def test_known_static_defect_produces_cited_root_cause_without_execution(buggy_r
     assert hashlib.sha256((buggy_repository / "src/demo/service.py").read_bytes()).hexdigest() == before
 
 
+def test_bug_investigator_exposes_snapshot_bound_graph_and_dataflow_as_advisory_only(buggy_repository: Path):
+    from private_agent.tools.bug_investigation import BugInvestigator
+    from private_agent.tools.python_analysis_bundle import materialize_ai_analysis_request
+
+    inspector = RepositoryInspector(local_repositories={"example/buggy": buggy_repository})
+    report = BugInvestigator(inspector).investigate(
+        repository="example/buggy", ref="", bug_report="Investigate the login error and validate_token call path"
+    )
+
+    assert report["call_graph"]["nodes"]
+    assert report["call_graph"]["edges"]
+    assert report["data_flow"]["edges"]
+    assert report["data_flow"]["vulnerability_confirmed"] is False
+    assert report["ai_analysis_contract"]["provider_independent"] is True
+    assert report["ai_analysis_contract"]["execution_authority"] == "none"
+    assert report["ai_analysis_contract"]["finding_validation_authority"] == "none"
+    assert report["ai_analysis_contract"]["snapshot_id"] == report["snapshot"]["snapshot_id"]
+    assert all(item.get("status") != "VALIDATED" for item in report["findings"])
+    assert all(item.get("runtime_target_confirmed") is False for item in report["call_graph"]["edges"])
+
+    request = materialize_ai_analysis_request(report, report["snapshot"])
+    assert request["repository"]["snapshot_id"] == report["snapshot"]["snapshot_id"]
+    assert request["finding_validation_authority"] == "none"
+    assert "Path('EXECUTED_BY_INVESTIGATOR')" not in str(request)
+
+
+def test_bug_investigator_rejects_source_changed_mid_analysis(buggy_repository: Path):
+    from private_agent.tools.bug_investigation import BugInvestigator
+    from private_agent.tools.github_access import RepositoryAccessError
+
+    inspector = RepositoryInspector(local_repositories={"example/buggy": buggy_repository})
+    original_inspect = inspector.inspect
+    changed = False
+
+    def change_after_structure(operation: str, inputs: dict[str, object]) -> dict[str, object]:
+        nonlocal changed
+        result = original_inspect(operation, inputs)
+        if operation == "inspect_repository_structure" and not changed:
+            path = buggy_repository / "src/demo/service.py"
+            path.write_text(path.read_text(encoding="utf-8") + "# changed during investigation\n", encoding="utf-8")
+            changed = True
+        return result
+
+    inspector.inspect = change_after_structure  # type: ignore[method-assign]
+    with pytest.raises(RepositoryAccessError) as error:
+        BugInvestigator(inspector).investigate(
+            repository="example/buggy", ref="", bug_report="Investigate a login failure"
+        )
+    assert error.value.code == "source_changed_during_analysis"
+
+
+def test_bug_investigator_propagates_source_drift_from_failed_structure_read(buggy_repository: Path):
+    from private_agent.tools.bug_investigation import BugInvestigator
+    from private_agent.tools.github_access import RepositoryAccessError
+
+    inspector = RepositoryInspector(local_repositories={"example/buggy": buggy_repository})
+    original_inspect = inspector.inspect
+
+    def fail_structure_after_detecting_drift(operation: str, inputs: dict[str, object]) -> dict[str, object]:
+        if operation == "inspect_repository_structure":
+            raise RepositoryAccessError("source_changed_during_analysis")
+        return original_inspect(operation, inputs)
+
+    inspector.inspect = fail_structure_after_detecting_drift  # type: ignore[method-assign]
+    with pytest.raises(RepositoryAccessError) as error:
+        BugInvestigator(inspector).investigate(
+            repository="example/buggy", ref="", bug_report="Investigate a login failure"
+        )
+    assert error.value.code == "source_changed_during_analysis"
+
+
 def test_bug_investigator_preserves_truncated_source_excerpt_on_evidence_refs(buggy_repository: Path):
     from private_agent.tools.bug_investigation import BugInvestigator
     from private_agent.tools.repository import RepositoryInspector

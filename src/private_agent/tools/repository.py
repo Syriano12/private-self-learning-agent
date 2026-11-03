@@ -17,6 +17,12 @@ from private_agent.tools.bug_investigation import BugInvestigationTool, bug_repo
 from private_agent.tools.github_access import GitHubAccess, RepositoryAccessError, parse_repository, validate_repository_path
 from private_agent.tools.local_repository import LocalRepository, sensitive_path
 from private_agent.tools.patching import register_patch_tools
+from private_agent.tools.python_call_graph import build_call_graph
+from private_agent.tools.python_data_flow import build_data_flow
+from private_agent.tools.python_ai_contract import (
+    build_ai_analysis_contract,
+    compact_analysis_evidence_registry,
+)
 from private_agent.tools.repository_analysis import dependencies, structure
 from private_agent.tools.repository_snapshot import CodeEvidenceRef, RepositorySnapshot
 
@@ -49,7 +55,7 @@ def _contains_truncated(value: Any) -> bool:
 @dataclass(frozen=True)
 class RepositoryLimits:
     max_file_bytes: int = 65536
-    max_response_bytes: int = 65536
+    max_response_bytes: int = 131072
     max_tree_files: int = 200
     max_read_files: int = 12
     max_total_read_bytes: int = 131072
@@ -383,11 +389,41 @@ class RepositoryInspector:
                         attach_refs(child)
 
             attach_refs(data)
+            if operation == "inspect_repository_structure":
+                call_graph, analysis_registry = build_call_graph(
+                    data.get("python_ast", {}), snapshot
+                )
+                sources_by_path = {
+                    path: str(item["content"])
+                    for path, item in cache.items()
+                    if path.endswith(".py") and not item.get("redacted", False)
+                }
+                try:
+                    data_flow = build_data_flow(
+                        data.get("python_ast", {}), sources_by_path, snapshot,
+                        call_graph, analysis_registry,
+                    )
+                except ValueError as exc:
+                    if str(exc) == "source_changed_during_analysis":
+                        raise RepositoryAccessError("source_changed_during_analysis") from None
+                    raise
+                data["call_graph"] = call_graph
+                data["data_flow"] = data_flow
+                compact_registry = compact_analysis_evidence_registry(
+                    analysis_registry.to_dict(), data.get("python_ast", {}), snapshot,
+                )
+                data["analysis_evidence_registry"] = compact_registry
+                data["ai_analysis_contract"] = build_ai_analysis_contract(
+                    snapshot, data.get("python_ast", {}), call_graph,
+                    data_flow, compact_registry,
+                )
             with self._snapshot_lock:
                 self._issued_snapshots[snapshot.snapshot_id] = snapshot
                 self._issued_snapshots.move_to_end(snapshot.snapshot_id)
                 while len(self._issued_snapshots) > 128:
                     self._issued_snapshots.popitem(last=False)
+            if operation == "inspect_repository_structure":
+                self.verify_snapshot(snapshot)
             output = self._safe_values({"repository": repository, "ref": metadata["ref"],
                 "commit": metadata["commit"], "source": metadata["source"], "untrusted": True,
                 "operation": operation, "data": data, "limitations": limitations,
