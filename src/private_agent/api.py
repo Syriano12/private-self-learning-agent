@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -13,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, Depends, FastAPI, Header, HTTPException, Path as APIPath, Query, Request, status
@@ -41,11 +42,13 @@ from private_agent.auth import (
 from private_agent.bugbounty.models import Finding, FindingState, ScopeDefinition, public_reference, reconcile_bug_bounty_metrics, safe_json, validate_confirmed_evidence
 from private_agent.bugbounty.learning import BugBountyLearningService
 from private_agent.bugbounty.local_evidence import normalize_research_input
-from private_agent.bugbounty.programs import ProgramAnalysisRepository, analyze_program
+from private_agent.bugbounty.programs import ProgramAnalysisRepository, PublicPolicyRetriever, analyze_program
 from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType, StageBudget
 from private_agent.bugbounty.reviews import FindingReview, FindingReviewDecision, FindingReviewRepository
+from private_agent.bugbounty.remote_worker import RemoteWorkerProtocol, WorkerAuthentication, WorkerProtocolError
 from private_agent.observability import ObservabilityMonitor, safe_metadata
 from private_agent.security import ApprovalRequest, SecurityController
+from private_agent.skills.runtime_preflight import run_host_preflight
 from private_agent.storage import QueueLeaseLost, Store
 from private_agent.bugbounty.trusted_tools import load_tool_spec_from_environment
 from private_agent.tools.research import ToolRegistry
@@ -56,6 +59,7 @@ from private_agent.worker import BackgroundWorker
 API_VERSION = "v1"
 API_SCHEMA_VERSION = 1
 SERVICE_NAME = "private-agent"
+LOGGER = logging.getLogger(__name__)
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _REDACTED_KEYS = {
@@ -188,6 +192,16 @@ class ProgramAnalysisRequest(APIModel):
     program_url: str = Field(min_length=8, max_length=2048)
     policy_text: str = Field(default="", max_length=128_000)
     source_type: str = Field(default="user_provided_policy", min_length=1, max_length=64)
+    fetch_public_policy: bool = False
+
+    @model_validator(mode="after")
+    def validate_public_policy_request(self) -> "ProgramAnalysisRequest":
+        if self.fetch_public_policy:
+            if self.policy_text.strip():
+                raise ValueError("public_policy_fetch_cannot_include_policy_text")
+            if self.source_type != "hackerone_program":
+                raise ValueError("public_policy_source_not_supported")
+        return self
 
 
 class ProgramAnalysisResponse(APIModel):
@@ -199,6 +213,7 @@ class ProgramAnalysisResponse(APIModel):
     exclusions: list[str] = Field(default_factory=list)
     ambiguities: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+    observations: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
@@ -506,6 +521,22 @@ class ReadinessResponse(APIModel):
     request_id: str = ""
 
 
+class RuntimePreflightCheckResponse(APIModel):
+    name: str
+    status: str
+    detail: str
+
+
+class RuntimePreflightResponse(APIModel):
+    verdict: str
+    host_ready: bool
+    can_run_acceptance: bool
+    acceptance_required: bool
+    runtime_identity: str | None = None
+    checks: list[RuntimePreflightCheckResponse]
+    request_id: str = ""
+
+
 class ToolResponse(APIModel):
     name: str
     description: str = ""
@@ -550,6 +581,21 @@ class UserCreateRequest(APIModel):
 
 class UserRoleRequest(APIModel):
     role: str = Field(pattern="^(OPERATOR|VIEWER)$")
+
+
+class WorkerClaimRequest(APIModel):
+    pass
+
+
+class WorkerHeartbeatRequest(APIModel):
+    job_id: str = Field(min_length=1, max_length=256)
+    lease_id: str = Field(min_length=1, max_length=256)
+
+
+class WorkerResultRequest(APIModel):
+    job_id: str = Field(min_length=1, max_length=256)
+    lease_id: str = Field(min_length=1, max_length=256)
+    result: dict[str, Any]
 
 
 class TokenAuthenticator:
@@ -737,6 +783,8 @@ class AgentAPIService:
         self.observability: ObservabilityMonitor = orchestrator.observability
         self.authenticator = TokenAuthenticator(token)
         self.auth_manager = AuthManager(self.store)
+        self.public_policy_retriever = PublicPolicyRetriever()
+        self.remote_worker_protocol = RemoteWorkerProtocol(self.store)
         self.require_owner_auth = os.getenv("AGENT_REQUIRE_OWNER_AUTH", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.auto_requeue_approvals = False
         self._lock = threading.RLock()
@@ -809,7 +857,24 @@ class AgentAPIService:
         principal: AuthenticatedPrincipal | None = None,
     ) -> ProgramAnalysisResponse:
         try:
-            analysis = analyze_program(payload.program_url, payload.policy_text, source_type=payload.source_type)
+            policy_text = payload.policy_text
+            source_type = payload.source_type
+            retrieval_observations: dict[str, Any] = {}
+            if payload.fetch_public_policy:
+                try:
+                    retrieved = self.public_policy_retriever.retrieve(payload.program_url)
+                except (TypeError, ValueError) as exc:
+                    raise APIError(422, str(exc), "The allowlisted public policy could not be retrieved") from exc
+                policy_text = retrieved.content
+                source_type = retrieved.source_type
+                retrieval_observations = retrieved.observations
+            analysis = analyze_program(
+                payload.program_url,
+                policy_text,
+                source_type=source_type,
+                fetched_automatically=payload.fetch_public_policy,
+                observations=retrieval_observations,
+            )
             stored = ProgramAnalysisRepository(self.store).save(
                 analysis,
                 owner_user_id=self._owner_user_id(principal),
@@ -1789,10 +1854,69 @@ def create_app(
         finally:
             application.state.lifespan_started = False
             if worker is not None:
-                stopped = worker.stop(timeout=worker_shutdown_timeout)
-                if worker_thread is not None:
-                    worker_thread.join(timeout=worker_shutdown_timeout)
-                application.state.worker_shutdown_clean = bool(stopped and not worker_thread.is_alive()) if worker_thread is not None else bool(stopped)
+                shutdown_error: str | None = None
+                shutdown_timed_out = False
+                shutdown_base_exception: BaseException | None = None
+
+                def record_shutdown_error(event_name: str, exc: BaseException) -> None:
+                    nonlocal shutdown_error, shutdown_base_exception
+                    shutdown_error = shutdown_error or type(exc).__name__
+                    if not isinstance(exc, Exception) and shutdown_base_exception is None:
+                        shutdown_base_exception = exc
+                    LOGGER.error(event_name, extra={"error_type": type(exc).__name__})
+
+                try:
+                    # This lifecycle fence is independent of the worker's stop
+                    # Event, so a broken request_stop/set path cannot leave an
+                    # idle loop running forever. It does not close SQLite.
+                    worker.store.request_worker_shutdown()
+                except BaseException as exc:
+                    record_shutdown_error("worker_shutdown_store_request_failed", exc)
+
+                def request_stop_safely() -> None:
+                    try:
+                        worker.request_stop()
+                    except BaseException as exc:
+                        record_shutdown_error("worker_shutdown_request_failed", exc)
+                        stop_event = getattr(worker, "_stop_event", None)
+                        set_stop = getattr(stop_event, "set", None)
+                        if callable(set_stop):
+                            try:
+                                set_stop()
+                            except BaseException as fallback_exc:
+                                record_shutdown_error("worker_shutdown_signal_fallback_failed", fallback_exc)
+
+                request_stop_safely()
+                try:
+                    stopped = worker.stop(timeout=worker_shutdown_timeout)
+                    shutdown_timed_out = not stopped
+                except BaseException as exc:
+                    record_shutdown_error("worker_shutdown_wait_failed", exc)
+                    request_stop_safely()
+                finally:
+                    # The configured timeout is an observability threshold, not
+                    # permission to close resources under an active claim.
+                    try:
+                        worker.join(timeout=None)
+                    except BaseException as exc:
+                        record_shutdown_error("worker_shutdown_drain_failed", exc)
+                        if worker_thread is not None:
+                            try:
+                                worker_thread.join()
+                            except BaseException as join_exc:
+                                record_shutdown_error("worker_shutdown_thread_join_failed", join_exc)
+                    if worker_thread is not None and worker_thread.is_alive():
+                        try:
+                            worker_thread.join()
+                        except BaseException as join_exc:
+                            record_shutdown_error("worker_shutdown_thread_join_failed", join_exc)
+                application.state.worker_shutdown_timed_out = shutdown_timed_out
+                application.state.worker_shutdown_error = shutdown_error
+                application.state.worker_shutdown_clean = bool(
+                    worker_thread is None or not worker_thread.is_alive()
+                ) and worker.fatal_error is None and shutdown_error is None
+                if shutdown_base_exception is not None:
+                    raise shutdown_base_exception
 
     application = FastAPI(
         title="Private Self-Learning Agent API",
@@ -1892,6 +2016,26 @@ def create_app(
         ):
             raise APIError(503, "worker_not_ready", "Task processing worker is not running")
 
+    def _worker_authenticate(request: Request, service: AgentAPIService, body: Mapping[str, Any]) -> WorkerAuthentication:
+        authorization = request.headers.get("Authorization", "")
+        if not authorization.startswith("Worker "):
+            raise HTTPException(status_code=401, detail="worker_authentication_required")
+        try:
+            return service.remote_worker_protocol.authenticate(
+                worker_id=request.headers.get("X-Worker-ID", ""),
+                credential=authorization[len("Worker "):],
+                method=request.method,
+                path=request.url.path,
+                timestamp=int(request.headers.get("X-Worker-Timestamp", "")),
+                nonce=request.headers.get("X-Worker-Nonce", ""),
+                body=body,
+                signature=request.headers.get("X-Worker-Signature", ""),
+            )
+        except (WorkerProtocolError, ValueError) as exc:
+            code = getattr(exc, "code", "worker_authentication_failed")
+            http_status = 409 if code in {"worker_request_replay", "worker_timestamp_out_of_window"} else 401
+            raise HTTPException(status_code=http_status, detail=code) from exc
+
     @application.get("/health", response_model=HealthResponse, tags=["system"])
     def health() -> HealthResponse:
         return HealthResponse(status="ok")
@@ -1961,6 +2105,22 @@ def create_app(
             503: {"model": ErrorResponse},
         },
     )
+
+    @router.get("/runtime/preflight", response_model=RuntimePreflightResponse)
+    def runtime_preflight(request: Request) -> RuntimePreflightResponse:
+        report = run_host_preflight()
+        return RuntimePreflightResponse(
+            verdict=report.verdict.value,
+            host_ready=report.host_ready,
+            can_run_acceptance=report.can_run_acceptance,
+            acceptance_required=report.acceptance_required,
+            runtime_identity=report.runtime_identity,
+            checks=[
+                RuntimePreflightCheckResponse(name=check.name, status=check.status.value, detail=check.detail)
+                for check in report.checks
+            ],
+            request_id=_request_id(request),
+        )
 
     @router.post(
         "/tasks",
@@ -2284,6 +2444,45 @@ def create_app(
                 )
             )
         return result
+
+    @application.post("/api/v1/worker/jobs/claim", response_model=dict[str, Any] | None, tags=["remote-worker"])
+    def worker_claim(
+        request: Request,
+        payload: WorkerClaimRequest,
+        service: AgentAPIService = Depends(_service),
+    ) -> dict[str, Any] | None:
+        auth = _worker_authenticate(request, service, payload.model_dump())
+        try:
+            return service.remote_worker_protocol.claim(auth)
+        except WorkerProtocolError as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from exc
+
+    @application.post("/api/v1/worker/jobs/{job_id}/heartbeat", response_model=dict[str, Any], tags=["remote-worker"])
+    def worker_heartbeat(
+        request: Request,
+        payload: WorkerHeartbeatRequest,
+        service: AgentAPIService = Depends(_service),
+    ) -> dict[str, Any]:
+        auth = _worker_authenticate(request, service, payload.model_dump())
+        try:
+            return service.remote_worker_protocol.heartbeat(auth, job_id=payload.job_id, lease_id=payload.lease_id)
+        except WorkerProtocolError as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from exc
+
+    @application.post("/api/v1/worker/jobs/{job_id}/result", response_model=dict[str, Any], tags=["remote-worker"])
+    def worker_result(
+        request: Request,
+        payload: WorkerResultRequest,
+        service: AgentAPIService = Depends(_service),
+    ) -> dict[str, Any]:
+        auth = _worker_authenticate(request, service, payload.model_dump())
+        try:
+            return service.remote_worker_protocol.submit_result(
+                auth, job_id=payload.job_id, lease_id=payload.lease_id, result=payload.result
+            )
+        except WorkerProtocolError as exc:
+            status_code = 422 if exc.code.startswith("worker_result_") else 409
+            raise HTTPException(status_code=status_code, detail=exc.code) from exc
 
     @router.get(
         "/users",

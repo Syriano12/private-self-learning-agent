@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 from private_agent.bugbounty.programs import ProgramAnalysisRepository, analyze_program
 from private_agent.bugbounty.passive_research import PassiveResearchAdapter
 from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType, StageBudget
-from private_agent.bugbounty.stage_execution import ResearchStageExecutor
+from private_agent.bugbounty.stage_execution import ResearchStageExecutor, StageExecutionOutcome
 import private_agent.storage as storage_module
 from private_agent.storage import Store
 from private_agent.worker import BackgroundWorker
@@ -38,6 +39,38 @@ def test_background_worker_completes_local_program_analysis_stage_without_networ
     assert persisted.stage_status == ResearchStageStatus.COMPLETED.value
     assert persisted.result["analysis_id"] == analysis.analysis_id
     assert persisted.result["scope_status"] == "READY_FOR_SCOPE_REVIEW"
+    store.close()
+
+
+def test_background_worker_renews_research_stage_lease_during_long_execution(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    analysis = ProgramAnalysisRepository(store).save(
+        analyze_program("https://example.com/policy", json.dumps(scope_payload())),
+        owner_user_id="legacy-owner",
+    )
+    stage = ResearchStageRepository(store).create(
+        analysis.analysis_id,
+        ResearchStageType.PROGRAM_ANALYSIS,
+        owner_user_id="legacy-owner",
+        budget=StageBudget(max_items=1, timeout_seconds=5, max_output_bytes=1_000),
+    )
+
+    class SlowStageExecutor:
+        def execute(self, _stage: object, _analysis: object) -> StageExecutionOutcome:
+            time.sleep(1.4)
+            return StageExecutionOutcome(ResearchStageStatus.COMPLETED.value, {"ok": True}, {})
+
+    worker = BackgroundWorker(
+        service.orchestrator,
+        worker_id="stage-worker-renewal",
+        lease_ttl_seconds=1,
+        heartbeat_interval_seconds=0.1,
+        stage_executor=SlowStageExecutor(),  # type: ignore[arg-type]
+    )
+    result = worker.run_once()
+    assert result["status"] == "STAGE_COMPLETED"
+    persisted = ResearchStageRepository(store).get(stage.stage_id, owner_user_id="legacy-owner")
+    assert persisted is not None and persisted.stage_status == ResearchStageStatus.COMPLETED.value
     store.close()
 
 

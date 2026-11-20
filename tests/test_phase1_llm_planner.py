@@ -67,7 +67,8 @@ def provider_with_handler(handler, *, api_key: str = "test-secret", **overrides)
 def test_gemini_provider_returns_structured_json_and_sends_prompt_and_schema() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
-        assert request.url.params["key"] == "test-secret"
+        assert "key" not in request.url.params
+        assert request.headers["x-goog-api-key"] == "test-secret"
         body = json.loads(request.content)
         assert body["systemInstruction"]["parts"][0]["text"] == "system"
         assert body["contents"][0]["parts"][0]["text"] == "user"

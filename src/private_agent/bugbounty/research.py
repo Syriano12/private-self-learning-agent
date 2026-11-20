@@ -208,6 +208,7 @@ class ResearchStageRepository:
         expires_at = self._lease_deadline(lease_ttl_seconds)
         lease_id = "STAGELEASE-" + uuid.uuid4().hex
         with self.store._db_lock:
+            self.store.assert_worker_claim_allowed()
             self.store.db.execute("BEGIN IMMEDIATE")
             try:
                 self.store.db.execute(
@@ -272,6 +273,35 @@ class ResearchStageRepository:
             "lease_acquired_at": acquired_at,
             "lease_expires_at": expires_at,
         }
+
+    def renew_claim(self, claim: Mapping[str, Any], *, lease_ttl_seconds: int) -> bool:
+        """Extend one running stage lease without weakening its fencing."""
+        stage_id = str(claim.get("stage_id", ""))
+        owner = str(claim.get("owner_user_id", ""))
+        lease_id = str(claim.get("lease_id", ""))
+        worker_id = str(claim.get("worker_id", ""))
+        if not stage_id or not owner or not lease_id or not worker_id:
+            return False
+        now = utc_now()
+        expires_at = self._lease_deadline(lease_ttl_seconds)
+        with self.store._db_lock, self.store.db:
+            cursor = self.store.db.execute(
+                """UPDATE bugbounty_research_stages
+                   SET lease_expires_at = ?, updated_at = ?
+                   WHERE stage_id = ? AND owner_user_id = ? AND stage_status = ?
+                     AND lease_id = ? AND worker_id = ? AND lease_expires_at > ?""",
+                (
+                    expires_at,
+                    now,
+                    stage_id,
+                    owner,
+                    ResearchStageStatus.RUNNING.value,
+                    lease_id,
+                    worker_id,
+                    now,
+                ),
+            )
+            return cursor.rowcount == 1
 
     @staticmethod
     def _bounded_payload(value: Mapping[str, Any] | None, *, max_bytes: int, name: str) -> dict[str, Any]:

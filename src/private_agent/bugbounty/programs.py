@@ -1,9 +1,10 @@
 """Bounded, review-only program analysis for authorized security work.
 
-This module never fetches a program URL and never treats caller supplied policy
-text as authorization. It canonicalizes the submitted source, hashes the
-bounded policy evidence, and produces a proposal that must still be reviewed
-and submitted through the existing scope and approval boundaries.
+Local analysis never fetches a program URL. An explicit public-policy opt-in is
+restricted to the allowlisted passive adapter and still never treats public
+text as authorization. The module canonicalizes source identity, hashes
+bounded policy evidence, and produces proposals that must be reviewed and
+submitted through the existing scope and approval boundaries.
 """
 from __future__ import annotations
 
@@ -11,23 +12,110 @@ import hashlib
 import json
 import re
 import sqlite3
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse, urlunparse
 
 from .models import ScopeDefinition, safe_json, stable_digest, utc_now, public_reference
+from .passive_research import PassiveResearchAdapter, normalize_passive_source_requests
 
 MAX_PROGRAM_URL_LENGTH = 2048
 MAX_POLICY_BYTES = 128_000
 MAX_POLICY_LINES = 2_000
 MAX_ASSETS = 100
+MAX_PUBLIC_POLICY_HOSTS = 100
+_PUBLIC_POLICY_HOST_RE = re.compile(
+    r"(?i)(?<![@a-z0-9-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?![a-z0-9-])"
+)
 
 
 class ProgramAnalysisStatus(str):
     READY_FOR_SCOPE_REVIEW = "READY_FOR_SCOPE_REVIEW"
     REVIEW_REQUIRED = "REVIEW_REQUIRED"
+
+
+def _public_policy_observations(policy_text: str) -> dict[str, Any]:
+    """Derive bounded, explicitly untrusted observations from public text."""
+    hosts = sorted({match.lower().rstrip(".") for match in _PUBLIC_POLICY_HOST_RE.findall(policy_text)})
+    marker_patterns = {
+        "in_scope": r"\b(?:in[ -]scope|scope|eligible)\b",
+        "out_of_scope": r"\b(?:out[ -]of[ -]scope|excluded|not[ -]in[ -]scope)\b",
+        "methods_or_testing": r"\b(?:method|testing|rate[ -]limit|prohibited|restricted)\b",
+    }
+    markers = sorted(name for name, pattern in marker_patterns.items() if re.search(pattern, policy_text, flags=re.IGNORECASE))
+    return {
+        "kind": "PUBLIC_POLICY_OBSERVATIONS",
+        "candidate_hosts": hosts[:MAX_PUBLIC_POLICY_HOSTS],
+        "scope_markers": markers,
+        "authorization_derived": False,
+        "scope_proposal_source": "untrusted_public_text",
+    }
+
+
+@dataclass(frozen=True)
+class PublicPolicyEvidence:
+    source_type: str
+    canonical_url: str
+    content: str
+    content_sha256: str
+    content_length: int
+    status_code: int
+    retrieved_at: str
+    observations: dict[str, Any]
+
+
+class PublicPolicyRetriever:
+    """Fetch only the explicitly supported public policy page shape.
+
+    This is a provenance helper, not an authorization provider. The adapter is
+    intentionally restricted to the existing ``hackerone_program`` allowlist;
+    authenticated APIs and arbitrary program URLs are not accepted.
+    """
+
+    def __init__(self, adapter: PassiveResearchAdapter | None = None) -> None:
+        self.adapter = adapter or PassiveResearchAdapter()
+
+    def retrieve(self, program_url: str) -> PublicPolicyEvidence:
+        normalized = normalize_passive_source_requests(
+            {"sources": [{"source_type": "hackerone_program", "url": program_url}]}
+        )
+        result = self.adapter.collect(normalized, max_items=1, max_output_bytes=32_000)
+        retrievals = result.get("retrievals") if isinstance(result, Mapping) else None
+        if not isinstance(retrievals, list) or not retrievals or not isinstance(retrievals[0], Mapping):
+            raise ValueError("public_policy_unavailable")
+        record = retrievals[0]
+        status_code = record.get("status_code")
+        content = record.get("text_excerpt")
+        if type(status_code) is not int or not 200 <= status_code < 300:
+            raise ValueError("public_policy_unavailable")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("public_policy_empty")
+        digest = record.get("content_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError("public_policy_digest_missing")
+        retrieved_at = record.get("retrieved_at")
+        return PublicPolicyEvidence(
+            source_type="hackerone_program",
+            canonical_url=str(record.get("source_url", normalized[0]["url"])),
+            content=content,
+            content_sha256=digest,
+            content_length=len(content.encode("utf-8")),
+            status_code=status_code,
+            retrieved_at=str(retrieved_at or utc_now()),
+            observations={
+                **_public_policy_observations(content),
+                "retrieval": {
+                    "status_code": status_code,
+                    "content_sha256": digest,
+                    "content_length": len(content.encode("utf-8")),
+                    "retrieved_at": str(retrieved_at or utc_now()),
+                    "adapter": "hackerone_program",
+                    "authorization_basis": "public_source_only",
+                },
+            },
+        )
 
 
 def _bounded_text(value: Any, *, limit: int, name: str) -> str:
@@ -185,6 +273,7 @@ class ProgramAnalysis:
     ambiguities: tuple[str, ...]
     limitations: tuple[str, ...]
     created_at: str
+    observations: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, *, public: bool = True) -> dict[str, Any]:
         scope = safe_json(self.scope_proposal) if self.scope_proposal is not None else None
@@ -200,10 +289,19 @@ class ProgramAnalysis:
             "ambiguities": list(self.ambiguities),
             "limitations": list(self.limitations),
             "created_at": self.created_at,
+            "observations": safe_json(self.observations),
         }
 
 
-def analyze_program(program_url: str, policy_text: str, *, source_type: str = "user_provided_policy", now: datetime | None = None) -> ProgramAnalysis:
+def analyze_program(
+    program_url: str,
+    policy_text: str,
+    *,
+    source_type: str = "user_provided_policy",
+    now: datetime | None = None,
+    fetched_automatically: bool = False,
+    observations: Mapping[str, Any] | None = None,
+) -> ProgramAnalysis:
     canonical_url = canonical_program_url(program_url)
     policy = _bounded_text(policy_text, limit=MAX_POLICY_BYTES, name="policy_text") if policy_text else ""
     retrieved_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
@@ -215,7 +313,11 @@ def analyze_program(program_url: str, policy_text: str, *, source_type: str = "u
         content_length=len(policy.encode("utf-8")),
     )
     if not policy:
-        return ProgramAnalysis("", canonical_url, source, ProgramAnalysisStatus.REVIEW_REQUIRED, None, (), ("policy_evidence_required",), ("program_url_not_fetched_automatically",), retrieved_at)
+        return ProgramAnalysis(
+            "", canonical_url, source, ProgramAnalysisStatus.REVIEW_REQUIRED, None, (),
+            ("policy_evidence_required",), ("program_url_not_fetched_automatically",), retrieved_at,
+            safe_json(observations or {}),
+        )
     scope_payload, json_limits = _parse_scope_json(policy)
     if scope_payload is None:
         line_scope, line_limits = _parse_line_policy(policy)
@@ -226,6 +328,12 @@ def analyze_program(program_url: str, policy_text: str, *, source_type: str = "u
     ambiguities: list[str] = []
     exclusions: tuple[str, ...] = ()
     proposal: dict[str, Any] | None = None
+    derived_observations = safe_json(observations or {})
+    if source_type == "hackerone_program":
+        derived_observations = {
+            **_public_policy_observations(policy),
+            **(derived_observations if isinstance(derived_observations, Mapping) else {}),
+        }
     if scope_payload is not None:
         try:
             scope = ScopeDefinition.from_dict(scope_payload, now=now)
@@ -236,9 +344,15 @@ def analyze_program(program_url: str, policy_text: str, *, source_type: str = "u
     if proposal is None:
         ambiguities.extend(limitations or ["scope_not_compiled"])
     status = ProgramAnalysisStatus.READY_FOR_SCOPE_REVIEW if proposal is not None and not ambiguities else ProgramAnalysisStatus.REVIEW_REQUIRED
-    if "program_url_not_fetched_automatically" not in limitations:
+    if fetched_automatically:
+        limitations.extend(("public_policy_excerpt_bounded", "public_policy_not_authorization"))
+    elif "program_url_not_fetched_automatically" not in limitations:
         limitations.append("program_url_not_fetched_automatically")
-    return ProgramAnalysis("", canonical_url, source, status, proposal, exclusions, tuple(sorted(set(ambiguities))), tuple(sorted(set(limitations))), retrieved_at)
+    return ProgramAnalysis(
+        "", canonical_url, source, status, proposal, exclusions,
+        tuple(sorted(set(ambiguities))), tuple(sorted(set(limitations))), retrieved_at,
+        derived_observations,
+    )
 
 
 class ProgramAnalysisRepository:

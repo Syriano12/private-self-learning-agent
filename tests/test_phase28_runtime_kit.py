@@ -22,6 +22,33 @@ def test_current_or_missing_runtime_is_reported_without_claiming_isolation() -> 
     assert report.can_run_acceptance is False
 
 
+def test_android_termux_host_is_not_accepted_for_scanner_isolation() -> None:
+    report = run_host_preflight(
+        which=lambda _name: None,
+        environment={"PREFIX": "/data/data/com.termux/files/usr", "TERMUX_VERSION": "0.118"},
+    )
+
+    assert report.check("host_platform").status is HostPreflightStatus.FAIL
+    assert report.check("host_platform").detail == "android_termux_scanner_runtime_unverified"
+    assert report.host_ready is False
+    assert report.can_run_acceptance is False
+
+
+def test_zero_disk_stat_on_termux_is_inconclusive_not_proof_of_full_storage() -> None:
+    report = run_host_preflight(
+        which=lambda _name: None,
+        environment={"PREFIX": "/data/data/com.termux/files/usr", "TERMUX_VERSION": "0.118"},
+        statvfs=lambda _path: SimpleNamespace(f_bavail=0, f_frsize=4096),
+    )
+
+    disk = report.check("disk_space")
+    assert disk.status is HostPreflightStatus.INCONCLUSIVE
+    assert disk.detail == "disk_stat_zero_on_android_termux"
+    assert disk.evidence["available_bytes"] == 0
+    assert report.host_ready is False
+    assert report.can_run_acceptance is False
+
+
 def test_runtime_presence_alone_is_not_a_pass() -> None:
     responses = iter(
         [

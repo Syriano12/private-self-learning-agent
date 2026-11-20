@@ -35,6 +35,7 @@ _ACCEPTANCE_RUNNABLE_STATUSES = frozenset(
 _HOST_REQUIRED_CHECKS = frozenset(
     {
         "os_kernel",
+        "host_platform",
         "oci_runtime",
         "user_namespaces",
         "subordinate_ids",
@@ -144,11 +145,14 @@ def run_host_preflight(
     run: Callable[..., Any] = subprocess.run,
     read_text: Callable[[str], str] | None = None,
     root_path: str = "/",
+    environment: Mapping[str, str] | None = None,
+    statvfs: Callable[[str], Any] = os.statvfs,
 ) -> HostPreflightReport:
     """Collect bounded, read-only host checks without provisioning anything."""
     read = read_text or _read_text
     checks: list[HostPreflightCheck] = []
     checks.append(_check_os_kernel())
+    checks.append(_check_host_platform(environment or os.environ))
 
     runtime_path = which(runtime_name)
     runtime_check, runtime_info = _check_runtime(runtime_name, runtime_path, run)
@@ -161,9 +165,27 @@ def run_host_preflight(
     checks.append(_check_filesystem(runtime_path, read))
     checks.append(_check_network_isolation(runtime_path, runtime_info))
     checks.append(_check_process_cleanup())
-    checks.append(_check_disk(root_path))
+    checks.append(_check_disk(root_path, environment or os.environ, statvfs))
     checks.append(_check_memory(read))
     return HostPreflightReport(tuple(checks))
+
+
+def _check_host_platform(environment: Mapping[str, str]) -> HostPreflightCheck:
+    if _is_android_termux(environment):
+        android_root = str(environment.get("ANDROID_ROOT", ""))
+        return HostPreflightCheck(
+            "host_platform",
+            HostPreflightStatus.FAIL,
+            "android_termux_scanner_runtime_unverified",
+            {"platform": "android_termux", "android_root_present": bool(android_root)},
+        )
+    return HostPreflightCheck("host_platform", HostPreflightStatus.PASS, "supported_linux_host_profile")
+
+
+def _is_android_termux(environment: Mapping[str, str]) -> bool:
+    prefix = str(environment.get("PREFIX", ""))
+    termux_version = str(environment.get("TERMUX_VERSION", ""))
+    return bool(termux_version or "/com.termux/" in prefix or prefix.startswith("/data/data/com.termux/"))
 
 
 def _check_os_kernel() -> HostPreflightCheck:
@@ -320,11 +342,19 @@ def _check_process_cleanup() -> HostPreflightCheck:
     return HostPreflightCheck("process_cleanup", HostPreflightStatus.FAIL, "process_group_termination_unavailable")
 
 
-def _check_disk(root_path: str) -> HostPreflightCheck:
+def _check_disk(root_path: str, environment: Mapping[str, str], statvfs: Callable[[str], Any]) -> HostPreflightCheck:
     try:
-        available = int(os.statvfs(root_path).f_bavail * os.statvfs(root_path).f_frsize)
-    except OSError:
+        stat = statvfs(root_path)
+        available = int(stat.f_bavail * stat.f_frsize)
+    except (OSError, AttributeError, TypeError, ValueError):
         return HostPreflightCheck("disk_space", HostPreflightStatus.INCONCLUSIVE, "disk_stat_unavailable")
+    if available == 0 and _is_android_termux(environment):
+        return HostPreflightCheck(
+            "disk_space",
+            HostPreflightStatus.INCONCLUSIVE,
+            "disk_stat_zero_on_android_termux",
+            {"available_bytes": available},
+        )
     status = HostPreflightStatus.PASS if available >= _MIN_DISK_BYTES else HostPreflightStatus.FAIL
     return HostPreflightCheck("disk_space", status, "disk_space_sufficient" if status is HostPreflightStatus.PASS else "disk_space_low", {"available_bytes": available})
 

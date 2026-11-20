@@ -141,6 +141,7 @@ class ScopeDecision(str, Enum):
     DENIED = "DENIED"
     AMBIGUOUS = "AMBIGUOUS"
     EXPIRED = "EXPIRED"
+    NOT_YET_ACTIVE = "NOT_YET_ACTIVE"
 
 
 class PolicyDecision(str, Enum):
@@ -261,6 +262,8 @@ class ScopeDefinition:
         now_value = now or datetime.now(timezone.utc)
         if issued.tzinfo is None or expires.tzinfo is None:
             raise ValueError("scope_timestamps_must_be_timezone_aware")
+        if issued > now_value:
+            raise ValueError("scope_not_yet_active")
         if expires <= issued:
             raise ValueError("scope_expiry_invalid")
         if expires <= now_value:
@@ -291,6 +294,8 @@ class ScopeDefinition:
         except ValueError as exc:
             if str(exc) == "scope_expired":
                 return ScopeDecision.EXPIRED, str(exc)
+            if str(exc) == "scope_not_yet_active":
+                return ScopeDecision.NOT_YET_ACTIVE, str(exc)
             return ScopeDecision.AMBIGUOUS, str(exc)
         parsed = urlparse(url)
         if parsed.scheme.lower() not in {"http", "https"}:

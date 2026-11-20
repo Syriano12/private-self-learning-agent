@@ -18,6 +18,7 @@ _IMAGE = "localhost/vulnora-acceptance@sha256:" + "a" * 64
 def _ready_report() -> HostPreflightReport:
     host_names = (
         "os_kernel",
+        "host_platform",
         "oci_runtime",
         "user_namespaces",
         "subordinate_ids",
@@ -52,7 +53,7 @@ def test_required_acceptance_is_runnable_but_not_pass(monkeypatch):
 
 def test_inconclusive_acceptance_check_is_not_runnable():
     checks = list(_ready_report().checks)
-    checks[8] = HostPreflightCheck("seccomp", HostPreflightStatus.INCONCLUSIVE, "unverified")
+    checks[9] = HostPreflightCheck("seccomp", HostPreflightStatus.INCONCLUSIVE, "unverified")
     report = HostPreflightReport(tuple(checks))
 
     assert report.verdict is HostPreflightStatus.INCONCLUSIVE

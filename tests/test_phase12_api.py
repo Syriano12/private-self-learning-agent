@@ -12,6 +12,7 @@ from private_agent.api import AgentAPIService, create_app
 from private_agent.core.orchestrator import Orchestrator, TaskInterrupted
 from private_agent.core.planner import PlanStep, TaskPlan
 from private_agent.observability import ObservabilityMonitor
+from private_agent.bugbounty.remote_worker import RemoteWorkerProtocol
 from private_agent.security import SecurityController
 from private_agent.storage import Store
 from private_agent.tools.contracts import ToolResult
@@ -123,6 +124,24 @@ def auth_headers(*, key: str | None = None) -> dict[str, str]:
     return headers
 
 
+def worker_headers(protocol: RemoteWorkerProtocol, credential: str, *, worker_id: str, method: str, path: str, body: dict, nonce: str) -> dict[str, str]:
+    timestamp = int(protocol.clock().timestamp())
+    return {
+        "Authorization": f"Worker {credential}",
+        "X-Worker-ID": worker_id,
+        "X-Worker-Timestamp": str(timestamp),
+        "X-Worker-Nonce": nonce,
+        "X-Worker-Signature": protocol.sign_request(
+            credential=credential,
+            method=method,
+            path=path,
+            timestamp=timestamp,
+            nonce=nonce,
+            body=body,
+        ),
+    }
+
+
 def create_low_task(client: TestClient, *, key: str = "create-1"):
     response = client.post("/api/v1/tasks", json={"goal": "complete a safe API task"}, headers=auth_headers(key=key))
     assert response.status_code == 201, response.text
@@ -166,6 +185,71 @@ def test_valid_authentication_creates_real_typed_task_response(tmp_path: Path) -
     assert body["schema_version"] == 1
     assert body["request_id"] == response.headers["X-Request-ID"]
     assert store.get_task_state(task_id)["status"] == "QUEUED"
+    store.close()
+
+
+def test_remote_worker_http_protocol_claims_heartbeats_and_persists_sanitized_result(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    protocol = service.remote_worker_protocol
+    worker_id = "api-fixture-worker"
+    credential = protocol.register_worker(
+        worker_id,
+        runtime_identity="podman@5.0.0",
+        image_digest="sha256:" + "a" * 64,
+        manifest_digest="sha256:" + "b" * 64,
+    )
+    job = protocol.enqueue_fixture_job(worker_id=worker_id, idempotency_key="api-fixture-job", fixture_name="safe")
+    client = client_for(service)
+
+    claim_path = "/api/v1/worker/jobs/claim"
+    claim = client.post(
+        claim_path,
+        json={},
+        headers=worker_headers(protocol, credential, worker_id=worker_id, method="POST", path=claim_path, body={}, nonce="api-claim"),
+    )
+    assert claim.status_code == 200, claim.text
+    envelope = claim.json()
+    assert envelope["job_id"] == job["job_id"]
+    assert credential not in claim.text
+
+    heartbeat_path = f"/api/v1/worker/jobs/{job['job_id']}/heartbeat"
+    heartbeat_body = {"job_id": job["job_id"], "lease_id": envelope["lease_id"]}
+    heartbeat = client.post(
+        heartbeat_path,
+        json=heartbeat_body,
+        headers=worker_headers(protocol, credential, worker_id=worker_id, method="POST", path=heartbeat_path, body=heartbeat_body, nonce="api-heartbeat"),
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    assert heartbeat.json()["status"] == "LEASED"
+
+    result_path = f"/api/v1/worker/jobs/{job['job_id']}/result"
+    result_body = {
+        "job_id": job["job_id"],
+        "lease_id": envelope["lease_id"],
+        "result": {
+            "status": "COMPLETED",
+            "observations": [{"name": "safe_fixture"}],
+            "candidate_findings": [{"title": "candidate"}],
+            "notes": "Cookie: should-not-persist",
+        },
+    }
+    result = client.post(
+        result_path,
+        json=result_body,
+        headers=worker_headers(protocol, credential, worker_id=worker_id, method="POST", path=result_path, body=result_body, nonce="api-result"),
+    )
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "COMPLETED"
+    assert "should-not-persist" not in result.text
+    assert result.json()["result"]["finding_confirmation_allowed"] is False
+
+    replay = client.post(
+        claim_path,
+        json={},
+        headers=worker_headers(protocol, credential, worker_id=worker_id, method="POST", path=claim_path, body={}, nonce="api-claim"),
+    )
+    assert replay.status_code == 409
+    assert replay.json()["error_code"] == "http_error"
     store.close()
 
 
@@ -483,4 +567,30 @@ def test_public_api_does_not_expose_cancel_or_skill_activation_as_fake_operation
     assert response.status_code in {404, 405}
     skill = client.post("/api/v1/skills/demo/activate", json={}, headers=auth_headers())
     assert skill.status_code == 404
+    store.close()
+
+
+def test_runtime_preflight_is_read_only_and_reports_blocked_scanner_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from private_agent.skills.runtime_preflight import HostPreflightCheck, HostPreflightReport, HostPreflightStatus
+
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    client = client_for(service)
+    report = HostPreflightReport(
+        (
+            HostPreflightCheck("oci_runtime", HostPreflightStatus.FAIL, "runtime_missing"),
+        )
+    )
+    import private_agent.api as api_module
+
+    monkeypatch.setattr(api_module, "run_host_preflight", lambda: report, raising=False)
+    assert client.get("/api/v1/runtime/preflight").status_code == 401
+    response = client.get("/api/v1/runtime/preflight", headers=auth_headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["verdict"] == "FAIL"
+    assert body["host_ready"] is False
+    assert body["can_run_acceptance"] is False
+    assert body["runtime_identity"] is None
+    assert body["checks"] == [{"name": "oci_runtime", "status": "FAIL", "detail": "runtime_missing"}]
+    assert "evidence" not in response.text
     store.close()

@@ -276,6 +276,22 @@ termux-wake-unlock
 - الأداء والحرارة والبطارية والتخزين المتاح.
 - نجاح نقل التعديلات المحلية غير المنشورة إلى الهاتف.
 
+### تفسير `disk_space` على Android
+
+إذا أظهر `runtime-preflight` `available_bytes=0` داخل Termux، فلا يكفي ذلك وحده لإثبات امتلاء التخزين؛ قد يكون قياس `statvfs` غير حاسم على mount/بيئة Android. يصنّف preflight هذه الحالة كـ`INCONCLUSIVE` عند اكتشاف Termux، وتبقى `host_ready=false` وscanner محجوبة. لا يحول ذلك الحالة إلى نجاح.
+
+لتمييز السبب على الهاتف دون تعديل النظام، قارن ناتج الأمرين التاليين:
+
+```sh
+df -k "$PREFIX"
+```
+
+```sh
+python -c 'import os; s=os.statvfs("/"); print({"f_bavail": s.f_bavail, "f_frsize": s.f_frsize, "available_bytes": s.f_bavail*s.f_frsize})'
+```
+
+إذا أظهر `df` مساحة متاحة موجبة بينما بقي `statvfs` صفراً، فهذا دليل على limitation في القياس لا على امتلاء المساحة. إذا أظهر كلاهما صفراً، فتعامل مع التخزين كعائق فعلي. في الحالتين لا يصبح الهاتف scanner host صالحًا؛ يبقى `host_platform` وغياب runtime isolation بوابة حجب مستقلة.
+
 Android يفرض قيودًا على خدمات الخلفية، وTermux الرسمي يحذر من عدم الاستقرار على Android 12+ ومن قتل العمليات الوهمية أو العمليات التي تستهلك CPU بكثرة. لذلك هذا تشغيل محلي أثناء بقاء الهاتف وTermux متاحين، وليس خدمة 24/7 مضمونة.
 
 ## حدود الأمان
@@ -287,6 +303,7 @@ Android يفرض قيودًا على خدمات الخلفية، وTermux الر
 - لا تشغّل `runtime-preflight` باعتباره إثباتًا لوجود scanner sandbox، ولا تحاول تثبيت أو تشغيل Podman/rootless runtime على Termux كمسار تجاوز.
 - لا تشغّل httpx أو Nuclei أو أي executable غير موثوق. Public scanner adapters يجب أن تبقى `UNAVAILABLE` عند غياب external sandbox verified.
 - SQLite والبيانات تبقى داخل مساحة Termux الخاصة، وليست متاحة تلقائيًا لتطبيقات Android الأخرى.
+- عند تشغيل `runtime-preflight` داخل Termux سيظهر check باسم `host_platform` بحالة `FAIL` وتفصيل `android_termux_scanner_runtime_unverified`. هذا كشف سلطوي لحالة المضيف، وليس إثباتًا بأن Podman أو sandbox متوفران.
 
 ## أول خطوة للمستخدم
 

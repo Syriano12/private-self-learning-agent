@@ -515,6 +515,7 @@ def test_f03_private_verified_claim_override_is_not_available(tmp_path: Path) ->
     assert saved.status == "PROPOSED"
     assert store.search_knowledge_claims("caller asserted verified fact") == []
     assert saved_source.source_id == source.source_id
+    store.db.commit()
     store.close()
 
 

@@ -13,7 +13,7 @@ from private_agent.core.task_state import TaskState
 from private_agent.bugbounty.programs import ProgramAnalysisRepository
 from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus
 from private_agent.bugbounty.stage_execution import ResearchStageExecutor, StageExecutionOutcome
-from private_agent.storage import QueueLeaseLost, Store
+from private_agent.storage import QueueLeaseLost, Store, StoreClosingError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -46,20 +46,27 @@ class _LeaseHeartbeat:
     def cleanup_stuck(self) -> bool:
         return self._cleanup_stuck
 
+    @property
+    def is_alive(self) -> bool:
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (self._renew_thread, self._watchdog_thread)
+        )
+
     def start(self) -> None:
         self._renew_thread = threading.Thread(target=self._run, name="agent-lease-heartbeat", daemon=True)
         self._watchdog_thread = threading.Thread(target=self._watchdog, name="agent-lease-watchdog", daemon=True)
         self._renew_thread.start()
         self._watchdog_thread.start()
 
-    def stop(self) -> bool:
+    def stop(self, *, wait_forever: bool = False) -> bool:
         """Request shutdown and report whether all heartbeat threads actually stopped."""
         self._stop.set()
-        deadline = time.monotonic() + max(2.0, self.interval_seconds * 2.0 + 1.0)
+        deadline = None if wait_forever else time.monotonic() + max(2.0, self.interval_seconds * 2.0 + 1.0)
         for thread in (self._renew_thread, self._watchdog_thread):
             if thread is None:
                 continue
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(timeout=remaining)
         self._cleanup_stuck = any(
             thread is not None and thread.is_alive()
@@ -127,6 +134,61 @@ class _LeaseHeartbeat:
                 watchdog_store.close()
 
 
+class _ResearchStageLeaseLost(ValueError):
+    pass
+
+
+class _ResearchStageLeaseHeartbeat:
+    """Renew a claimed research stage without sharing SQLite connections."""
+
+    def __init__(self, store: Store, claim: dict[str, Any], *, interval_seconds: float, lease_ttl_seconds: int) -> None:
+        self.store = store
+        self.claim = claim
+        self.interval_seconds = float(interval_seconds)
+        self.lease_ttl_seconds = int(lease_ttl_seconds)
+        self.lost = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="agent-stage-lease-heartbeat", daemon=True)
+        self._thread.start()
+
+    def stop(self, *, wait_forever: bool = False) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            timeout = None if wait_forever else max(2.0, self.interval_seconds * 2.0 + 1.0)
+            self._thread.join(timeout=timeout)
+        return not self.is_alive
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def raise_if_lost(self) -> None:
+        if not self.lost.is_set():
+            return
+        raise _ResearchStageLeaseLost("stage_lease_heartbeat_failed") from self._error
+
+    def _run(self) -> None:
+        heartbeat_store: Store | None = None
+        try:
+            heartbeat_store = Store(self.store.path)
+            repository = ResearchStageRepository(heartbeat_store)
+            while not self._stop.wait(self.interval_seconds):
+                if not repository.renew_claim(self.claim, lease_ttl_seconds=self.lease_ttl_seconds):
+                    self._error = _ResearchStageLeaseLost("stage_lease_renewal_failed")
+                    self.lost.set()
+                    return
+        except BaseException as exc:
+            self._error = exc
+            self.lost.set()
+        finally:
+            if heartbeat_store is not None:
+                heartbeat_store.close()
+
+
 class BackgroundWorker:
     """Controlled durable worker with one loop per instance.
 
@@ -183,8 +245,12 @@ class BackgroundWorker:
         self.event_logger = event_logger
         self._stop_event = threading.Event()
         self._lifecycle_lock = threading.Lock()
+        self._lifecycle = threading.Condition(self._lifecycle_lock)
         self._running = False
         self._loop_thread: threading.Thread | None = None
+        self._active_run_once = 0
+        self._heartbeat_lock = threading.Lock()
+        self._active_heartbeats: set[Any] = set()
         self._last_report: dict[str, Any] | None = None
         self._fatal_error: BaseException | None = None
 
@@ -217,36 +283,108 @@ class BackgroundWorker:
         with self._lifecycle_lock:
             if self._running:
                 raise RuntimeError("worker_already_running")
+            if self._active_run_once:
+                raise RuntimeError("worker_run_once_active")
+            if self._loop_thread is not None and self._loop_thread.is_alive():
+                raise RuntimeError("worker_already_running")
+            self._loop_thread = None
             self._stop_event.clear()
             self._fatal_error = None
             self._running = True
             thread = threading.Thread(
-                target=self._run_loop,
+                target=self._run_registered_loop,
                 args=(stop_event,),
                 name=f"agent-worker-{self.worker_id}",
                 daemon=daemon,
             )
             self._loop_thread = thread
+            try:
+                self.store.register_background_worker(self)
+            except BaseException:
+                self._running = False
+                self._loop_thread = None
+                raise
         try:
             thread.start()
         except BaseException:
-            with self._lifecycle_lock:
+            with self._lifecycle:
                 self._running = False
                 self._loop_thread = None
+                self._lifecycle.notify_all()
+            self.store.unregister_background_worker(self)
             raise
+        with self._lifecycle:
+            self._lifecycle.notify_all()
         return thread
 
-    def stop(self, *, timeout: float = 5.0) -> bool:
-        """Request cooperative shutdown and wait for at most ``timeout`` seconds."""
-        if timeout < 0:
-            raise ValueError("shutdown_timeout_invalid")
+    def request_stop(self) -> None:
+        """Set the cooperative stop signal without waiting for active work."""
         self._stop_event.set()
-        with self._lifecycle_lock:
+
+    def join(self, *, timeout: float | None = 5.0) -> bool:
+        """Wait for the actual worker thread; ``None`` means drain without a deadline."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("shutdown_timeout_invalid")
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        with self._lifecycle:
             thread = self._loop_thread
-        if thread is None or thread is threading.current_thread():
-            return not self.running
-        thread.join(timeout=float(timeout))
-        return not thread.is_alive()
+            if thread is threading.current_thread():
+                return False
+            while thread is not None and thread.ident is None:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._lifecycle.wait(timeout=remaining)
+                thread = self._loop_thread
+        if thread is not None:
+            thread.join(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                return False
+        with self._lifecycle:
+            while self._active_run_once:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._lifecycle.wait(timeout=remaining)
+            if thread is not None and self._loop_thread is thread:
+                self._loop_thread = None
+            return not self._running
+
+    def stop(self, *, timeout: float | None = 5.0) -> bool:
+        """Request cooperative shutdown and wait for at most ``timeout`` seconds."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("shutdown_timeout_invalid")
+        self.request_stop()
+        return self.join(timeout=timeout)
+
+    def _track_heartbeat(self, heartbeat: Any) -> None:
+        with self._heartbeat_lock:
+            self._active_heartbeats.add(heartbeat)
+
+    def _untrack_heartbeat(self, heartbeat: Any) -> None:
+        with self._heartbeat_lock:
+            self._active_heartbeats.discard(heartbeat)
+
+    def _drain_heartbeats(self) -> None:
+        while True:
+            with self._heartbeat_lock:
+                active = tuple(self._active_heartbeats)
+            if not active:
+                return
+            for heartbeat in active:
+                heartbeat.stop(wait_forever=True)
+                if not heartbeat.is_alive:
+                    self._untrack_heartbeat(heartbeat)
+
+    def _run_registered_loop(self, external_stop_event: threading.Event | None) -> dict[str, Any]:
+        self.store.enter_background_worker(self)
+        try:
+            return self._run_loop(external_stop_event)
+        finally:
+            try:
+                self._drain_heartbeats()
+            finally:
+                self.store.leave_background_worker(self)
 
     def run_forever(self, *, stop_event: threading.Event | None = None) -> dict[str, Any]:
         """Run until stopped, returning a serializable lifecycle report.
@@ -257,11 +395,39 @@ class BackgroundWorker:
         with self._lifecycle_lock:
             if self._running:
                 raise RuntimeError("worker_already_running")
+            if self._active_run_once:
+                raise RuntimeError("worker_run_once_active")
+            if self._loop_thread is not None and self._loop_thread.is_alive():
+                raise RuntimeError("worker_already_running")
+            self._loop_thread = None
             self._stop_event.clear()
             self._fatal_error = None
             self._running = True
             self._loop_thread = threading.current_thread()
-        return self._run_loop(stop_event)
+            try:
+                self.store.register_background_worker(self)
+            except BaseException:
+                self._running = False
+                self._loop_thread = None
+                raise
+        try:
+            self.store.enter_background_worker(self)
+        except BaseException:
+            self.store.unregister_background_worker(self)
+            with self._lifecycle_lock:
+                self._running = False
+                self._loop_thread = None
+            raise
+        try:
+            return self._run_loop(stop_event)
+        finally:
+            try:
+                self._drain_heartbeats()
+            finally:
+                self.store.leave_background_worker(self)
+                with self._lifecycle_lock:
+                    if self._loop_thread is threading.current_thread():
+                        self._loop_thread = None
 
     def _run_loop(self, external_stop_event: threading.Event | None) -> dict[str, Any]:
         report: dict[str, Any] = {
@@ -295,6 +461,10 @@ class BackgroundWorker:
                     if self._wait_for(self.error_backoff_seconds, external_stop_event):
                         break
                     continue
+                except StoreClosingError:
+                    if self._stop_requested(external_stop_event) or self.store.closing:
+                        break
+                    raise
                 except BaseException as exc:
                     report["status"] = "FATAL"
                     report["fatal_error_type"] = type(exc).__name__
@@ -331,6 +501,9 @@ class BackgroundWorker:
                         error_code=str(result.get("error_code", "")),
                     )
                     delay = self.poll_interval_seconds
+                if self.store.closing:
+                    self._emit_event("worker_store_closing")
+                    break
                 if self._wait_for(delay, external_stop_event):
                     break
             report["status"] = "STOPPED"
@@ -341,11 +514,14 @@ class BackgroundWorker:
             with self._lifecycle_lock:
                 self._last_report = dict(report)
                 self._running = False
-                self._loop_thread = None
             self._emit_event("worker_stopped", status=str(report["status"]))
 
     def _stop_requested(self, external_stop_event: threading.Event | None) -> bool:
-        return self._stop_event.is_set() or bool(external_stop_event is not None and external_stop_event.is_set())
+        return (
+            self._stop_event.is_set()
+            or bool(external_stop_event is not None and external_stop_event.is_set())
+            or self.store.closing
+        )
 
     def _wait_for(self, delay: float, external_stop_event: threading.Event | None) -> bool:
         delay = max(0.0, float(delay))
@@ -383,6 +559,24 @@ class BackgroundWorker:
 
     def run_once(self) -> dict[str, Any]:
         """Claim and process at most one task, returning a serializable result."""
+        with self._lifecycle:
+            if self._active_run_once:
+                raise RuntimeError("worker_run_once_already_active")
+            if self._running and self._loop_thread is not threading.current_thread():
+                raise RuntimeError("worker_already_running")
+            self._active_run_once += 1
+        try:
+            with self.store.background_worker_operation(self):
+                return self._run_once()
+        finally:
+            with self._lifecycle:
+                self._active_run_once -= 1
+                self._lifecycle.notify_all()
+
+    def _run_once(self) -> dict[str, Any]:
+        """Execute one task while the caller owns a Store lifecycle registration."""
+        if self.store.closing:
+            return {"status": "STOPPED", "processed": False, "task_id": ""}
         self._reconcile_approved_waiting_tasks()
         claim = self.store.claim_next_task(
             self.worker_id,
@@ -435,6 +629,7 @@ class BackgroundWorker:
             interval_seconds=self.heartbeat_interval_seconds,
             max_execution_age_seconds=self.max_execution_age_seconds,
         )
+        self._track_heartbeat(heartbeat)
         heartbeat.start()
         result: dict[str, Any] | None = None
         try:
@@ -443,6 +638,8 @@ class BackgroundWorker:
             if not heartbeat.stop() and result is not None:
                 result["heartbeat_cleanup"] = "stuck"
                 result["heartbeat_stuck"] = True
+            if not heartbeat.is_alive:
+                self._untrack_heartbeat(heartbeat)
         if result is None:
             raise RuntimeError("worker_result_missing")
         return result
@@ -475,6 +672,14 @@ class BackgroundWorker:
             is_owner=True,
         )
         started = time.monotonic()
+        stage_heartbeat = _ResearchStageLeaseHeartbeat(
+            self.store,
+            claim,
+            interval_seconds=min(self.heartbeat_interval_seconds, max(0.05, self.lease_ttl_seconds / 3.0)),
+            lease_ttl_seconds=self.lease_ttl_seconds,
+        )
+        self._track_heartbeat(stage_heartbeat)
+        stage_heartbeat.start()
         try:
             outcome = self.stage_executor.execute(stage, analysis)
             if time.monotonic() - started > stage.budget.timeout_seconds:
@@ -485,6 +690,7 @@ class BackgroundWorker:
                     "stage_timeout",
                     "Stage exceeded its bounded execution time",
                 )
+            stage_heartbeat.raise_if_lost()
             finished = self.research_stages.finish_claim(
                 claim,
                 outcome.status,
@@ -493,6 +699,15 @@ class BackgroundWorker:
                 error_code=outcome.error_code,
                 error_message=outcome.error_message,
             )
+        except _ResearchStageLeaseLost:
+            self.research_stages.mark_unknown_if_owned(claim, reason="stage_lease_heartbeat_failed")
+            return {
+                "status": "STAGE_LEASE_LOST",
+                "processed": False,
+                "task_id": "",
+                "stage_id": stage_id,
+                "error_code": "stage_lease_heartbeat_failed",
+            }
         except ValueError as exc:
             if str(exc) == "stage_lease_lost":
                 self.research_stages.mark_unknown_if_owned(claim, reason="stage_lease_lost")
@@ -522,6 +737,10 @@ class BackgroundWorker:
                 "error_code": "stage_worker_failed",
                 "error": str(exc),
             }
+        finally:
+            stage_heartbeat.stop()
+            if not stage_heartbeat.is_alive:
+                self._untrack_heartbeat(stage_heartbeat)
         status = "STAGE_" + finished.stage_status
         self._emit_event(
             "worker_stage_result",
@@ -557,6 +776,17 @@ class BackgroundWorker:
                 raise
 
     def _process_claim(
+        self,
+        claim: dict[str, Any],
+        task_id: str,
+        heartbeat: _LeaseHeartbeat,
+    ) -> dict[str, Any]:
+        # Keep the lease context until the queue claim is durably finished. A
+        # terminal task state alone does not mean finish_task_claim has run.
+        with self.store.lease_context(task_id, str(claim["lease_id"]), self.worker_id):
+            return self._process_claim_with_lease(claim, task_id, heartbeat)
+
+    def _process_claim_with_lease(
         self,
         claim: dict[str, Any],
         task_id: str,

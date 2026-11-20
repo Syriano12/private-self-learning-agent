@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ from private_agent.bugbounty.models import safe_json
 from private_agent.core.experience import sanitize_value
 from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH
 
+LOGGER = logging.getLogger(__name__)
 
 _DATABASE_LOCKS_GUARD = threading.Lock()
 _DATABASE_LOCKS: dict[str, threading.RLock] = {}
@@ -46,6 +48,242 @@ def _database_lock(path: Path) -> threading.RLock:
             lock = threading.RLock()
             _DATABASE_LOCKS[key] = lock
         return lock
+
+
+class StoreClosingError(RuntimeError):
+    """Raised when a new Store operation starts after shutdown has begun."""
+
+
+class StoreClosedError(StoreClosingError):
+    """Raised when a Store operation is attempted after its connection closed."""
+
+
+class StoreTransactionActiveError(RuntimeError):
+    """Raised when closing would implicitly roll back an open transaction."""
+
+
+class _GuardedSQLiteCursor(sqlite3.Cursor):
+    def execute(self, sql: str, parameters: Any = ()):
+        with self.connection._store_transaction_operation():
+            return super().execute(sql, parameters)
+
+    def executemany(self, sql: str, parameters: Any):
+        with self.connection._store_transaction_operation():
+            return super().executemany(sql, parameters)
+
+    def executescript(self, sql_script: str):
+        with self.connection._store_transaction_operation(reject_if_active=True):
+            script = self.connection._store_prepare_executescript(sql_script)
+            return super().executescript(script)
+
+    def fetchone(self):
+        with self.connection._store_db_operation():
+            return super().fetchone()
+
+    def fetchmany(self, size: int | None = None):
+        with self.connection._store_db_operation():
+            return super().fetchmany() if size is None else super().fetchmany(size)
+
+    def fetchall(self):
+        with self.connection._store_db_operation():
+            return super().fetchall()
+
+    def __next__(self):
+        with self.connection._store_db_operation():
+            return super().__next__()
+
+
+class _GuardedSQLiteConnection(sqlite3.Connection):
+    def _store_db_operation(self):
+        operation = getattr(self, "_store_access_guard", None)
+        return operation() if operation is not None else nullcontext()
+
+    @staticmethod
+    def _store_first_sql_words(statement: str, *, limit: int = 3) -> tuple[str, ...]:
+        index = 0
+        words: list[str] = []
+        while index < len(statement) and len(words) < limit:
+            if statement[index].isspace() or statement[index] == "\ufeff":
+                index += 1
+                continue
+            if statement.startswith("--", index):
+                newline = statement.find("\n", index + 2)
+                if newline < 0:
+                    return ()
+                index = newline + 1
+                continue
+            if statement.startswith("/*", index):
+                end_comment = statement.find("*/", index + 2)
+                if end_comment < 0:
+                    return ()
+                index = end_comment + 2
+                continue
+            start = index
+            while index < len(statement) and (statement[index].isalnum() or statement[index] == "_"):
+                index += 1
+            if start == index:
+                if statement[index] in ".=(),":
+                    index += 1
+                    continue
+                break
+            words.append(statement[start:index].upper())
+        return tuple(words)
+
+    @classmethod
+    def _store_prepare_executescript(cls, sql_script: str) -> str:
+        """Wrap transactional scripts and preserve standalone autocommit statements.
+
+        Scripts mixing PRAGMA/VACUUM with transactional statements are refused
+        before execution; these commands cannot participate in the same atomic
+        SQLite transaction.
+        """
+        if not isinstance(sql_script, str):
+            return sql_script
+        heads: list[tuple[str, ...]] = []
+        statement_buffer: list[str] = []
+        for character in sql_script:
+            statement_buffer.append(character)
+            if character == ";":
+                statement = "".join(statement_buffer)
+                if sqlite3.complete_statement(statement):
+                    words = cls._store_first_sql_words(statement)
+                    if words:
+                        heads.append(words)
+                    statement_buffer.clear()
+        if statement_buffer:
+            words = cls._store_first_sql_words("".join(statement_buffer))
+            if words:
+                heads.append(words)
+
+        transaction_controls = {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"}
+        controls = [words[0] for words in heads if words[0] in transaction_controls]
+        autocommit_commands = {"PRAGMA", "VACUUM"}
+        if any(words[0] in autocommit_commands for words in heads):
+            if all(words[0] in autocommit_commands for words in heads):
+                return sql_script
+            raise sqlite3.ProgrammingError("executescript_mixed_autocommit_and_transactional_unsupported")
+
+        def ends_transaction(words: tuple[str, ...]) -> bool:
+            return words[0] in {"COMMIT", "END"} or (
+                words[0] == "ROLLBACK" and "TO" not in words[1:3]
+            )
+
+        if controls and heads[0][0] == "SAVEPOINT":
+            if any(ends_transaction(words) for words in heads[1:-1]):
+                raise sqlite3.ProgrammingError("executescript_transaction_boundary_must_be_final")
+            prepared = f"BEGIN IMMEDIATE;\n{sql_script}"
+            return prepared if heads and ends_transaction(heads[-1]) else f"{prepared}\nCOMMIT;"
+        if controls and heads[0][0] != "BEGIN":
+            raise sqlite3.ProgrammingError("executescript_transaction_control_must_start_with_begin")
+        if controls and any(ends_transaction(words) for words in heads[1:-1]):
+            raise sqlite3.ProgrammingError("executescript_transaction_boundary_must_be_final")
+        if controls:
+            return sql_script
+        return f"BEGIN IMMEDIATE;\n{sql_script}\nCOMMIT;"
+
+    @contextmanager
+    def _store_transaction_operation(self, *, reject_if_active: bool = False):
+        """Keep the connection transaction state and the shared lock consistent."""
+        with self._store_db_operation():
+            was_in_transaction = self.in_transaction
+            if reject_if_active and was_in_transaction:
+                raise sqlite3.ProgrammingError("executescript_not_allowed_in_transaction")
+            try:
+                yield
+            except BaseException as operation_error:
+                # An implicit transaction created by this call belongs to this
+                # failed call; roll it back before permitting another thread in.
+                if not was_in_transaction and self.in_transaction:
+                    try:
+                        sqlite3.Connection.rollback(self)
+                    except BaseException as rollback_error:
+                        raise operation_error from rollback_error
+                raise
+            finally:
+                self._store_sync_transaction_lock()
+
+    def cursor(self, factory=None):
+        if factory is not None and factory is not _GuardedSQLiteCursor:
+            raise sqlite3.ProgrammingError("custom_cursor_factory_not_supported")
+        with self._store_db_operation():
+            return super().cursor(_GuardedSQLiteCursor)
+
+    def _store_sync_transaction_lock(self) -> None:
+        """Match transaction ownership and the process-wide RLock to SQLite."""
+        in_transaction = self.in_transaction
+        lock = getattr(self, "_store_transaction_lock", None)
+        if lock is None:
+            return
+        owner = getattr(self, "_store_transaction_owner", None)
+        thread_id = threading.get_ident()
+        if in_transaction:
+            if owner == thread_id:
+                return
+            if owner is not None:
+                raise RuntimeError("sqlite_transaction_thread_changed")
+            lock.acquire()
+            self._store_transaction_owner = thread_id
+            return
+        if owner == thread_id:
+            self._store_release_transaction_lock()
+        elif owner is not None:
+            raise RuntimeError("sqlite_transaction_owner_mismatch")
+
+    def _store_release_transaction_lock(self) -> None:
+        owner = getattr(self, "_store_transaction_owner", None)
+        if owner != threading.get_ident():
+            return
+        self._store_transaction_owner = None
+        lock = getattr(self, "_store_transaction_lock", None)
+        if lock is not None:
+            lock.release()
+
+    def execute(self, sql: str, parameters: Any = ()):
+        cursor = self.cursor()
+        try:
+            return cursor.execute(sql, parameters)
+        except BaseException:
+            cursor.close()
+            raise
+
+    def executemany(self, sql: str, parameters: Any):
+        cursor = self.cursor()
+        try:
+            return cursor.executemany(sql, parameters)
+        except BaseException:
+            cursor.close()
+            raise
+
+    def executescript(self, sql_script: str):
+        cursor = self.cursor()
+        try:
+            return cursor.executescript(sql_script)
+        except BaseException:
+            cursor.close()
+            raise
+
+    def commit(self) -> None:
+        with self._store_transaction_operation():
+            super().commit()
+
+    def rollback(self) -> None:
+        with self._store_transaction_operation():
+            super().rollback()
+
+    def __enter__(self):
+        with self._store_db_operation():
+            return super().__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        with self._store_transaction_operation():
+            return super().__exit__(exc_type, exc_value, traceback)
+
+    def close(self) -> None:
+        handler = getattr(self, "_store_close_handler", None)
+        if handler is None:
+            super().close()
+        else:
+            handler()
 
 
 def now() -> str:
@@ -85,7 +323,7 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
     2: {
@@ -187,6 +425,24 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
             "input_json": "TEXT",
         },
     },
+    12: {
+        "remote_workers": {
+            "worker_id": "TEXT", "credential_digest": "TEXT", "credential_version": "INTEGER",
+            "previous_credential_digest": "TEXT", "previous_credential_version": "INTEGER",
+            "previous_credential_expires_at": "TEXT", "status": "TEXT", "runtime_identity": "TEXT",
+            "image_digest": "TEXT", "manifest_digest": "TEXT", "acceptance_status": "TEXT",
+            "created_at": "TEXT", "updated_at": "TEXT", "last_seen_at": "TEXT",
+        },
+        "remote_worker_jobs": {
+            "job_id": "TEXT", "task_id": "TEXT", "worker_id": "TEXT", "idempotency_key": "TEXT",
+            "envelope_json": "TEXT", "lease_id": "TEXT", "status": "TEXT", "lease_expires_at": "TEXT",
+            "heartbeat_at": "TEXT", "attempt_count": "INTEGER", "result_json": "TEXT",
+            "result_digest": "TEXT", "last_error_code": "TEXT", "created_at": "TEXT", "updated_at": "TEXT",
+        },
+        "remote_worker_nonces": {
+            "worker_id": "TEXT", "nonce": "TEXT", "seen_at": "TEXT", "request_digest": "TEXT",
+        },
+    },
 }
 
 _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -210,6 +466,10 @@ _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
     "idx_finding_reviews_task": ("task_id", "finding_id", "created_at", "review_id"),
     "idx_finding_reviews_owner": ("owner_user_id", "created_at", "review_id"),
     "idx_research_stages_claim": ("stage_status", "lease_expires_at", "created_at", "stage_id"),
+    "idx_remote_workers_status": ("status", "acceptance_status", "updated_at", "worker_id"),
+    "idx_remote_worker_jobs_claim": ("status", "worker_id", "created_at", "job_id"),
+    "idx_remote_worker_jobs_lease": ("status", "lease_expires_at", "job_id"),
+    "idx_remote_worker_jobs_idempotency": ("worker_id", "idempotency_key"),
 }
 
 
@@ -226,7 +486,17 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db_lock = _database_lock(self.path)
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self._lifecycle = threading.Condition(self._db_lock)
+        self._closing = False
+        self._worker_shutdown_requested = False
+        self._closed = False
+        self._background_workers: set[Any] = set()
+        self._worker_thread_ids: dict[int, int] = {}
+        self.db = sqlite3.connect(self.path, check_same_thread=False, factory=_GuardedSQLiteConnection)
+        self.db._store_access_guard = self._db_operation
+        self.db._store_close_handler = self.close
+        self.db._store_transaction_lock = self._db_lock
+        self.db._store_transaction_owner = None
         self.db.row_factory = sqlite3.Row
         self._lease_local = threading.local()
         self._approval_gate: Any | None = None
@@ -235,6 +505,105 @@ class Store:
         # advisory and cannot create an in-process trust authority.
         with self._db_lock:
             self.init_schema()
+
+    @property
+    def closing(self) -> bool:
+        with self._lifecycle:
+            return self._closing or self._worker_shutdown_requested
+
+    @property
+    def closed(self) -> bool:
+        with self._lifecycle:
+            return self._closed
+
+    def request_worker_shutdown(self) -> None:
+        """Fence new worker claims without closing the Store connection.
+
+        This fence is terminal for the Store's worker lifecycle; create a new
+        Store before starting a new worker after application shutdown.
+        """
+        with self._lifecycle:
+            if self._closed:
+                return
+            self._worker_shutdown_requested = True
+            self._lifecycle.notify_all()
+
+    @contextmanager
+    def _db_operation(self):
+        """Serialize a SQLite call with shutdown and reject post-close callers.
+
+        During draining, only an already-registered worker thread may finish its
+        in-flight claim. Other callers and new worker registrations are fenced.
+        """
+        with self._lifecycle:
+            if self._closed:
+                raise StoreClosedError("store_closed")
+            if self._closing and threading.get_ident() not in self._worker_thread_ids:
+                raise StoreClosingError("store_closing")
+            yield
+
+    def register_background_worker(self, worker: Any) -> None:
+        with self._lifecycle:
+            if self._closing or self._worker_shutdown_requested or self._closed:
+                raise StoreClosingError("store_closing")
+            self._background_workers.add(worker)
+
+    def enter_background_worker(self, worker: Any) -> None:
+        with self._lifecycle:
+            if worker not in self._background_workers:
+                raise StoreClosingError("worker_not_registered_with_store")
+            thread_id = threading.get_ident()
+            self._worker_thread_ids[thread_id] = self._worker_thread_ids.get(thread_id, 0) + 1
+
+    def leave_background_worker(self, worker: Any) -> None:
+        with self._lifecycle:
+            self._leave_worker_thread_locked(threading.get_ident())
+            self._background_workers.discard(worker)
+            self._lifecycle.notify_all()
+
+    def _leave_worker_thread_locked(self, thread_id: int) -> None:
+        depth = self._worker_thread_ids.get(thread_id, 0)
+        if depth <= 1:
+            self._worker_thread_ids.pop(thread_id, None)
+        else:
+            self._worker_thread_ids[thread_id] = depth - 1
+
+    @contextmanager
+    def background_worker_operation(self, worker: Any):
+        """Track one run_once call, including direct calls outside start()/run_forever()."""
+        thread_id = threading.get_ident()
+        with self._lifecycle:
+            registered = worker in self._background_workers
+            if self._closed or (
+                (self._closing or self._worker_shutdown_requested)
+                and (not registered or thread_id not in self._worker_thread_ids)
+            ):
+                raise StoreClosingError("store_closing")
+            temporary_registration = not registered
+            if temporary_registration:
+                self._background_workers.add(worker)
+            self._worker_thread_ids[thread_id] = self._worker_thread_ids.get(thread_id, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lifecycle:
+                self._leave_worker_thread_locked(thread_id)
+                if temporary_registration:
+                    self._background_workers.discard(worker)
+                self._lifecycle.notify_all()
+
+    def unregister_background_worker(self, worker: Any) -> None:
+        with self._lifecycle:
+            self._background_workers.discard(worker)
+            self._lifecycle.notify_all()
+
+    def assert_worker_claim_allowed(self) -> None:
+        """Fence acquisition of a new task/stage lease once shutdown starts."""
+        with self._lifecycle:
+            if self._closed:
+                raise StoreClosedError("store_closed")
+            if self._closing or self._worker_shutdown_requested:
+                raise StoreClosingError("store_closing_no_new_claims")
 
     def _bind_approval_gate(self, gate: Any, *, owner: Any | None = None) -> None:
         """Bind the in-process approval writer through a SecurityController only."""
@@ -384,6 +753,16 @@ class Store:
             )
         if version == 11:
             return (("table", "bugbounty_research_stages"),)
+        if version == 12:
+            return (
+                ("table", "remote_workers"),
+                ("table", "remote_worker_jobs"),
+                ("table", "remote_worker_nonces"),
+                ("index", "idx_remote_workers_status"),
+                ("index", "idx_remote_worker_jobs_claim"),
+                ("index", "idx_remote_worker_jobs_lease"),
+                ("index", "idx_remote_worker_jobs_idempotency"),
+            )
         return ()
 
     def _assert_migration_objects(self, version: int) -> None:
@@ -423,6 +802,9 @@ class Store:
                 "auth_sessions": ("FOREIGN KEY (USER_ID)",),
                 "task_owners": ("FOREIGN KEY (TASK_ID)", "FOREIGN KEY (USER_ID)"),
                 "bugbounty_finding_reviews": ("CHECK (EVIDENCE_VALIDATED IN (0, 1))",),
+                "remote_workers": ("CHECK (STATUS IN ('ACTIVE', 'ROTATED', 'REVOKED'))", "CHECK (ACCEPTANCE_STATUS IN ('UNVERIFIED', 'VERIFIED'))"),
+                "remote_worker_jobs": ("CHECK (STATUS IN ('QUEUED', 'LEASED', 'COMPLETED', 'FAILED', 'EXECUTION_UNKNOWN', 'BLOCKED'))",),
+                "remote_worker_nonces": ("PRIMARY KEY (WORKER_ID, NONCE)",),
             }.get(name, ())
                 for fragment in required_fragments:
                     if fragment not in table_sql:
@@ -927,6 +1309,56 @@ class Store:
             )
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (11, now()))
             return
+        if version == 12:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS remote_workers (
+              worker_id TEXT PRIMARY KEY,
+              credential_digest TEXT NOT NULL,
+              credential_version INTEGER NOT NULL CHECK (credential_version >= 1),
+              previous_credential_digest TEXT NOT NULL DEFAULT '',
+              previous_credential_version INTEGER NOT NULL DEFAULT 0 CHECK (previous_credential_version >= 0),
+              previous_credential_expires_at TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'ROTATED', 'REVOKED')),
+              runtime_identity TEXT NOT NULL,
+              image_digest TEXT NOT NULL,
+              manifest_digest TEXT NOT NULL,
+              acceptance_status TEXT NOT NULL CHECK (acceptance_status IN ('UNVERIFIED', 'VERIFIED')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_seen_at TEXT NOT NULL DEFAULT ''
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS remote_worker_jobs (
+              job_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL DEFAULT '',
+              worker_id TEXT NOT NULL,
+              idempotency_key TEXT NOT NULL,
+              envelope_json TEXT NOT NULL,
+              lease_id TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN ('QUEUED', 'LEASED', 'COMPLETED', 'FAILED', 'EXECUTION_UNKNOWN', 'BLOCKED')),
+              lease_expires_at TEXT NOT NULL DEFAULT '',
+              heartbeat_at TEXT NOT NULL DEFAULT '',
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+              result_json TEXT NOT NULL DEFAULT '{}',
+              result_digest TEXT NOT NULL DEFAULT '',
+              last_error_code TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(worker_id, idempotency_key),
+              FOREIGN KEY (worker_id) REFERENCES remote_workers(worker_id)
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS remote_worker_nonces (
+              worker_id TEXT NOT NULL,
+              nonce TEXT NOT NULL,
+              seen_at TEXT NOT NULL,
+              request_digest TEXT NOT NULL,
+              PRIMARY KEY (worker_id, nonce),
+              FOREIGN KEY (worker_id) REFERENCES remote_workers(worker_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_workers_status ON remote_workers(status, acceptance_status, updated_at, worker_id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_worker_jobs_claim ON remote_worker_jobs(status, worker_id, created_at, job_id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_worker_jobs_lease ON remote_worker_jobs(status, lease_expires_at, job_id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_worker_jobs_idempotency ON remote_worker_jobs(worker_id, idempotency_key)")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (12, now()))
+            return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
     def latest_owner_policy_version(self) -> int:
@@ -1417,6 +1849,7 @@ class Store:
         expires = (datetime.now(timezone.utc) + timedelta(seconds=int(lease_ttl_seconds))).isoformat()
         self._db_lock.acquire()
         try:
+            self.assert_worker_claim_allowed()
             self.db.execute("BEGIN IMMEDIATE")
             expired = self.db.execute(
                 """SELECT * FROM task_queue
@@ -3160,5 +3593,70 @@ class Store:
             return
 
     def close(self) -> None:
-        with self._db_lock:
-            self.db.close()
+        current_thread_id = threading.get_ident()
+        with self._lifecycle:
+            if self._closed:
+                return
+            if current_thread_id in self._worker_thread_ids:
+                raise RuntimeError("store_close_from_worker_thread")
+            if self.db.in_transaction:
+                raise StoreTransactionActiveError("store_transaction_active")
+            if self._closing:
+                while self._closing and not self._closed:
+                    self._lifecycle.wait()
+                if self._closed:
+                    return
+            self._worker_shutdown_requested = True
+            self._closing = True
+            workers = tuple(self._background_workers)
+            self._lifecycle.notify_all()
+
+        for worker in workers:
+            try:
+                worker.request_stop()
+            except BaseException as exc:
+                # A broken shutdown hook must not cause an early SQLite close.
+                LOGGER.error("store_worker_request_stop_failed", extra={"error_type": type(exc).__name__})
+                stop_event = getattr(worker, "_stop_event", None)
+                set_stop = getattr(stop_event, "set", None)
+                if callable(set_stop):
+                    try:
+                        set_stop()
+                    except BaseException as fallback_exc:
+                        LOGGER.error(
+                            "store_worker_stop_signal_fallback_failed",
+                            extra={"error_type": type(fallback_exc).__name__},
+                        )
+
+        for worker in workers:
+            thread = getattr(worker, "_loop_thread", None)
+            if thread is threading.current_thread():
+                raise RuntimeError("store_close_from_worker_thread")
+            try:
+                worker.join(timeout=None)
+            except BaseException:
+                # Retain the hard safety invariant even if the helper itself fails.
+                if thread is not None and thread.ident is not None:
+                    try:
+                        thread.join()
+                    except BaseException as join_exc:
+                        LOGGER.error("store_worker_thread_join_failed", extra={"error_type": type(join_exc).__name__})
+            if thread is not None and thread.is_alive():
+                thread.join()
+
+        with self._lifecycle:
+            while self._background_workers or self._worker_thread_ids:
+                self._lifecycle.wait()
+
+        try:
+            with self._db_lock:
+                sqlite3.Connection.close(self.db)
+                self.db._store_release_transaction_lock()
+        except BaseException:
+            with self._lifecycle:
+                self._closing = False
+                self._lifecycle.notify_all()
+            raise
+        with self._lifecycle:
+            self._closed = True
+            self._lifecycle.notify_all()

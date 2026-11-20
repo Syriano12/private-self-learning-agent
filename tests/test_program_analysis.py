@@ -5,11 +5,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 from private_agent.api import create_app
 from private_agent.auth import AuthManager
-from private_agent.bugbounty.programs import ProgramAnalysisRepository, analyze_program, canonical_program_url
+from private_agent.bugbounty.passive_research import PassiveResearchAdapter
+from private_agent.bugbounty.programs import ProgramAnalysisRepository, PublicPolicyRetriever, analyze_program, canonical_program_url
 from private_agent.storage import Store
 from private_agent.worker import BackgroundWorker
 from tests.test_phase12_api import APITestTool, make_service
@@ -62,6 +64,26 @@ def test_missing_or_expired_policy_is_review_required_and_not_executable() -> No
     assert any("scope_expired" in item for item in result.ambiguities)
 
 
+def test_future_issued_scope_is_not_active_before_its_start_time() -> None:
+    from private_agent.bugbounty.models import ScopeDecision, ScopeDefinition
+
+    future = scope_payload()
+    future["issued_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    future["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    with pytest.raises(ValueError, match="scope_not_yet_active"):
+        ScopeDefinition.from_dict(future)
+    analysis = analyze_program("https://example.com/policy", json.dumps(future))
+    assert analysis.status == "REVIEW_REQUIRED"
+    assert analysis.scope_proposal is None
+    assert any("scope_not_yet_active" in item for item in analysis.ambiguities)
+    future["issued_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    future["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    active = ScopeDefinition.from_dict(future)
+    decision, reason = active.authorize("https://fixture.local/api/v1", now=datetime.now(timezone.utc))
+    assert decision is ScopeDecision.ALLOWED
+    assert reason == "explicit_scope_match"
+
+
 def test_line_policy_parser_requires_explicit_fields() -> None:
     result = analyze_program("https://example.com/policy", "program-id: local\nin-scope: fixture.local /api/v1 GET")
     assert result.status == "REVIEW_REQUIRED"
@@ -100,6 +122,68 @@ def test_api_analysis_requires_csrf_and_returns_owner_scoped_review(tmp_path: Pa
     assert "written-authorization-local-only" not in response.text
     analysis_id = payload["analysis_id"]
     assert client.get(f"/api/v1/bug-bounty/programs/{analysis_id}").status_code == 200
+    store.close()
+
+
+def test_explicit_allowlisted_public_policy_retrieval_is_bounded_and_untrusted(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"), token=None)
+    AuthManager(store).initialize_owner(OWNER_EMAIL, OWNER_PASSWORD)
+    service.public_policy_retriever = PublicPolicyRetriever(
+        PassiveResearchAdapter(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    text="<html><body>In scope: api.example.com; out of scope: admin.example.com; token: SECRET_PUBLIC_TEXT</body></html>",
+                )
+            ),
+            resolver=lambda _host: ("93.184.216.34",),
+        )
+    )
+    client = TestClient(create_app(service=service), raise_server_exceptions=False)
+    csrf = _login(client, OWNER_EMAIL, OWNER_PASSWORD)
+    response = client.post(
+        "/api/v1/bug-bounty/programs/analyze",
+        json={
+            "program_url": "https://hackerone.com/example-public",
+            "policy_text": "",
+            "source_type": "hackerone_program",
+            "fetch_public_policy": True,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "REVIEW_REQUIRED"
+    assert payload["source"]["source_type"] == "hackerone_program"
+    assert payload["source"]["content_sha256"]
+    assert payload["scope_proposal"] is None
+    assert payload["observations"]["authorization_derived"] is False
+    assert "api.example.com" in payload["observations"]["candidate_hosts"]
+    assert "admin.example.com" in payload["observations"]["candidate_hosts"]
+    assert "public_policy_not_authorization" in payload["limitations"]
+    assert "program_url_not_fetched_automatically" not in payload["limitations"]
+    assert "SECRET_PUBLIC_TEXT" not in response.text
+    store.close()
+
+
+def test_public_policy_retrieval_rejects_unsupported_source_before_network(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"), token=None)
+    AuthManager(store).initialize_owner(OWNER_EMAIL, OWNER_PASSWORD)
+    client = TestClient(create_app(service=service), raise_server_exceptions=False)
+    csrf = _login(client, OWNER_EMAIL, OWNER_PASSWORD)
+    response = client.post(
+        "/api/v1/bug-bounty/programs/analyze",
+        json={
+            "program_url": "https://example.com/policy",
+            "policy_text": "",
+            "source_type": "user_provided_policy",
+            "fetch_public_policy": True,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "validation_error"
     store.close()
 
 

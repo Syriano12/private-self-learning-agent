@@ -159,7 +159,7 @@ class GeminiProvider(LLMProvider):
         for attempt in range(self.config.max_retries + 1):
             try:
                 with httpx.Client(timeout=self.config.timeout, transport=self.transport) as client:
-                    response = client.post(url, params={"key": self.config.api_key}, json=payload)
+                    response = client.post(url, headers={"x-goog-api-key": self.config.api_key}, json=payload)
             except httpx.HTTPError as exc:
                 safe = _redact(str(exc), secrets)
                 if attempt < self.config.max_retries:
