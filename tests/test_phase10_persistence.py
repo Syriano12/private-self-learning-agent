@@ -401,7 +401,75 @@ def test_resume_continues_from_last_verified_step_without_reexecuting_it(tmp_pat
     restarted_store.close()
 
 
-@pytest.mark.parametrize("record_issue", ["missing", "conflicting", "untrusted_output", "malformed_unrelated_record"])
+def test_resume_retry_from_failed_action_starts_with_clean_lifecycle_fields(tmp_path: Path) -> None:
+    path = tmp_path / "failed-action-retry.sqlite3"
+    tool = DurableTool("safe", [ToolResult.failed("temporary", "retry after resume"), ToolResult.success({"result": "ok"})])
+
+    def interrupt_after_failure(checkpoint: str, state: dict) -> None:
+        if checkpoint == "AFTER_VERIFICATION" and state.get("current_step") == "step-1":
+            raise TaskInterrupted("interrupted after failed action")
+
+    store = Store(path)
+    first = Orchestrator(
+        store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+        checkpoint_hook=interrupt_after_failure,
+    )
+    with pytest.raises(TaskInterrupted):
+        first.run("retry failed action")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    state_before = TaskState.from_dict(store.get_task_state(task_id))
+    key = state_before.failed_actions[0]
+    assert state_before.action_records[key]["status"] == "FAILED"
+    store.close()
+
+    def interrupt_after_retry_execution(checkpoint: str, state: dict) -> None:
+        if checkpoint == "AFTER_EXECUTION":
+            raise TaskInterrupted("interrupted after resumed execution")
+
+    retry_store = Store(path)
+    retry = Orchestrator(
+        retry_store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+        checkpoint_hook=interrupt_after_retry_execution,
+    )
+    with pytest.raises(TaskInterrupted):
+        retry.resume_task(task_id)
+    retry_state = TaskState.from_dict(retry_store.get_task_state(task_id))
+    retry_record = retry_state.action_records[key]
+    assert retry_record["status"] == "OBSERVING"
+    assert retry_record["execution_status"] == "success"
+    assert retry_record["observation"] is None
+    assert retry_record["verification"] is None
+    assert key not in retry_state.observations
+    assert key not in retry_state.verification_results
+    assert tool.calls == 2
+    retry_store.close()
+
+    final_store = Store(path)
+    final = Orchestrator(final_store, registry(tool), planner=StubPlanner([step("safe")]))
+    result = final.resume_task(task_id)
+    assert result["final_status"] == "COMPLETED"
+    assert tool.calls == 2
+    final_state = TaskState.from_dict(final_store.get_task_state(task_id))
+    assert key in final_state.completed_actions
+    assert key in final_state.failed_actions  # Failed attempts remain historical after a successful retry.
+    final_store.close()
+
+
+@pytest.mark.parametrize(
+    "record_issue",
+    [
+        "missing",
+        "conflicting",
+        "untrusted_output",
+        "tampered_output",
+        "malformed_unrelated_record",
+        "malformed_unrelated_dict",
+    ],
+)
 def test_resume_fails_closed_when_persisted_action_record_is_untrusted(tmp_path: Path, record_issue: str) -> None:
     first_tool = DurableTool("first")
     second_tool = DurableTool("second")
@@ -433,6 +501,10 @@ def test_resume_fails_closed_when_persisted_action_record_is_untrusted(tmp_path:
         state.action_records[first_key]["step_id"] = "different-step"
     elif record_issue == "untrusted_output":
         state.action_records[first_key]["output"]["status"] = "failed"
+    elif record_issue == "tampered_output":
+        state.action_records[first_key]["output"]["output"] = {"result": "tampered"}
+    elif record_issue == "malformed_unrelated_dict":
+        state.action_records["malformed-unrelated"] = {"status": "VERIFIED"}
     else:
         state.action_records["malformed-unrelated"] = None
     state.touch()
@@ -457,10 +529,77 @@ def test_resume_fails_closed_when_persisted_action_record_is_untrusted(tmp_path:
     assert result["final_status"] == "BLOCKED"
     assert first_tool.calls == 1
     assert second_tool.calls == 0
-    if record_issue == "malformed_unrelated_record":
+    if record_issue in {"malformed_unrelated_record", "malformed_unrelated_dict"}:
         persisted = restarted_store.get_task_state(task_id)
         assert persisted["status"] == "BLOCKED"
         assert persisted["action_records"]["malformed-unrelated"]["status"] == "FAILED"
+    restarted_store.close()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "lifecycle_issue", "expected_tool_calls"),
+    [
+        ("PLAN_CREATED", "not_started_has_output", 0),
+        ("BEFORE_EXECUTION", "executing_has_output", 0),
+        ("AFTER_EXECUTION", "observing_has_verification", 1),
+    ],
+)
+def test_resume_rejects_action_record_fields_from_a_later_lifecycle(
+    tmp_path: Path,
+    checkpoint: str,
+    lifecycle_issue: str,
+    expected_tool_calls: int,
+) -> None:
+    tool = DurableTool("safe")
+    path = tmp_path / f"lifecycle-{lifecycle_issue}.sqlite3"
+
+    def interrupt(name: str, state: dict) -> None:
+        if name == checkpoint:
+            raise TaskInterrupted("interrupted at lifecycle checkpoint")
+
+    store = Store(path)
+    agent = Orchestrator(
+        store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+        checkpoint_hook=interrupt,
+    )
+    with pytest.raises(TaskInterrupted):
+        agent.run("lifecycle validation")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    state = TaskState.from_dict(store.get_task_state(task_id))
+    key = state.pending_actions[0]
+    if lifecycle_issue == "not_started_has_output":
+        record = state.action_record(key)
+        record["output"] = {"status": "success", "output": {"result": "forged"}}
+    else:
+        record = state.action_records[key]
+        if lifecycle_issue == "executing_has_output":
+            record["execution_status"] = "success"
+            record["output"] = {
+                "step_id": "step-1",
+                "tool_name": "safe",
+                "status": "success",
+                "output": {"result": "forged"},
+                "error": None,
+                "metadata": {},
+            }
+        else:
+            record["verification"] = {"status": "VERIFIED", "verified": True}
+    state.touch()
+    store.save_task_state(state, "TEST_INVALID_ACTION_LIFECYCLE")
+    store.close()
+
+    restarted_store = Store(path)
+    restarted = Orchestrator(
+        restarted_store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+    )
+    result = restarted.resume_task(task_id)
+
+    assert result["final_status"] == "BLOCKED"
+    assert tool.calls == expected_tool_calls
     restarted_store.close()
 
 

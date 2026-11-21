@@ -776,8 +776,113 @@ class Orchestrator:
                 )
             return state.result or self._resume_failure(task_id, "terminal_state_missing_result")
 
+        def valid_persisted_action_record(key: str, record: Any) -> bool:
+            if not isinstance(key, str) or not isinstance(record, dict):
+                return False
+            status = record.get("status")
+            if status not in ("NOT_STARTED", "EXECUTING", "OBSERVING", "VERIFIED", "FAILED"):
+                return False
+            if record.get("action_key") != key:
+                return False
+            for field in ("step_id", "tool_name", "input_fingerprint", "updated_at"):
+                if not isinstance(record.get(field), str):
+                    return False
+            if status == "NOT_STARTED":
+                return (
+                    key in state.pending_actions
+                    and key not in state.completed_actions
+                    and key not in state.failed_actions
+                    and record.get("tool_name") == ""
+                    and record.get("input_fingerprint") == ""
+                    and record.get("execution_status") in (None, "")
+                    and record.get("output") is None
+                    and record.get("observation") is None
+                    and record.get("verification") is None
+                )
+            if not all(record.get(field) for field in ("step_id", "tool_name", "input_fingerprint")):
+                return False
+            if record.get("input_fingerprint") != key:
+                return False
+            if status == "EXECUTING":
+                return (
+                    key in state.pending_actions
+                    and key not in state.completed_actions
+                    and record.get("execution_status") in (None, "")
+                    and record.get("output") is None
+                    and record.get("observation") is None
+                    and record.get("verification") is None
+                    and key not in state.observations
+                    and key not in state.verification_results
+                )
+
+            execution_status = record.get("execution_status")
+            if execution_status not in ("success", "failed", "blocked"):
+                return False
+            try:
+                step_result = self._step_result_from_dict(record.get("output"))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return False
+            if (
+                step_result is None
+                or step_result.step_id != record.get("step_id")
+                or step_result.tool_name != record.get("tool_name")
+                or step_result.status != execution_status
+            ):
+                return False
+            if status == "OBSERVING":
+                observation = state.observations.get(key)
+                if (
+                    key not in state.pending_actions
+                    or key in state.completed_actions
+                    or record.get("observation") is not None
+                    or record.get("verification") is not None
+                    or key in state.verification_results
+                ):
+                    return False
+                if observation is not None and (
+                    not isinstance(observation, dict)
+                    or observation.get("task_id") != state.task_id
+                    or observation.get("step_id") != record.get("step_id")
+                    or observation.get("tool_name") != record.get("tool_name")
+                    or observation.get("execution_status") != execution_status
+                    or observation.get("observed_output") != step_result.output
+                ):
+                    return False
+                return True
+
+            if status == "VERIFIED":
+                if key not in state.completed_actions:
+                    return False
+            elif key not in state.failed_actions or key in state.completed_actions:
+                return False
+            observation = record.get("observation")
+            verification = record.get("verification")
+            if (
+                not isinstance(observation, dict)
+                or observation != state.observations.get(key)
+                or observation.get("task_id") != state.task_id
+                or observation.get("step_id") != record.get("step_id")
+                or observation.get("tool_name") != record.get("tool_name")
+                or observation.get("execution_status") != execution_status
+                or observation.get("observed_output") != step_result.output
+                or not isinstance(verification, dict)
+                or verification != state.verification_results.get(key)
+                or verification.get("status") not in ("VERIFIED", "FAILED", "INSUFFICIENT", "BLOCKED")
+                or verification.get("verified") is not (verification.get("status") == "VERIFIED")
+            ):
+                return False
+            if status == "VERIFIED":
+                return (
+                    execution_status == "success"
+                    and step_result.error is None
+                    and observation.get("observed_error") is None
+                    and verification.get("status") == "VERIFIED"
+                )
+            return True
+
         invalid_action_record_keys = [
-            key for key, record in state.action_records.items() if not isinstance(record, dict)
+            key for key, record in state.action_records.items()
+            if not valid_persisted_action_record(key, record)
         ]
         if invalid_action_record_keys:
             for key in invalid_action_record_keys:
@@ -858,10 +963,10 @@ class Orchestrator:
                 self._save_checkpoint(state, "UNKNOWN_RESOLVED")
 
         if state.status == "OBSERVING":
-            state.transition("READY", phase="RESUME_OBSERVING")
+            state.checkpoint("RESUME_OBSERVING", phase="RESUME_OBSERVING")
             self._save_checkpoint(state, "RESUME_OBSERVING")
         elif state.status == "VERIFYING":
-            state.transition("READY", phase="RESUME_VERIFYING")
+            state.checkpoint("RESUME_VERIFYING", phase="RESUME_VERIFYING")
             self._save_checkpoint(state, "RESUME_VERIFYING")
 
         try:
@@ -915,7 +1020,13 @@ class Orchestrator:
             self._set_policy_stop_reason(state, blocked)
             self._save_checkpoint(state, "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED")
             return False, decisions
-        state.checkpoint("APPROVAL_REVALIDATED", status="READY", phase="APPROVAL_REVALIDATED", successful=True)
+        resumed_lifecycle_status = state.status if state.status in {"OBSERVING", "VERIFYING"} else "READY"
+        state.checkpoint(
+            "APPROVAL_REVALIDATED",
+            status=resumed_lifecycle_status,
+            phase="APPROVAL_REVALIDATED",
+            successful=True,
+        )
         self._save_checkpoint(state, "APPROVAL_REVALIDATED")
         return True, decisions
 
@@ -960,6 +1071,8 @@ class Orchestrator:
         for step in current_plan.steps:
             key = state.action_key_for_step(step)
             record = state.action_records.get(key)
+            record_observation = record.get("observation") if isinstance(record, dict) else None
+            state_observation = state.observations.get(key)
             if key not in completed_actions:
                 if isinstance(record, dict) and record.get("status") == "VERIFIED":
                     return self._resume_blocked(state, "persisted_action_completion_conflict")
@@ -987,6 +1100,14 @@ class Orchestrator:
                 or step_result.tool_name != step.tool
                 or step_result.status != "success"
                 or step_result.error is not None
+                or not isinstance(record_observation, dict)
+                or record_observation != state_observation
+                or record_observation.get("task_id") != state.task_id
+                or record_observation.get("step_id") != step.id
+                or record_observation.get("tool_name") != step.tool
+                or record_observation.get("execution_status") != "success"
+                or record_observation.get("observed_error") is not None
+                or record_observation.get("observed_output") != step_result.output
             ):
                 return self._resume_blocked(state, "persisted_verified_action_untrusted")
             verified_previous_results[step.id] = step_result
@@ -1067,6 +1188,8 @@ class Orchestrator:
                     if step_result is None:
                         return self._resume_blocked(state, "persisted_execution_result_corrupted")
                 else:
+                    state.observations.pop(key, None)
+                    state.verification_results.pop(key, None)
                     state.mark_action(
                         key,
                         status="EXECUTING",
@@ -1078,6 +1201,10 @@ class Orchestrator:
                             tool=step.tool,
                             inputs=step.input,
                         ),
+                        execution_status="",
+                        output=None,
+                        observation=None,
+                        verification=None,
                     )
                     state.context["attempts"] = rounds
                     state.checkpoint("BEFORE_EXECUTION", status="EXECUTING", phase="BEFORE_EXECUTION", step_id=step.id)
