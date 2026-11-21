@@ -83,7 +83,11 @@ def test_independent_memory_writes_do_not_require_a_worker_lease(tmp_path: Path)
     store.save_reflection({"insight_id": "independent-reflection", "pattern": "safe", "confidence": 0.9})
     store.save_learned_strategy({"strategy_id": "independent-strategy", "status": "validated", "confidence": 0.9})
 
-    assert store.search_knowledge("independent")
+    knowledge_row = store.db.execute(
+        "SELECT verification_status FROM knowledge_items WHERE id = 'independent-knowledge'"
+    ).fetchone()
+    assert knowledge_row is not None
+    assert knowledge_row["verification_status"] == "needs_review"
     assert store.get_reflection("independent-reflection") is not None
     assert store.get_learned_strategy("independent-strategy") is not None
     store.close()

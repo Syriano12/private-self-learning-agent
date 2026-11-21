@@ -2983,6 +2983,15 @@ class Store:
         rows = self.db.execute("SELECT * FROM knowledge_items ORDER BY confidence DESC, updated_at DESC").fetchall()
         scored = []
         for row in rows:
+            verification_status = str(row["verification_status"]).strip().lower()
+            try:
+                source_reliability = float(row["source_reliability"])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            # Current writes cannot attest legacy knowledge; only preserve the
+            # narrow verified, positive-reliability shape written by older code.
+            if verification_status != "verified" or not (0.0 < source_reliability <= 1.0):
+                continue
             text = f"{row['concept']} {row['content']} {row['domain']}".lower()
             score = sum(term in text for term in terms)
             if score: scored.append((score, dict(row)))
