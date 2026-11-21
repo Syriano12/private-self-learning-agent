@@ -85,3 +85,29 @@ def test_compatible_registered_input_proposal_still_requires_permission() -> Non
 
     with pytest.raises(PlanValidationError, match="permission_not_granted:scope_research"):
         Planner().create("Investigate a scoped task", tools, [], permissions={})
+
+
+def test_incompatible_fallback_is_not_selected_after_learned_avoidance() -> None:
+    tools = ToolRegistry()
+    tools.register(WebResearchTool())
+    tools.register(ScopeRequiredResearchTool())
+    goal = "Research a general topic"
+    learned = {
+        "status": "active",
+        "confidence": 0.95,
+        "strategy_id": "avoid-web-research",
+        "avoided_action": {"type": "avoid_unverified_retry", "tool": "web_research"},
+    }
+
+    plan = Planner().create(
+        goal,
+        tools,
+        [],
+        permissions={"web_research": "public_read"},
+        learned_strategies=[learned],
+    )
+
+    assert plan.steps[0].tool == "web_research"
+    assert plan.steps[0].input["query"] == goal
+    with pytest.raises(PlanValidationError, match="permission_not_granted:web_research"):
+        Planner().create(goal, tools, [], permissions={}, learned_strategies=[learned])
