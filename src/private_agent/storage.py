@@ -1761,7 +1761,7 @@ class Store:
 
     def _mark_expired_lease_in_transaction(self, row: sqlite3.Row, stamp: str) -> dict[str, Any]:
         """Fence an expired worker and conservatively persist an unknown outcome."""
-        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState
+        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState, TaskStopReasonCode
 
         task_id = str(row["task_id"])
         state_row = self.db.execute(
@@ -1805,6 +1805,14 @@ class Store:
                     )
                 else:
                     state.touch()
+                state.set_stop_reason(
+                    TaskStopReasonCode.EXECUTION_UNKNOWN,
+                    step_id=state.current_step or None,
+                    action_id=next(
+                        (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                        None,
+                    ),
+                )
                 self._persist_task_state_in_transaction(
                     state.to_dict(),
                     "EXECUTION_UNKNOWN",
@@ -2023,7 +2031,7 @@ class Store:
                 raise QueueLeaseLost(f"queue_lease_expired:{task_id}")
 
             if state_status is not None:
-                from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+                from private_agent.core.task_state import TaskState, TaskStopReasonCode, TERMINAL_STATUSES
 
                 state_row = self.db.execute(
                     "SELECT state_json FROM task_states WHERE task_id = ?",
@@ -2044,6 +2052,14 @@ class Store:
                                 phase="EXECUTION_UNKNOWN",
                                 successful=False,
                             )
+                        state.set_stop_reason(
+                            TaskStopReasonCode.EXECUTION_UNKNOWN,
+                            step_id=state.current_step or None,
+                            action_id=next(
+                                (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                                None,
+                            ),
+                        )
                     elif state_status == "FAILED" and state.status not in TERMINAL_STATUSES:
                         state.result = {
                             **state.result,
@@ -2051,6 +2067,14 @@ class Store:
                             "errors": list(state.result.get("errors", [])) + [error_message or error_code or "worker_failed"],
                         }
                         state.checkpoint("WORKER_FAILED", status="FAILED", phase="WORKER_FAILED", successful=False)
+                        state.set_stop_reason(
+                            TaskStopReasonCode.WORKER_FAILED,
+                            step_id=state.current_step or None,
+                            action_id=next(
+                                (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                                None,
+                            ),
+                        )
                     self._persist_task_state_in_transaction(
                         state.to_dict(),
                         "EXECUTION_UNKNOWN" if state_status == "EXECUTION_UNKNOWN" else "WORKER_FAILED",
@@ -2109,7 +2133,7 @@ class Store:
             if current is None or current["queue_status"] != "LEASED" or current["lease_id"] != lease_id or current["worker_id"] != worker_id:
                 raise QueueLeaseLost(f"queue_lease_lost:{task_id}")
 
-            from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+            from private_agent.core.task_state import TaskState, TaskStopReasonCode, TERMINAL_STATUSES
 
             state_row = self.db.execute(
                 "SELECT state_json FROM task_states WHERE task_id = ?",
@@ -2137,6 +2161,14 @@ class Store:
                         )
                     else:
                         state.touch()
+                    state.set_stop_reason(
+                        TaskStopReasonCode.EXECUTION_UNKNOWN,
+                        step_id=state.current_step or None,
+                        action_id=next(
+                            (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                            None,
+                        ),
+                    )
                     self._persist_task_state_in_transaction(
                         state.to_dict(),
                         "EXECUTION_UNKNOWN",

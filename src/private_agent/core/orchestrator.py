@@ -19,6 +19,7 @@ from private_agent.core.task_state import (
     MAX_TASK_GOAL_LENGTH,
     StateIntegrityError,
     TaskState,
+    TaskStopReasonCode,
     TERMINAL_STATUSES,
     action_fingerprint,
 )
@@ -102,6 +103,33 @@ class Orchestrator:
             severity=severity,
             component="orchestrator",
             metadata=metadata or {},
+        )
+
+    @staticmethod
+    def _action_id_for_step(state: TaskState, step_id: str) -> str | None:
+        return next(
+            (
+                action_id
+                for action_id, record in state.action_records.items()
+                if record.get("step_id") == step_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _set_policy_stop_reason(state: TaskState, decisions: list[PolicyDecision]) -> None:
+        blocked = [decision for decision in decisions if not decision.allowed]
+        if not blocked:
+            state.set_stop_reason(None)
+            return
+        pending = next((decision for decision in blocked if decision.decision == "REQUIRE_APPROVAL"), None)
+        selected = pending or blocked[0]
+        action_record = state.action_records.get(selected.action_id, {})
+        step_id = action_record.get("step_id") if isinstance(action_record, dict) else None
+        state.set_stop_reason(
+            TaskStopReasonCode.APPROVAL_REQUIRED if pending else TaskStopReasonCode.POLICY_BLOCKED,
+            step_id=step_id,
+            action_id=selected.action_id,
         )
 
     def run(
@@ -269,6 +297,7 @@ class Orchestrator:
                     phase="WAITING_APPROVAL" if waiting else "SECURITY_BLOCKED",
                     successful=False,
                 )
+                self._set_policy_stop_reason(state, blocked)
                 self._save_checkpoint(state, "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED")
                 return self._security_blocked_result(
                     task_id,
@@ -581,6 +610,11 @@ class Orchestrator:
             state.checkpoint("TASK_COMPLETED", status="COMPLETED", phase="TASK_COMPLETED", successful=True)
             self._save_checkpoint(state, "TASK_COMPLETED")
         else:
+            state.set_stop_reason(
+                TaskStopReasonCode.TASK_FAILED,
+                step_id=state.current_step or None,
+                action_id=self._action_id_for_step(state, state.current_step) if state.current_step else None,
+            )
             state.checkpoint("TASK_FAILED", status="FAILED", phase="TASK_FAILED", successful=False)
             self._save_checkpoint(state, "TASK_FAILED")
         self.experience_memory.store(experience)
@@ -840,6 +874,7 @@ class Orchestrator:
                 status="WAITING_APPROVAL" if waiting else "BLOCKED",
                 phase="WAITING_APPROVAL" if waiting else "RESUME_SECURITY_BLOCKED",
             )
+            self._set_policy_stop_reason(state, blocked)
             self._save_checkpoint(state, "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED")
             return False, decisions
         state.checkpoint("APPROVAL_REVALIDATED", status="READY", phase="APPROVAL_REVALIDATED", successful=True)
@@ -1165,6 +1200,11 @@ class Orchestrator:
             state.checkpoint("TASK_COMPLETED", status="COMPLETED", phase="TASK_COMPLETED", successful=True)
             self._save_checkpoint(state, "TASK_COMPLETED")
         else:
+            state.set_stop_reason(
+                TaskStopReasonCode.TASK_FAILED,
+                step_id=state.current_step or None,
+                action_id=self._action_id_for_step(state, state.current_step) if state.current_step else None,
+            )
             state.checkpoint("TASK_FAILED", status="FAILED", phase="TASK_FAILED")
             self._save_checkpoint(state, "TASK_FAILED")
         self.experience_memory.store(experience)
@@ -1212,11 +1252,24 @@ class Orchestrator:
         *,
         decisions: list[PolicyDecision] | None = None,
     ) -> dict[str, Any]:
+        execution_unknown = state.status == "EXECUTION_UNKNOWN"
         waiting = state.status == "WAITING_APPROVAL"
         unresolved_unknown = "ambiguous_execution_state" in reason
         if not waiting and not unresolved_unknown:
             state.transition("BLOCKED", phase="RESUME_BLOCKED")
         state.recovery_state = {**state.recovery_state, "reason": reason}
+        if execution_unknown:
+            state.set_stop_reason(
+                TaskStopReasonCode.EXECUTION_UNKNOWN,
+                step_id=state.current_step or None,
+                action_id=self._action_id_for_step(state, state.current_step) if state.current_step else None,
+            )
+        elif decisions:
+            self._set_policy_stop_reason(state, decisions)
+        elif waiting:
+            # Keep the state reason absent when resume failed for a different,
+            # unclassified cause; do not claim approval is still the blocker.
+            state.set_stop_reason(None)
         result = dict(state.result or {})
         result.update(
             {

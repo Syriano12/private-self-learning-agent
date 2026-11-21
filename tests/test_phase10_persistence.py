@@ -9,7 +9,7 @@ import pytest
 from private_agent.core.execution import ExecutionContext
 from private_agent.core.orchestrator import Orchestrator, TaskInterrupted
 from private_agent.core.planner import PlanStep, TaskPlan
-from private_agent.core.task_state import InvalidStateTransition, StateIntegrityError, TaskState
+from private_agent.core.task_state import InvalidStateTransition, StateIntegrityError, TaskState, canonical_fingerprint
 from private_agent.security import SecurityController, SecurityPolicy
 from private_agent.storage import Store
 from private_agent.tools.contracts import ToolResult
@@ -99,8 +99,9 @@ def test_task_creation_and_durable_checkpoints(tmp_path: Path) -> None:
     assert state is not None
     assert state["task_id"] == result["task_id"]
     assert state["goal"] == "persist creation"
-    assert state["state_version"] == 1
+    assert state["state_version"] == 2
     assert state["status"] == "COMPLETED"
+    assert state["stop_reason"] is None
     assert state["last_successful_checkpoint"] == "TASK_COMPLETED"
     checkpoint_types = [row["checkpoint_type"] for row in store.task_checkpoints(result["task_id"])]
     assert checkpoint_types[:3] == ["TASK_CREATED", "TASK_PLANNING", "PLAN_CREATED"]
@@ -110,7 +111,33 @@ def test_task_creation_and_durable_checkpoints(tmp_path: Path) -> None:
     assert "AFTER_VERIFICATION" in checkpoint_types
     assert "TASK_COMPLETED" in checkpoint_types
     assert store.get_task_state_row(result["task_id"])["state_fingerprint"] == state["state_fingerprint"]
+    assert store.get_task_state_row(result["task_id"])["state_version"] == 2
     store.close()
+
+
+def test_v1_state_migrates_with_unavailable_reason_and_validates_legacy_fingerprint() -> None:
+    legacy_state = TaskState.create("legacy-task", "legacy failure")
+    legacy_state.transition("FAILED", phase="TASK_FAILED")
+    payload = legacy_state.to_dict()
+    payload.pop("stop_reason")
+    payload["state_version"] = 1
+    payload["state_fingerprint"] = ""
+    payload["state_fingerprint"] = canonical_fingerprint(payload)
+    # Old readers ignored unversioned fields. The migration does too, so an
+    # appended reason is never trusted as historical evidence.
+    payload["stop_reason"] = {"code": "TASK_FAILED", "step_id": "forged-legacy-reason"}
+
+    migrated = TaskState.from_dict(payload)
+
+    assert migrated.state_version == 2
+    assert migrated.status == "FAILED"
+    assert migrated.stop_reason is None
+    assert migrated.state_fingerprint != payload["state_fingerprint"]
+
+    corrupted = dict(payload)
+    corrupted["goal"] = "modified legacy state"
+    with pytest.raises(StateIntegrityError, match="state_fingerprint_mismatch"):
+        TaskState.from_dict(corrupted)
 
 
 def test_successful_resume_after_normal_interruption(tmp_path: Path) -> None:
@@ -543,7 +570,7 @@ def test_atomic_checkpoint_rows_are_self_consistent_and_auditable(tmp_path: Path
     for checkpoint in checkpoints:
         payload = json.loads(checkpoint["state_json"])
         assert payload["state_fingerprint"] == checkpoint["state_fingerprint"]
-        assert payload["state_version"] == checkpoint["state_version"] == 1
+        assert payload["state_version"] == checkpoint["state_version"] == 2
     audit_types = {event["event_type"] for event in agent.security.audit.list(task_id=result["task_id"])} if agent.security else set()
     assert not audit_types or "CHECKPOINT_SAVED" in audit_types
     store.close()

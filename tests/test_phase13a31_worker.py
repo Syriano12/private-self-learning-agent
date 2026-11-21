@@ -166,7 +166,9 @@ def test_expired_lease_becomes_execution_unknown_and_is_not_retried(tmp_path: Pa
     assert recovered["status"] == "EXECUTION_UNKNOWN"
     assert recovered["task_id"] == created["task_id"]
     assert service.orchestrator.tools._tools["safe"].calls == 0
-    assert store.get_task_state(created["task_id"])["status"] == "EXECUTION_UNKNOWN"
+    state = store.get_task_state(created["task_id"])
+    assert state["status"] == "EXECUTION_UNKNOWN"
+    assert state["stop_reason"]["code"] == "EXECUTION_UNKNOWN"
     assert store.task_queue_record(created["task_id"])["queue_status"] == "EXECUTION_UNKNOWN"
     assert worker.run_once()["status"] == "NO_TASK"
     store.close()
@@ -204,7 +206,9 @@ def test_failure_before_execution_is_failed_without_tool_side_effect(tmp_path: P
     assert result["status"] == "FAILED"
     assert result["error_code"] == "worker_failed"
     assert service.orchestrator.tools._tools["safe"].calls == 0
-    assert store.get_task_state(created["task_id"])["status"] == "FAILED"
+    state = store.get_task_state(created["task_id"])
+    assert state["status"] == "FAILED"
+    assert state["stop_reason"]["code"] == "WORKER_FAILED"
     assert store.task_queue_record(created["task_id"])["queue_status"] == "FAILED"
     store.close()
 
@@ -257,7 +261,9 @@ def test_interruption_after_execution_is_unknown_and_not_automatically_reexecute
 
     assert result["status"] == "EXECUTION_UNKNOWN"
     assert tool.calls == 1
-    assert store.get_task_state(created["task_id"])["status"] == "EXECUTION_UNKNOWN"
+    state = store.get_task_state(created["task_id"])
+    assert state["status"] == "EXECUTION_UNKNOWN"
+    assert state["stop_reason"]["code"] == "EXECUTION_UNKNOWN"
     assert store.task_queue_record(created["task_id"])["queue_status"] == "EXECUTION_UNKNOWN"
     assert worker.run_once()["status"] == "NO_TASK"
     assert tool.calls == 1

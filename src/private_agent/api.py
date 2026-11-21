@@ -26,7 +26,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from private_agent.core.llm import build_provider
 from private_agent.core.orchestrator import Orchestrator
-from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH, TASK_STATUSES, StateIntegrityError, TaskState
+from private_agent.core.task_state import (
+    MAX_TASK_GOAL_LENGTH,
+    TASK_STATUSES,
+    StateIntegrityError,
+    TaskState,
+    TaskStopReason,
+    TaskStopReasonCode,
+)
 from private_agent.auth import (
     ACTIVE,
     CSRF_COOKIE_NAME,
@@ -343,6 +350,14 @@ class TaskStatusFilter(str, Enum):
     COMPLETED = "COMPLETED"
 
 
+class TaskStopReasonResponse(APIModel):
+    """Closed public reason code and safe identifiers; no free-form detail."""
+
+    code: TaskStopReasonCode
+    step_id: str | None = None
+    action_id: str | None = None
+
+
 class TaskSummaryResponse(APIModel):
     task_id: str
     goal: str
@@ -361,6 +376,7 @@ class TaskSummaryResponse(APIModel):
     last_error_code: str = ""
     waiting_for_approval: bool = False
     execution_unknown: bool = False
+    stop_reason: TaskStopReasonResponse | None = None
 
 
 class TaskListResponse(APIModel):
@@ -448,6 +464,7 @@ class TaskStateResponse(APIModel):
     created_at: str
     updated_at: str
     queue_status: str = ""
+    stop_reason: TaskStopReasonResponse | None = None
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
@@ -728,6 +745,16 @@ def _verification_status(state: TaskState) -> str:
         if result_status:
             verification_status = str(result_status)
     return verification_status
+
+
+def _task_stop_reason_response(reason: TaskStopReason | None) -> TaskStopReasonResponse | None:
+    if reason is None:
+        return None
+    return TaskStopReasonResponse(
+        code=reason.code,
+        step_id=reason.step_id,
+        action_id=reason.action_id,
+    )
 
 
 def _request_id(request: Request) -> str:
@@ -1204,6 +1231,7 @@ class AgentAPIService:
             created_at=state.created_at,
             updated_at=state.updated_at,
             queue_status=str(queue.get("queue_status", "")),
+            stop_reason=_task_stop_reason_response(state.stop_reason),
             request_id=request_id,
         )
 
@@ -1294,6 +1322,7 @@ class AgentAPIService:
                     last_error_code=str(row["last_error_code"]),
                     waiting_for_approval=state.status == "WAITING_APPROVAL",
                     execution_unknown=state.status == "EXECUTION_UNKNOWN",
+                    stop_reason=_task_stop_reason_response(state.stop_reason),
                 )
             )
         next_cursor = None
