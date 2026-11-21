@@ -14,6 +14,8 @@ def _insert_historical_knowledge(
     item_id: str,
     verification_status: str,
     source_reliability: float,
+    evidence: str = "synthetic legacy evidence",
+    last_verified_at: str = "",
 ) -> None:
     created_at = datetime.now(timezone.utc).isoformat()
     store.db.execute(
@@ -30,7 +32,7 @@ def _insert_historical_knowledge(
             "fact",
             f"synthetic {item_id} content",
             "synthetic historical source",
-            "synthetic evidence",
+            evidence,
             0.9,
             verification_status,
             source_reliability,
@@ -39,7 +41,7 @@ def _insert_historical_knowledge(
             0.0,
             created_at,
             created_at,
-            "",
+            last_verified_at,
             "[]",
             "[]",
             "[]",
@@ -54,8 +56,7 @@ class CapturingProvider:
     def generate_json(self, *, system_prompt: str, user_prompt: str, response_schema: dict):
         import json
 
-        import_context = json.loads(user_prompt)
-        self.context = import_context
+        self.context = json.loads(user_prompt)
         return LLMResponse(
             {
                 "goal": "legacy planning marker",
@@ -76,7 +77,7 @@ class CapturingProvider:
         )
 
 
-def test_only_verified_legacy_knowledge_reaches_planner_context(tmp_path) -> None:
+def test_legacy_knowledge_fails_closed_at_planner_boundary(tmp_path) -> None:
     store = Store(tmp_path / "legacy-trust.sqlite3")
     store.add_knowledge(
         KnowledgeItem(
@@ -101,35 +102,51 @@ def test_only_verified_legacy_knowledge_reaches_planner_context(tmp_path) -> Non
     assert written_by_current_api["source_reliability"] == 0.0
     assert written_by_current_api["last_verified_at"] == ""
 
-    # These rows model existing database entries from earlier storage versions.
+    # This legacy row reproduces the review challenge: an old verified label
+    # with positive reliability, but no verification timestamp or evidence.
+    _insert_historical_knowledge(
+        store,
+        item_id="historical-verified-empty-evidence",
+        verification_status="verified",
+        source_reliability=0.9,
+        evidence="",
+    )
+    # Even apparently complete legacy fields are not a trusted attestation:
+    # the old schema cannot bind them to typed, verified provenance.
+    _insert_historical_knowledge(
+        store,
+        item_id="historical-verified-populated",
+        verification_status="verified",
+        source_reliability=0.9,
+        evidence="synthetic excerpt that appears relevant",
+        last_verified_at=datetime.now(timezone.utc).isoformat(),
+    )
     _insert_historical_knowledge(
         store,
         item_id="historical-needs-review",
         verification_status="needs_review",
         source_reliability=0.9,
     )
-    _insert_historical_knowledge(
-        store,
-        item_id="historical-unverified",
-        verification_status="unverified",
-        source_reliability=0.9,
-    )
-    _insert_historical_knowledge(
-        store,
-        item_id="historical-verified-zero-reliability",
-        verification_status="verified",
-        source_reliability=0.0,
-    )
-    _insert_historical_knowledge(
-        store,
-        item_id="historical-verified",
-        verification_status="verified",
-        source_reliability=0.6,
-    )
     store.db.commit()
 
+    before = [
+        tuple(row)
+        for row in store.db.execute(
+            "SELECT id, verification_status, evidence, last_verified_at "
+            "FROM knowledge_items ORDER BY id"
+        ).fetchall()
+    ]
     relevant = store.search_knowledge("legacy planning marker")
-    assert [item["id"] for item in relevant] == ["historical-verified"]
+    assert relevant == []
+    after = [
+        tuple(row)
+        for row in store.db.execute(
+            "SELECT id, verification_status, evidence, last_verified_at "
+            "FROM knowledge_items ORDER BY id"
+        ).fetchall()
+    ]
+    assert after == before, "retrieval must not mutate or discard persisted knowledge"
+    assert len(after) == 4
 
     provider = CapturingProvider()
     tools = ToolRegistry()
@@ -137,6 +154,5 @@ def test_only_verified_legacy_knowledge_reaches_planner_context(tmp_path) -> Non
     plan = Planner(provider).create("legacy planning marker", tools, relevant)
 
     assert plan.steps[0].tool == "web_research"
-    assert provider.context["relevant_memory"] == relevant
-    assert provider.context["relevant_memory"][0]["verification_status"] == "verified"
+    assert provider.context["relevant_memory"] == []
     store.close()

@@ -2979,23 +2979,10 @@ class Store:
             raise KnowledgeValidationError("knowledge_query_invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
             raise KnowledgeValidationError("knowledge_query_limit_invalid")
-        terms = [t.lower() for t in query.split() if len(t) > 2]
-        rows = self.db.execute("SELECT * FROM knowledge_items ORDER BY confidence DESC, updated_at DESC").fetchall()
-        scored = []
-        for row in rows:
-            verification_status = str(row["verification_status"]).strip().lower()
-            try:
-                source_reliability = float(row["source_reliability"])
-            except (TypeError, ValueError, OverflowError):
-                continue
-            # Current writes cannot attest legacy knowledge; only preserve the
-            # narrow verified, positive-reliability shape written by older code.
-            if verification_status != "verified" or not (0.0 < source_reliability <= 1.0):
-                continue
-            text = f"{row['concept']} {row['content']} {row['domain']}".lower()
-            score = sum(term in text for term in terms)
-            if score: scored.append((score, dict(row)))
-        result = [item for _, item in sorted(scored, key=lambda x: (x[0], x[1]['confidence']), reverse=True)[:limit]]
+        # Legacy knowledge_items do not bind their status, reliability, source,
+        # evidence, or verification time to a trusted provenance attestation.
+        # Fail closed for planner retrieval without changing or deleting rows.
+        result: list[dict[str, Any]] = []
         self._emit_observability(
             "MEMORY_RETRIEVED",
             metadata={"memory_type": "knowledge", "result_count": len(result)},
