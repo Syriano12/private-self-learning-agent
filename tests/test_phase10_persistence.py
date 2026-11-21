@@ -27,6 +27,7 @@ class DurableTool:
         self.name = name
         self.outcomes = list(outcomes or [ToolResult.success({"result": name})])
         self.calls = 0
+        self.previous_results_seen: list[dict[str, object]] = []
         self.required_capabilities = list(capabilities or [])
         self.declared_capabilities = list(capabilities or [])
         self.risk_level = risk
@@ -43,6 +44,7 @@ class DurableTool:
 
     def execute(self, inputs: dict, context: ExecutionContext) -> ToolResult:
         self.calls += 1
+        self.previous_results_seen.append(dict(context.previous_results))
         return self.outcomes.pop(0) if self.outcomes else ToolResult.success({"result": self.name})
 
 
@@ -66,14 +68,21 @@ def registry(*items: DurableTool) -> ToolRegistry:
     return result
 
 
-def step(tool: str = "safe", *, step_id: str = "step-1", value: str = "x", criteria: dict | None = None) -> PlanStep:
+def step(
+    tool: str = "safe",
+    *,
+    step_id: str = "step-1",
+    value: str = "x",
+    criteria: dict | None = None,
+    depends_on: list[str] | None = None,
+) -> PlanStep:
     return PlanStep(
         step_id,
         "durable action",
         tool,
         {"value": value},
         "controlled test",
-        [],
+        depends_on or [],
         success_criteria=criteria or {"required_fields": ["result"]},
     )
 
@@ -360,7 +369,7 @@ def test_resume_continues_from_last_verified_step_without_reexecuting_it(tmp_pat
         registry(first_tool, second_tool),
         planner=StubPlanner([
             step("first", step_id="first-step"),
-            step("second", step_id="second-step"),
+            step("second", step_id="second-step", depends_on=["first-step"]),
         ]),
         checkpoint_hook=interrupt,
     )
@@ -378,16 +387,80 @@ def test_resume_continues_from_last_verified_step_without_reexecuting_it(tmp_pat
         registry(first_tool, second_tool),
         planner=StubPlanner([
             step("first", step_id="first-step"),
-            step("second", step_id="second-step"),
+            step("second", step_id="second-step", depends_on=["first-step"]),
         ]),
     )
     result = restarted.resume_task(task_id)
     assert result["final_status"] == "COMPLETED"
     assert first_tool.calls == 1
     assert second_tool.calls == 1
+    assert second_tool.previous_results_seen[0]["first-step"].output == {"result": "first"}
     state_after = TaskState.from_dict(restarted_store.get_task_state(task_id))
     assert first_key in state_after.completed_actions
     assert len(state_after.completed_actions) == 2
+    restarted_store.close()
+
+
+@pytest.mark.parametrize("record_issue", ["missing", "conflicting", "untrusted_output", "malformed_unrelated_record"])
+def test_resume_fails_closed_when_persisted_action_record_is_untrusted(tmp_path: Path, record_issue: str) -> None:
+    first_tool = DurableTool("first")
+    second_tool = DurableTool("second")
+    path = tmp_path / f"untrusted-record-{record_issue}.sqlite3"
+
+    def interrupt(checkpoint: str, state: dict) -> None:
+        if checkpoint == "AFTER_VERIFICATION" and state.get("current_step") == "first-step":
+            raise TaskInterrupted("interrupted between verified steps")
+
+    plan_steps = [
+        step("first", step_id="first-step"),
+        step("second", step_id="second-step", depends_on=["first-step"]),
+    ]
+    store = Store(path)
+    agent = Orchestrator(
+        store,
+        registry(first_tool, second_tool),
+        planner=StubPlanner(plan_steps),
+        checkpoint_hook=interrupt,
+    )
+    with pytest.raises(TaskInterrupted):
+        agent.run("untrusted multi-step resume")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    state = TaskState.from_dict(store.get_task_state(task_id))
+    first_key = state.completed_actions[0]
+    if record_issue == "missing":
+        state.action_records.pop(first_key)
+    elif record_issue == "conflicting":
+        state.action_records[first_key]["step_id"] = "different-step"
+    elif record_issue == "untrusted_output":
+        state.action_records[first_key]["output"]["status"] = "failed"
+    else:
+        state.action_records["malformed-unrelated"] = None
+    state.touch()
+    if record_issue == "malformed_unrelated_record":
+        store.db.execute(
+            "UPDATE task_states SET state_json = ?, state_fingerprint = ? WHERE task_id = ?",
+            (json.dumps(state.to_dict(), ensure_ascii=False, sort_keys=True), state.state_fingerprint, task_id),
+        )
+        store.db.commit()
+    else:
+        store.save_task_state(state, "TEST_UNTRUSTED_ACTION_RECORD")
+    store.close()
+
+    restarted_store = Store(path)
+    restarted = Orchestrator(
+        restarted_store,
+        registry(first_tool, second_tool),
+        planner=StubPlanner(plan_steps),
+    )
+    result = restarted.resume_task(task_id)
+
+    assert result["final_status"] == "BLOCKED"
+    assert first_tool.calls == 1
+    assert second_tool.calls == 0
+    if record_issue == "malformed_unrelated_record":
+        persisted = restarted_store.get_task_state(task_id)
+        assert persisted["status"] == "BLOCKED"
+        assert persisted["action_records"]["malformed-unrelated"]["status"] == "FAILED"
     restarted_store.close()
 
 

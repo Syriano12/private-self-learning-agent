@@ -776,6 +776,44 @@ class Orchestrator:
                 )
             return state.result or self._resume_failure(task_id, "terminal_state_missing_result")
 
+        invalid_action_record_keys = [
+            key for key, record in state.action_records.items() if not isinstance(record, dict)
+        ]
+        if invalid_action_record_keys:
+            for key in invalid_action_record_keys:
+                state.action_records[key] = {
+                    "action_key": key,
+                    "status": "FAILED",
+                    "execution_status": "failed",
+                    "step_id": "",
+                    "tool_name": "",
+                    "input_fingerprint": "",
+                    "output": None,
+                    "observation": None,
+                    "verification": None,
+                    "approval_id": "",
+                    "updated_at": state.updated_at,
+                }
+                state.completed_actions = [item for item in state.completed_actions if item != key]
+                state.pending_actions = [item for item in state.pending_actions if item != key]
+                if key not in state.failed_actions:
+                    state.failed_actions.append(key)
+            state.recovery_state = {
+                **state.recovery_state,
+                "invalid_action_record_keys": invalid_action_record_keys,
+            }
+            state.touch()
+            if state.status == "EXECUTING":
+                state.transition("EXECUTION_UNKNOWN", phase="EXECUTION_UNKNOWN", step_id=state.current_step)
+            elif state.status == "WAITING_APPROVAL":
+                state.transition("BLOCKED", phase="RESUME_BLOCKED")
+            reason = (
+                "ambiguous_execution_state_invalid_action_record"
+                if state.status == "EXECUTION_UNKNOWN"
+                else "invalid_persisted_action_record"
+            )
+            return self._resume_blocked(state, reason)
+
         self.recovery.attempts.clear()
         self._audit_task_event(state, "TASK_RESUMED", "Task state loaded after process restart")
         if self.security is None:
@@ -917,6 +955,42 @@ class Orchestrator:
         return False
 
     def _resume_execute_state(self, state: TaskState, current_plan: TaskPlan) -> dict[str, Any]:
+        completed_actions = set(state.completed_actions)
+        verified_previous_results: dict[str, StepResult] = {}
+        for step in current_plan.steps:
+            key = state.action_key_for_step(step)
+            record = state.action_records.get(key)
+            if key not in completed_actions:
+                if isinstance(record, dict) and record.get("status") == "VERIFIED":
+                    return self._resume_blocked(state, "persisted_action_completion_conflict")
+                continue
+            record_verification = record.get("verification") if isinstance(record, dict) else None
+            state_verification = state.verification_results.get(key)
+            try:
+                step_result = self._step_result_from_dict(record.get("output")) if isinstance(record, dict) else None
+            except (KeyError, TypeError, ValueError):
+                step_result = None
+            if (
+                not isinstance(record, dict)
+                or record.get("action_key") != key
+                or record.get("status") != "VERIFIED"
+                or record.get("step_id") != step.id
+                or record.get("tool_name") != step.tool
+                or record.get("input_fingerprint") != key
+                or record.get("execution_status") != "success"
+                or not isinstance(record_verification, dict)
+                or record_verification.get("status") != "VERIFIED"
+                or record_verification.get("verified") is not True
+                or state_verification != record_verification
+                or step_result is None
+                or step_result.step_id != step.id
+                or step_result.tool_name != step.tool
+                or step_result.status != "success"
+                or step_result.error is not None
+            ):
+                return self._resume_blocked(state, "persisted_verified_action_untrusted")
+            verified_previous_results[step.id] = step_result
+
         prior = list(state.context.get("prior_knowledge_used", []))
         learned_context = list(state.context.get("learned_strategies_used", []))
         retrieved_payload = list(state.context.get("retrieved_experiences", []))
@@ -971,6 +1045,7 @@ class Orchestrator:
                 break
             context = ExecutionContext(
                 task_id=state.task_id,
+                previous_results=dict(verified_previous_results),
                 approved_permissions=set(self.approved_permissions),
                 metadata={"attempt": rounds, "goal": state.goal},
                 security_controller=self.security,
