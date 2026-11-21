@@ -135,7 +135,9 @@ class Orchestrator:
         self._checkpoint(state, "TASK_CREATED", phase="TASK_CREATED", successful=True)
         state.checkpoint("TASK_PLANNING", status="PLANNING", phase="PLANNING", successful=True)
         self._save_checkpoint(state, "TASK_PLANNING")
-        prior = self.store.search_knowledge(goal)
+        # Legacy knowledge rows are advisory and have no source-bound trust
+        # record. Only signed, fresh typed claims may enter planning context.
+        prior = self.store.search_knowledge_claims(goal)
         retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal))
         retrieved_payload = [item.to_dict() for item in retrieved]
         reflection_context = [

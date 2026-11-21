@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import re
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from private_agent.core.experience import sanitize_value
@@ -21,7 +23,9 @@ MAX_EXCERPT_LENGTH = 2048
 MAX_SOURCE_CONTENT_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 4096
 MAX_EVIDENCE_IDS = 32
+MAX_CONFLICT_SUPPRESSIONS = 256
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_KEY_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 _SENSITIVE_QUERY_PARTS = ("token", "secret", "password", "credential", "authorization", "api_key", "apikey", "signature")
 
 SOURCE_TYPES = frozenset({"web", "repository", "document", "local", "user"})
@@ -164,6 +168,258 @@ def _ordered_json(value: Any) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class KnowledgeAttestation:
+    """A signed issuer assertion binding a claim snapshot to its source and evidence."""
+
+    attestation_id: str
+    source_snapshot: dict[str, Any]
+    claim_snapshot: dict[str, Any]
+    evidence_snapshots: list[dict[str, Any]]
+    verified_by: str
+    verified_at: str
+    key_id: str
+    signature: str = ""
+    attestation_version: int = 2
+    conflict_suppression_ids: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "attestation_id", _identifier(self.attestation_id, "attestation_id"))
+        if (
+            not isinstance(self.attestation_version, int)
+            or isinstance(self.attestation_version, bool)
+            or self.attestation_version not in {1, 2}
+        ):
+            raise _error("attestation_version_unsupported")
+        if not isinstance(self.source_snapshot, dict) or not isinstance(self.claim_snapshot, dict):
+            raise _error("attestation_snapshot_invalid")
+        try:
+            source = KnowledgeSource(**dict(self.source_snapshot))
+            claim = KnowledgeClaim(**dict(self.claim_snapshot))
+        except (TypeError, ValueError) as exc:
+            raise _error("attestation_snapshot_invalid") from exc
+        if source.status != "ACTIVE":
+            raise _error("attestation_source_inactive")
+        if source.source_class == "unverified":
+            raise _error("attestation_source_unverified")
+        if claim.status != "SUPPORTED" or claim.verification_status != "verified":
+            raise _error("attestation_claim_not_verified")
+        object.__setattr__(self, "source_snapshot", json.loads(_ordered_json(source.to_dict())))
+        object.__setattr__(self, "claim_snapshot", json.loads(_ordered_json(claim.to_dict())))
+        if not isinstance(self.evidence_snapshots, list) or not 1 <= len(self.evidence_snapshots) <= MAX_EVIDENCE_IDS:
+            raise _error("attestation_evidence_invalid")
+        evidence_items: list[dict[str, Any]] = []
+        for raw in self.evidence_snapshots:
+            if not isinstance(raw, dict):
+                raise _error("attestation_evidence_invalid")
+            try:
+                item = KnowledgeEvidence(**dict(raw))
+            except (TypeError, ValueError) as exc:
+                raise _error("attestation_evidence_invalid") from exc
+            if (
+                item.claim_id != claim.claim_id
+                or item.source_id != source.source_id
+                or item.verification_status != "verified"
+            ):
+                raise _error("attestation_evidence_binding_mismatch")
+            evidence_items.append(item.to_dict())
+        evidence_items.sort(key=lambda item: (item["evidence_id"], item["evidence_fingerprint"]))
+        if len({item["evidence_id"] for item in evidence_items}) != len(evidence_items):
+            raise _error("attestation_evidence_duplicate")
+        object.__setattr__(self, "evidence_snapshots", json.loads(_ordered_json(evidence_items)))
+        object.__setattr__(self, "verified_by", _safe_text(self.verified_by, "attestation_verifier", max_length=256))
+        object.__setattr__(self, "verified_at", _timestamp(self.verified_at, "attestation_verified_at"))
+        if not isinstance(self.conflict_suppression_ids, list) or len(self.conflict_suppression_ids) > MAX_CONFLICT_SUPPRESSIONS:
+            raise _error("attestation_conflict_suppressions_invalid")
+        conflict_ids = [_identifier(item, "conflict_id") for item in self.conflict_suppression_ids]
+        if len(set(conflict_ids)) != len(conflict_ids):
+            raise _error("attestation_conflict_suppressions_duplicate")
+        if self.attestation_version == 1 and conflict_ids:
+            raise _error("attestation_conflict_suppressions_version_invalid")
+        object.__setattr__(self, "conflict_suppression_ids", sorted(conflict_ids))
+        if not isinstance(self.key_id, str) or not _KEY_ID_PATTERN.fullmatch(self.key_id):
+            raise _error("attestation_key_id_invalid")
+        if not isinstance(self.signature, str) or (self.signature and not _SHA256_PATTERN.fullmatch(self.signature)):
+            raise _error("attestation_signature_invalid")
+
+    def signed_payload(self) -> dict[str, Any]:
+        payload = {
+            "attestation_version": self.attestation_version,
+            "attestation_id": self.attestation_id,
+            "source_snapshot": self.source_snapshot,
+            "claim_snapshot": self.claim_snapshot,
+            "evidence_snapshots": self.evidence_snapshots,
+            "verified_by": self.verified_by,
+            "verified_at": self.verified_at,
+            "key_id": self.key_id,
+        }
+        if self.attestation_version >= 2:
+            payload["conflict_suppression_ids"] = self.conflict_suppression_ids
+        return payload
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.signed_payload(), "signature": self.signature}
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> KnowledgeAttestation:
+        allowed_v1 = {
+            "attestation_version", "attestation_id", "source_snapshot", "claim_snapshot",
+            "evidence_snapshots", "verified_by", "verified_at", "key_id", "signature",
+        }
+        allowed_v2 = allowed_v1 | {"conflict_suppression_ids"}
+        if not isinstance(payload, dict):
+            raise _error("attestation_payload_invalid")
+        version = payload.get("attestation_version")
+        if (version == 1 and set(payload) != allowed_v1) or (
+            version == 2 and set(payload) != allowed_v2
+        ) or version not in {1, 2}:
+            raise _error("attestation_payload_invalid")
+        return cls(**payload)
+
+
+class KnowledgeAttestor:
+    """Sign and verify issuer assertions; the key holder is the cryptographic trust root.
+
+    Issuance is disabled unless an authorization callback is configured. The
+    callback receives the reviewed bundle and must return the authenticated
+    reviewer's identity from trusted principal context. A valid HMAC proves who
+    signed these snapshots, not that the claim is true or the source is authentic.
+    """
+
+    MIN_KEY_BYTES = 32
+
+    def __init__(
+        self,
+        key: str | bytes,
+        *,
+        issuer_authorizer: Callable[
+            [KnowledgeSource, KnowledgeClaim, list[KnowledgeEvidence]], str | None
+        ] | None = None,
+    ) -> None:
+        if isinstance(key, str):
+            key = key.encode("utf-8")
+        if not isinstance(key, bytes) or len(key) < self.MIN_KEY_BYTES:
+            raise _error("knowledge_attestation_key_too_short")
+        if issuer_authorizer is not None and not callable(issuer_authorizer):
+            raise _error("knowledge_attestation_issuer_authorizer_invalid")
+        self._key = bytes(key)
+        self.key_id = sha256_hex(self._key)[:16]
+        self._issuer_authorizer = issuer_authorizer
+
+    def issue(
+        self,
+        source: KnowledgeSource,
+        claim: KnowledgeClaim,
+        evidence: list[KnowledgeEvidence],
+        *,
+        verified_at: str | None = None,
+    ) -> KnowledgeAttestation:
+        if self._issuer_authorizer is None:
+            raise _error("attestation_issuer_unauthorized")
+        if not isinstance(source, KnowledgeSource) or not isinstance(claim, KnowledgeClaim):
+            raise _error("attestation_bundle_types_required")
+        if not source.content_bound or source.content is None:
+            raise _error("attestation_source_content_required")
+        if source.status != "ACTIVE":
+            raise _error("attestation_source_inactive")
+        if source.source_class == "unverified":
+            raise _error("attestation_source_unverified")
+        if claim.status != "SUPPORTED" or claim.verification_status != "verified" or not claim.last_verified_at:
+            raise _error("attestation_claim_not_verified")
+        if not isinstance(evidence, list) or not 1 <= len(evidence) <= MAX_EVIDENCE_IDS:
+            raise _error("attestation_evidence_invalid")
+        if any(not isinstance(item, KnowledgeEvidence) for item in evidence):
+            raise _error("attestation_evidence_invalid")
+        if any(item.verification_status != "verified" for item in evidence):
+            raise _error("attestation_evidence_unverified")
+        if any(item.claim_id != claim.claim_id or item.source_id != source.source_id for item in evidence):
+            raise _error("attestation_evidence_binding_mismatch")
+        content = source.content.decode("utf-8") if isinstance(source.content, bytes) else source.content
+        sanitized_content = sanitize_value(content)
+        if not isinstance(sanitized_content, str):
+            raise _error("attestation_source_content_invalid")
+        normalized_content = re.sub(r"\s+", " ", sanitized_content).strip()
+        for item in evidence:
+            if item.excerpt not in normalized_content:
+                raise _error("attestation_evidence_not_in_source")
+        try:
+            issuer_identity = self._issuer_authorizer(source, claim, evidence)
+            if not isinstance(issuer_identity, str) or not issuer_identity.strip():
+                raise ValueError("issuer_identity_missing")
+            issuer = _safe_text(
+                issuer_identity, "attestation_verifier", max_length=256
+            )
+        except Exception as exc:
+            raise _error("attestation_issuer_unauthorized") from exc
+        checked_at = _timestamp(verified_at or _now(), "attestation_verified_at")
+        unsigned = KnowledgeAttestation(
+            attestation_id=str(uuid.uuid4()),
+            source_snapshot=source.to_dict(),
+            claim_snapshot=claim.to_dict(),
+            evidence_snapshots=[item.to_dict() for item in evidence],
+            verified_by=issuer,
+            verified_at=checked_at,
+            key_id=self.key_id,
+        )
+        signature = hmac.new(
+            self._key,
+            _ordered_json(unsigned.signed_payload()).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return KnowledgeAttestation.from_dict({**unsigned.to_dict(), "signature": signature})
+
+    def verify(self, attestation: KnowledgeAttestation | dict[str, Any]) -> bool:
+        try:
+            item = attestation if isinstance(attestation, KnowledgeAttestation) else KnowledgeAttestation.from_dict(attestation)
+            if not item.signature or item.key_id != self.key_id:
+                return False
+            expected = hmac.new(
+                self._key,
+                _ordered_json(item.signed_payload()).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            return hmac.compare_digest(expected, item.signature)
+        except (KnowledgeValidationError, TypeError, ValueError):
+            return False
+
+
+    def suppress_for_conflict(
+        self,
+        attestation: KnowledgeAttestation | dict[str, Any],
+        conflict_id: str,
+    ) -> KnowledgeAttestation:
+        """Add signed deny-only conflict state without authorizing knowledge."""
+        item = (
+            attestation
+            if isinstance(attestation, KnowledgeAttestation)
+            else KnowledgeAttestation.from_dict(attestation)
+        )
+        if not self.verify(item):
+            raise _error("knowledge_attestation_invalid")
+        normalized_conflict_id = _identifier(conflict_id, "conflict_id")
+        if normalized_conflict_id in item.conflict_suppression_ids:
+            return item
+        unsigned = KnowledgeAttestation(
+            attestation_id=item.attestation_id,
+            source_snapshot=item.source_snapshot,
+            claim_snapshot=item.claim_snapshot,
+            evidence_snapshots=item.evidence_snapshots,
+            verified_by=item.verified_by,
+            verified_at=item.verified_at,
+            key_id=self.key_id,
+            attestation_version=2,
+            conflict_suppression_ids=sorted(
+                [*item.conflict_suppression_ids, normalized_conflict_id]
+            ),
+        )
+        signature = hmac.new(
+            self._key,
+            _ordered_json(unsigned.signed_payload()).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return KnowledgeAttestation.from_dict({**unsigned.to_dict(), "signature": signature})
 
 
 @dataclass(frozen=True)
@@ -401,6 +657,8 @@ class KnowledgeConflict:
 __all__ = [
     "CLAIM_STATUSES",
     "CONFLICT_STATUSES",
+    "KnowledgeAttestation",
+    "KnowledgeAttestor",
     "KnowledgeClaim",
     "KnowledgeConflict",
     "KnowledgeEvidence",
