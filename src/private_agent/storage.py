@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import uuid
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from private_agent.core.knowledge import (
+    KnowledgeAttestation,
+    KnowledgeAttestor,
     KnowledgeClaim,
     KnowledgeConflict,
     KnowledgeEvidence,
@@ -323,7 +326,7 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 
 _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
     2: {
@@ -443,6 +446,13 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
             "worker_id": "TEXT", "nonce": "TEXT", "seen_at": "TEXT", "request_digest": "TEXT",
         },
     },
+    13: {
+        "knowledge_attestations": {
+            "attestation_id": "TEXT", "claim_id": "TEXT", "source_id": "TEXT",
+            "claim_version": "INTEGER", "key_id": "TEXT", "signature": "TEXT",
+            "attestation_json": "TEXT", "created_at": "TEXT",
+        },
+    },
 }
 
 _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -470,6 +480,7 @@ _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
     "idx_remote_worker_jobs_claim": ("status", "worker_id", "created_at", "job_id"),
     "idx_remote_worker_jobs_lease": ("status", "lease_expires_at", "job_id"),
     "idx_remote_worker_jobs_idempotency": ("worker_id", "idempotency_key"),
+    "idx_knowledge_attestations_claim": ("claim_id", "claim_version", "created_at", "attestation_id"),
 }
 
 
@@ -482,7 +493,12 @@ class QueueLeaseLost(RuntimeError):
 
 
 class Store:
-    def __init__(self, path: str | Path = "data/agent.sqlite3") -> None:
+    def __init__(
+        self,
+        path: str | Path = "data/agent.sqlite3",
+        *,
+        knowledge_attestation_key: str | bytes | None = None,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db_lock = _database_lock(self.path)
@@ -500,9 +516,9 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self._lease_local = threading.local()
         self._approval_gate: Any | None = None
-        # No trusted knowledge-ingestion boundary exists yet. Caller-supplied
-        # source class, content binding, and verification fields remain
-        # advisory and cannot create an in-process trust authority.
+        if knowledge_attestation_key is None:
+            knowledge_attestation_key = os.environ.get("AGENT_KNOWLEDGE_ATTESTATION_KEY")
+        self._knowledge_attestor = KnowledgeAttestor(knowledge_attestation_key) if knowledge_attestation_key else None
         with self._db_lock:
             self.init_schema()
 
@@ -763,6 +779,11 @@ class Store:
                 ("index", "idx_remote_worker_jobs_lease"),
                 ("index", "idx_remote_worker_jobs_idempotency"),
             )
+        if version == 13:
+            return (
+                ("table", "knowledge_attestations"),
+                ("index", "idx_knowledge_attestations_claim"),
+            )
         return ()
 
     def _assert_migration_objects(self, version: int) -> None:
@@ -797,6 +818,11 @@ class Store:
                     "task_queue": ("CHECK (QUEUE_STATUS IN", "FOREIGN KEY (TASK_ID)"),
                 "knowledge_claims": ("CHECK (CONFIDENCE >= 0 AND CONFIDENCE <= 1)", "CHECK (VERSION >= 1)"),
                 "knowledge_evidence": ("FOREIGN KEY (CLAIM_ID)", "FOREIGN KEY (SOURCE_ID)"),
+                "knowledge_attestations": (
+                    "CHECK (CLAIM_VERSION >= 1)",
+                    "FOREIGN KEY (CLAIM_ID)",
+                    "FOREIGN KEY (SOURCE_ID)",
+                ),
                 "knowledge_conflicts": ("CHECK (CLAIM_ID <> CONFLICTING_CLAIM_ID)", "FOREIGN KEY (CLAIM_ID)", "FOREIGN KEY (CONFLICTING_CLAIM_ID)"),
                 "auth_users": ("CHECK (ROLE IN ('OWNER', 'OPERATOR', 'VIEWER'))", "CHECK (STATUS IN ('ACTIVE', 'DISABLED'))"),
                 "auth_sessions": ("FOREIGN KEY (USER_ID)",),
@@ -1358,6 +1384,25 @@ class Store:
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_worker_jobs_lease ON remote_worker_jobs(status, lease_expires_at, job_id)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_worker_jobs_idempotency ON remote_worker_jobs(worker_id, idempotency_key)")
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (12, now()))
+            return
+        if version == 13:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS knowledge_attestations (
+              attestation_id TEXT PRIMARY KEY,
+              claim_id TEXT NOT NULL,
+              source_id TEXT NOT NULL,
+              claim_version INTEGER NOT NULL CHECK (claim_version >= 1),
+              key_id TEXT NOT NULL,
+              signature TEXT NOT NULL,
+              attestation_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (claim_id) REFERENCES knowledge_claims(claim_id),
+              FOREIGN KEY (source_id) REFERENCES knowledge_sources(source_id)
+            )""")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_attestations_claim "
+                "ON knowledge_attestations(claim_id, claim_version, created_at, attestation_id)"
+            )
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (13, now()))
             return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
@@ -2782,11 +2827,70 @@ class Store:
         )
         return conflict
 
+    def _suppress_knowledge_attestations_for_conflict(self, conflict: KnowledgeConflict) -> None:
+        if conflict.status != "OPEN":
+            return
+        claim_ids = sorted(
+            {item for item in (conflict.claim_id, conflict.conflicting_claim_id) if item}
+        )
+        if not claim_ids:
+            return
+        rows = self.db.execute(
+            "SELECT * FROM knowledge_attestations ORDER BY created_at, attestation_id"
+        ).fetchall()
+        if self._knowledge_attestor is None:
+            if rows:
+                raise KnowledgeValidationError("knowledge_attestation_key_missing")
+            return
+        for row in rows:
+            try:
+                attestation = KnowledgeAttestation.from_dict(
+                    json.loads(str(row["attestation_json"]))
+                )
+            except (KnowledgeValidationError, TypeError, ValueError):
+                if str(row["claim_id"]) in claim_ids:
+                    raise KnowledgeValidationError("knowledge_attestation_invalid")
+                continue
+            signed_claim_id = str(attestation.claim_snapshot["claim_id"])
+            if signed_claim_id not in claim_ids:
+                if str(row["claim_id"]) in claim_ids:
+                    raise KnowledgeValidationError("knowledge_attestation_invalid")
+                continue
+            if not self._knowledge_attestor.verify(attestation):
+                raise KnowledgeValidationError("knowledge_attestation_invalid")
+            updated = self._knowledge_attestor.suppress_for_conflict(
+                attestation, conflict.conflict_id
+            )
+            attestation_json = json.dumps(
+                updated.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            cursor = self.db.execute(
+                """UPDATE knowledge_attestations
+                   SET attestation_id = ?, claim_id = ?, source_id = ?, claim_version = ?,
+                       key_id = ?, signature = ?, attestation_json = ?, created_at = ?
+                   WHERE attestation_id = ?""",
+                (
+                    updated.attestation_id,
+                    updated.claim_snapshot["claim_id"],
+                    updated.source_snapshot["source_id"],
+                    updated.claim_snapshot["version"],
+                    updated.key_id,
+                    updated.signature,
+                    attestation_json,
+                    updated.verified_at,
+                    row["attestation_id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KnowledgeValidationError("knowledge_attestation_conflict_update_failed")
+
     def save_knowledge_conflict(self, conflict: KnowledgeConflict) -> KnowledgeConflict:
         if not isinstance(conflict, KnowledgeConflict):
             raise KnowledgeValidationError("conflict_type_required")
         with self._lease_write(self._knowledge_lease_task_id()):
-            return self._insert_knowledge_conflict(conflict)
+            saved = self._insert_knowledge_conflict(conflict)
+            self._suppress_knowledge_attestations_for_conflict(saved)
+            return saved
 
     def list_knowledge_conflicts(self, claim_id: str | None = None) -> list[dict[str, Any]]:
         if claim_id is None:
@@ -2853,6 +2957,164 @@ class Store:
                 "evidence": [item.to_dict() for item in saved_evidence],
             }
 
+    def save_attested_knowledge_bundle(
+        self,
+        source: KnowledgeSource,
+        claim: KnowledgeClaim,
+        evidence: list[KnowledgeEvidence],
+        attestation: KnowledgeAttestation,
+    ) -> dict[str, Any]:
+        """Persist a reviewed bundle while keeping its ordinary claim row advisory."""
+        if not isinstance(source, KnowledgeSource) or not isinstance(claim, KnowledgeClaim):
+            raise KnowledgeValidationError("bundle_types_required")
+        if not isinstance(evidence, list) or not evidence or len(evidence) > 32:
+            raise KnowledgeValidationError("bundle_evidence_required")
+        if any(not isinstance(item, KnowledgeEvidence) for item in evidence):
+            raise KnowledgeValidationError("bundle_evidence_types_required")
+        if not isinstance(attestation, KnowledgeAttestation):
+            raise KnowledgeValidationError("knowledge_attestation_required")
+        if self._knowledge_attestor is None:
+            raise KnowledgeValidationError("knowledge_attestation_key_missing")
+        if not source.content_bound or not self._knowledge_attestor.verify(attestation):
+            raise KnowledgeValidationError("knowledge_attestation_invalid")
+        source_snapshot = source.to_dict()
+        claim_snapshot = claim.to_dict()
+        evidence_snapshots = sorted(
+            (item.to_dict() for item in evidence),
+            key=lambda item: (item["evidence_id"], item["evidence_fingerprint"]),
+        )
+        if (
+            source_snapshot != attestation.source_snapshot
+            or claim_snapshot != attestation.claim_snapshot
+            or evidence_snapshots != attestation.evidence_snapshots
+        ):
+            raise KnowledgeValidationError("knowledge_attestation_bundle_mismatch")
+        if any(item.claim_id != claim.claim_id or item.source_id != source.source_id for item in evidence):
+            raise KnowledgeValidationError("bundle_provenance_mismatch")
+        encoded_bundle = json.dumps(
+            {"source": source_snapshot, "claim": claim_snapshot, "evidence": evidence_snapshots},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(encoded_bundle.encode("utf-8")) > 256 * 1024:
+            raise KnowledgeValidationError("bundle_too_large")
+        attestation_json = json.dumps(
+            attestation.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(attestation_json.encode("utf-8")) > 256 * 1024:
+            raise KnowledgeValidationError("knowledge_attestation_too_large")
+
+        with self._lease_write(self._knowledge_lease_task_id()):
+            saved_source = self._insert_knowledge_source(source)
+            saved_claim = self._insert_knowledge_claim(claim)
+            saved_evidence: list[KnowledgeEvidence] = []
+            for item in evidence:
+                saved_evidence.append(self._insert_knowledge_evidence(item))
+            if (
+                saved_source.to_dict() != attestation.source_snapshot
+                or saved_claim.claim_id != claim.claim_id
+                or saved_claim.claim_fingerprint != claim.claim_fingerprint
+            ):
+                raise KnowledgeValidationError("knowledge_attestation_persisted_identity_mismatch")
+            saved_evidence_snapshots = sorted(
+                (item.to_dict() for item in saved_evidence),
+                key=lambda item: (item["evidence_id"], item["evidence_fingerprint"]),
+            )
+            if saved_evidence_snapshots != attestation.evidence_snapshots:
+                raise KnowledgeValidationError("knowledge_attestation_persisted_evidence_mismatch")
+            open_conflicts = self.db.execute(
+                """SELECT conflict_id FROM knowledge_conflicts
+                   WHERE status = 'OPEN' AND (claim_id = ? OR conflicting_claim_id = ?)
+                   ORDER BY conflict_id""",
+                (claim.claim_id, claim.claim_id),
+            ).fetchall()
+            for conflict_row in open_conflicts:
+                attestation = self._knowledge_attestor.suppress_for_conflict(
+                    attestation, str(conflict_row["conflict_id"])
+                )
+            attestation_json = json.dumps(
+                attestation.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if len(attestation_json.encode("utf-8")) > 256 * 1024:
+                raise KnowledgeValidationError("knowledge_attestation_too_large")
+            existing = self.db.execute(
+                "SELECT attestation_json, signature FROM knowledge_attestations WHERE attestation_id = ?",
+                (attestation.attestation_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["attestation_json"] != attestation_json or existing["signature"] != attestation.signature:
+                    raise KnowledgeValidationError("knowledge_attestation_id_conflict")
+            else:
+                self.db.execute(
+                    """INSERT INTO knowledge_attestations
+                       (attestation_id, claim_id, source_id, claim_version, key_id, signature,
+                        attestation_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        attestation.attestation_id,
+                        claim.claim_id,
+                        source.source_id,
+                        claim.version,
+                        attestation.key_id,
+                        attestation.signature,
+                        attestation_json,
+                        attestation.verified_at,
+                    ),
+                )
+            if not self._attestation_matches_persisted_rows(attestation):
+                raise KnowledgeValidationError("knowledge_attestation_persistence_check_failed")
+            return {
+                "source": saved_source.to_dict(),
+                "claim": saved_claim.to_dict(),
+                "evidence": [item.to_dict() for item in saved_evidence],
+                "attestation": attestation.to_dict(),
+            }
+
+    def _attestation_matches_persisted_rows(self, attestation: KnowledgeAttestation) -> bool:
+        if self._knowledge_attestor is None or not self._knowledge_attestor.verify(attestation):
+            return False
+        source_row = self.db.execute(
+            "SELECT * FROM knowledge_sources WHERE source_id = ?",
+            (attestation.source_snapshot["source_id"],),
+        ).fetchone()
+        claim_row = self.db.execute(
+            "SELECT * FROM knowledge_claims WHERE claim_id = ?",
+            (attestation.claim_snapshot["claim_id"],),
+        ).fetchone()
+        if source_row is None or claim_row is None:
+            return False
+        try:
+            stored_source = self._knowledge_source_from_row(source_row).to_dict()
+            stored_claim = self._knowledge_claim_from_row(claim_row).to_dict()
+        except (KnowledgeValidationError, TypeError, ValueError):
+            return False
+        if stored_source != attestation.source_snapshot:
+            return False
+        if (
+            stored_claim["status"] != "PROPOSED"
+            or stored_claim["verification_status"] != "unverified"
+            or stored_claim["last_verified_at"] != ""
+        ):
+            return False
+        for field_name in ("status", "verification_status", "last_verified_at"):
+            stored_claim[field_name] = attestation.claim_snapshot[field_name]
+        if stored_claim != attestation.claim_snapshot:
+            return False
+        evidence_rows = self.db.execute(
+            """SELECT * FROM knowledge_evidence
+               WHERE claim_id = ? AND source_id = ? ORDER BY evidence_id""",
+            (attestation.claim_snapshot["claim_id"], attestation.source_snapshot["source_id"]),
+        ).fetchall()
+        try:
+            stored_evidence = sorted(
+                (self._knowledge_evidence_from_row(row).to_dict() for row in evidence_rows),
+                key=lambda item: (item["evidence_id"], item["evidence_fingerprint"]),
+            )
+        except (KnowledgeValidationError, TypeError, ValueError):
+            return False
+        return stored_evidence == attestation.evidence_snapshots
+
     @staticmethod
     def _knowledge_as_of(value: str | None) -> datetime:
         raw = value or now()
@@ -2863,6 +3125,45 @@ class Store:
         if parsed.tzinfo is None:
             raise KnowledgeValidationError("as_of_timezone_required")
         return parsed.astimezone(timezone.utc)
+
+    def _verified_knowledge_attestations(
+        self,
+    ) -> tuple[dict[str, KnowledgeAttestation], dict[str, int]]:
+        if self._knowledge_attestor is None:
+            return {}, {}
+        result: dict[str, KnowledgeAttestation] = {}
+        source_ids: dict[str, set[str]] = {}
+        rows = self.db.execute(
+            "SELECT * FROM knowledge_attestations ORDER BY created_at, attestation_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["attestation_json"]))
+                attestation = KnowledgeAttestation.from_dict(payload)
+            except (KnowledgeValidationError, TypeError, ValueError):
+                continue
+            try:
+                row_claim_version = int(row["claim_version"])
+            except (TypeError, ValueError):
+                continue
+            if (
+                row["attestation_id"] != attestation.attestation_id
+                or row["claim_id"] != attestation.claim_snapshot["claim_id"]
+                or row["source_id"] != attestation.source_snapshot["source_id"]
+                or row_claim_version != int(attestation.claim_snapshot["version"])
+                or row["key_id"] != attestation.key_id
+                or row["signature"] != attestation.signature
+                or not self._attestation_matches_persisted_rows(attestation)
+            ):
+                continue
+            claim_id = attestation.claim_snapshot["claim_id"]
+            source_ids.setdefault(claim_id, set()).add(attestation.source_snapshot["source_id"])
+            previous = result.get(claim_id)
+            if previous is None or (attestation.claim_snapshot["version"], attestation.verified_at) > (
+                previous.claim_snapshot["version"], previous.verified_at
+            ):
+                result[claim_id] = attestation
+        return result, {claim_id: len(items) for claim_id, items in source_ids.items()}
 
     def search_knowledge_claims(
         self,
@@ -2884,57 +3185,74 @@ class Store:
         if not terms:
             return []
         rows = self.db.execute("SELECT * FROM knowledge_claims").fetchall()
+        attested_claims, attested_source_counts = self._verified_knowledge_attestations()
         open_conflicts: dict[str, int] = {}
         for row in self.db.execute("SELECT claim_id, conflicting_claim_id FROM knowledge_conflicts WHERE status = 'OPEN'").fetchall():
             open_conflicts[str(row["claim_id"])] = open_conflicts.get(str(row["claim_id"]), 0) + 1
             open_conflicts[str(row["conflicting_claim_id"])] = open_conflicts.get(str(row["conflicting_claim_id"]), 0) + 1
-        source_counts = {
-            str(row["claim_id"]): int(row["count"])
-            for row in self.db.execute(
-                "SELECT claim_id, COUNT(DISTINCT source_id) AS count FROM knowledge_evidence GROUP BY claim_id"
-            ).fetchall()
-        }
-        # Without a trusted attestation boundary, no persisted evidence is
-        # eligible to make a claim active or verified.
-        evidence_state: dict[str, int] = {}
         results: list[dict[str, Any]] = []
         for row in rows:
-            status = str(row["status"])
-            verification_status = str(row["verification_status"])
+            attestation = attested_claims.get(str(row["claim_id"]))
+            claim_snapshot = attestation.claim_snapshot if attestation is not None else None
+            status = str(claim_snapshot["status"] if claim_snapshot is not None else "PROPOSED")
+            verification_status = str(
+                claim_snapshot["verification_status"] if claim_snapshot is not None else "unverified"
+            )
             if status in {"RETIRED", "QUARANTINED"}:
                 continue
             text = f"{row['subject']} {row['predicate']} {row['object_text']} {row['domain']}".lower()
             score = sum(term in text for term in terms)
             if not score:
                 continue
-            valid_from = self._knowledge_as_of(str(row["valid_from"])) if row["valid_from"] else None
-            valid_until = self._knowledge_as_of(str(row["valid_until"])) if row["valid_until"] else None
+            valid_from_raw = claim_snapshot["valid_from"] if claim_snapshot is not None else ""
+            valid_until_raw = claim_snapshot["valid_until"] if claim_snapshot is not None else ""
+            valid_from = self._knowledge_as_of(str(valid_from_raw)) if valid_from_raw else None
+            valid_until = self._knowledge_as_of(str(valid_until_raw)) if valid_until_raw else None
             if valid_from is not None and reference < valid_from:
                 continue
             if valid_until is not None and reference >= valid_until:
                 continue
-            last_verified = self._knowledge_as_of(str(row["last_verified_at"])) if row["last_verified_at"] else None
-            is_fresh = bool(last_verified is not None and (reference - last_verified).total_seconds() <= max_age_seconds)
-            is_verified = verification_status == "verified"
+            attested_at = self._knowledge_as_of(attestation.verified_at) if attestation is not None else None
+            age_seconds = (reference - attested_at).total_seconds() if attested_at is not None else None
+            is_fresh = bool(age_seconds is not None and 0 <= age_seconds <= max_age_seconds)
+            is_verified = bool(attestation is not None and verification_status == "verified")
             is_active = (
                 status == "SUPPORTED"
                 and is_verified
                 and is_fresh
-                and evidence_state.get(str(row["claim_id"]), 0) > 0
+                and bool(attestation.evidence_snapshots if attestation is not None else [])
                 and not open_conflicts.get(str(row["claim_id"]), 0)
+                and not (attestation.conflict_suppression_ids if attestation is not None else [])
             )
             if not include_unverified and not is_active:
                 continue
             item = dict(row)
-            item["metadata"] = json.loads(str(row["metadata_json"]))
+            if claim_snapshot is not None:
+                item.update(claim_snapshot)
+                item["last_verified_at"] = attestation.verified_at
+            else:
+                item.update(
+                    {
+                        "status": "PROPOSED",
+                        "verification_status": "unverified",
+                        "last_verified_at": "",
+                    }
+                )
+            if "metadata" not in item:
+                item["metadata"] = json.loads(str(row["metadata_json"]))
             item.pop("metadata_json", None)
             item.update(
                 {
-                    "source_count": source_counts.get(str(row["claim_id"]), 0),
+                    "source_count": attested_source_counts.get(str(row["claim_id"]), 0),
                     "conflict_count": open_conflicts.get(str(row["claim_id"]), 0),
                     "is_verified": is_verified,
                     "is_fresh": is_fresh,
                     "is_active": is_active,
+                    "is_attested": attestation is not None,
+                    "attestation_id": attestation.attestation_id if attestation is not None else "",
+                    "conflict_suppression_ids": (
+                        list(attestation.conflict_suppression_ids) if attestation is not None else []
+                    ),
                     "match_score": score,
                 }
             )
