@@ -29,6 +29,8 @@ from private_agent.storage import KnowledgeItem, Store
 from private_agent.security import PolicyDecision, SecurityController
 from private_agent.tools.research import ToolRegistry
 
+MAX_CONVERSATION_REPLANS = 32
+
 
 class TaskInterrupted(RuntimeError):
     """Internal deterministic interruption seam used to prove checkpoint resume behavior."""
@@ -131,6 +133,252 @@ class Orchestrator:
             step_id=step_id,
             action_id=selected.action_id,
         )
+
+    def _verified_outcomes_for_plan(self, state: TaskState, plan: TaskPlan) -> dict[str, StepOutcome]:
+        outcomes: dict[str, StepOutcome] = {}
+        for step in plan.steps:
+            key = state.action_key_for_step(step)
+            record = state.action_records.get(key)
+            observation_payload = state.observations.get(key)
+            verification = state.verification_results.get(key)
+            if (
+                key not in state.completed_actions
+                or not isinstance(record, dict)
+                or record.get("status") != "VERIFIED"
+                or record.get("step_id") != step.id
+                or not isinstance(observation_payload, dict)
+                or not isinstance(verification, dict)
+            ):
+                continue
+            try:
+                observation = Observation(**observation_payload)
+                outcome = StepOutcome(
+                    state.task_id,
+                    observation.step_id,
+                    observation.tool_name,
+                    observation.execution_status,
+                    str(verification.get("status", "FAILED")),
+                    observation,
+                    verification,
+                )
+            except (TypeError, KeyError):
+                continue
+            outcomes[step.id] = outcome
+        return outcomes
+
+    def _block_conversation_replan(self, state: TaskState, reason: str) -> dict[str, Any]:
+        result = {
+            "task_id": state.task_id,
+            "goal": state.goal,
+            "errors": [reason],
+            "verification": {"verified": False, "status": "BLOCKED"},
+            "final_status": "BLOCKED",
+        }
+        state.result = result
+        state.checkpoint(
+            "CONVERSATION_REPLAN_BLOCKED",
+            status="BLOCKED",
+            phase="CONVERSATION_REPLAN_BLOCKED",
+            successful=False,
+        )
+        self._save_checkpoint(state, "CONVERSATION_REPLAN_BLOCKED")
+        self.store.save_event(state.task_id, "conversation_replan_blocked", {"reason": reason})
+        return result
+
+    def _maybe_replan_from_followups(
+        self,
+        state: TaskState,
+        current_plan: TaskPlan,
+        *,
+        prior: list[dict[str, Any]],
+        retrieved: list[dict[str, Any]],
+        reflection_context: list[dict[str, Any]],
+        learned_context: list[dict[str, Any]],
+    ) -> tuple[TaskPlan, list[PolicyDecision], dict[str, Any] | None, bool]:
+        """Consume pending follow-ups only after a persisted verified-action checkpoint."""
+        if not self.store.has_active_lease_context(state.task_id):
+            return current_plan, list(state.security_decisions.values()), None, False
+        has_verified_current_step = any(
+            isinstance(record, dict)
+            and record.get("step_id") == state.current_step
+            and record.get("status") == "VERIFIED"
+            and key in state.completed_actions
+            for key, record in state.action_records.items()
+        )
+        if state.status != "READY" or not state.current_step or not has_verified_current_step:
+            return current_plan, list(state.security_decisions.values()), None, False
+        try:
+            pending = self.store.pending_task_messages_for_worker(state.task_id)
+        except ValueError as exc:
+            # A stale or non-verification checkpoint is a reason to leave messages pending,
+            # never to infer that an action completed.
+            if str(exc) in {
+                "conversation_safe_checkpoint_required",
+                "conversation_verified_action_required",
+            }:
+                return current_plan, list(state.security_decisions.values()), None, False
+            raise
+        if not pending:
+            return current_plan, list(state.security_decisions.values()), None, False
+        if state.context.get("task_kind") == "bug_bounty":
+            blocked = self._block_conversation_replan(state, "conversation_task_kind_unsupported")
+            return current_plan, list(state.security_decisions.values()), blocked, False
+
+        messages = self.store.task_messages(state.task_id)
+        followups = [item for item in messages if item.get("message_kind") == "FOLLOW_UP"]
+        effective_goal = state.goal
+        if followups:
+            effective_goal += "\n\nUser follow-up messages:\n" + "\n".join(
+                f"- {str(item.get('content', '')).strip()}" for item in followups if str(item.get("content", "")).strip()
+            )
+        try:
+            proposed = self._create_plan(effective_goal, prior, retrieved, reflection_context, learned_context)
+            if not proposed.steps:
+                raise ValueError("conversation_plan_empty")
+            previous_completed: list[tuple[PlanStep, str, dict[str, Any]]] = []
+            for step in current_plan.steps:
+                old_key = state.action_key_for_step(step)
+                if old_key not in state.completed_actions:
+                    continue
+                record = state.action_records.get(old_key)
+                observation = state.observations.get(old_key)
+                verification = state.verification_results.get(old_key)
+                if (
+                    not isinstance(record, dict)
+                    or record.get("status") != "VERIFIED"
+                    or record.get("action_key") != old_key
+                    or record.get("input_fingerprint") != old_key
+                    or record.get("step_id") != step.id
+                    or record.get("tool_name") != step.tool
+                    or not isinstance(observation, dict)
+                    or record.get("observation") != observation
+                    or not isinstance(verification, dict)
+                    or verification.get("status") != "VERIFIED"
+                    or verification.get("verified") is not True
+                    or record.get("verification") != verification
+                ):
+                    raise ValueError("conversation_completed_action_untrusted")
+                previous_completed.append((step, old_key, record))
+
+            preserved_by_id = {step.id: step for step, _, _ in previous_completed}
+            candidate_to_id: dict[str, str] = {}
+            exact_matches: set[str] = set()
+
+            def equivalent(left: PlanStep, right: PlanStep) -> bool:
+                return all(
+                    getattr(left, name) == getattr(right, name)
+                    for name in ("id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria")
+                )
+
+            for index, step in enumerate(proposed.steps, start=1):
+                existing = preserved_by_id.get(step.id)
+                if existing is not None and equivalent(existing, step):
+                    candidate_to_id[step.id] = existing.id
+                    exact_matches.add(step.id)
+                else:
+                    candidate_to_id[step.id] = f"conversation-{state.plan_version + 1}-{index}"
+
+            new_steps: list[PlanStep] = []
+            for step in proposed.steps:
+                if step.id in exact_matches:
+                    continue
+                new_id = candidate_to_id[step.id]
+                dependencies = [candidate_to_id.get(dep, dep) for dep in step.depends_on]
+                new_steps.append(
+                    PlanStep(
+                        id=new_id,
+                        objective=step.objective,
+                        tool=step.tool,
+                        input=dict(step.input),
+                        reason=step.reason,
+                        depends_on=dependencies,
+                        verifier=step.verifier,
+                        success_criteria=dict(step.success_criteria),
+                        status="pending",
+                        output={},
+                    )
+                )
+            merged_steps = [step for step, _, _ in previous_completed] + new_steps
+            all_ids = [step.id for step in merged_steps]
+            if not merged_steps or len(merged_steps) > 64 or len(set(all_ids)) != len(all_ids):
+                raise ValueError("conversation_plan_shape_invalid")
+            id_set = set(all_ids)
+            if any(not set(step.depends_on).issubset(id_set) for step in merged_steps):
+                raise ValueError("conversation_plan_dependency_invalid")
+            merged_plan = TaskPlan(
+                goal=effective_goal,
+                steps=merged_steps,
+                rationale=f"{proposed.rationale}; previously verified actions retained",
+            )
+        except Exception as exc:
+            blocked = self._block_conversation_replan(state, "conversation_replan_failed")
+            self.store.save_event(
+                state.task_id,
+                "conversation_replan_error",
+                {"error_category": type(exc).__name__},
+            )
+            return current_plan, list(state.security_decisions.values()), blocked, False
+
+        old_completed_keys = {old_key for _, old_key, _ in previous_completed}
+        old_observations = {key: state.observations.get(key) for _, key, _ in previous_completed}
+        old_verifications = {key: state.verification_results.get(key) for _, key, _ in previous_completed}
+        old_records = {key: dict(record) for _, key, record in previous_completed}
+        completed_before = list(state.completed_actions)
+        state.set_plan(self._plan_payload(merged_plan), version=state.plan_version + 1)
+        new_completed_keys: list[str] = []
+        for step, old_key, record in previous_completed:
+            new_key = state.action_key_for_step(step)
+            remapped = dict(old_records[old_key])
+            remapped["action_key"] = new_key
+            remapped["input_fingerprint"] = new_key
+            state.action_records[new_key] = remapped
+            if old_observations[old_key] is not None:
+                state.observations[new_key] = old_observations[old_key]
+            if old_verifications[old_key] is not None:
+                state.verification_results[new_key] = old_verifications[old_key]
+            if old_key != new_key:
+                state.action_records.pop(old_key, None)
+                state.observations.pop(old_key, None)
+                state.verification_results.pop(old_key, None)
+            new_completed_keys.append(new_key)
+        state.completed_actions = [key for key in completed_before if key not in old_completed_keys] + new_completed_keys
+        state.pending_actions = [
+            state.action_key_for_step(step)
+            for step in merged_plan.steps
+            if state.action_key_for_step(step) not in set(state.completed_actions)
+        ]
+        message_ids = [str(item["message_id"]) for item in pending]
+        state.context["conversation_replans"] = list(state.context.get("conversation_replans", [])) + [
+            {"message_ids": message_ids, "plan_version": state.plan_version}
+        ]
+        state.checkpoint(
+            "CONVERSATION_REPLANNED",
+            status="READY",
+            phase="CONVERSATION_REPLANNED",
+            successful=True,
+        )
+        self._save_checkpoint(state, "CONVERSATION_REPLANNED", consume_message_ids=message_ids)
+        self.store.save_event(
+            state.task_id,
+            "conversation_plan_updated",
+            {"message_ids": message_ids, "plan_version": state.plan_version, "step_count": len(merged_plan.steps)},
+        )
+        if self.security is not None:
+            try:
+                security_ok, decisions = self._revalidate_resume_security(state, merged_plan)
+            except (KeyError, StateIntegrityError, ValueError):
+                blocked = self._resume_blocked(state, "conversation_security_revalidation_error")
+                return merged_plan, list(state.security_decisions.values()), blocked, True
+            if not security_ok:
+                blocked = self._resume_blocked(
+                    state,
+                    "conversation_security_revalidation_blocked",
+                    decisions=decisions,
+                )
+                return merged_plan, decisions, blocked, True
+        else:
+            decisions = []
+        return merged_plan, decisions, None, True
 
     def run(
         self,
@@ -328,7 +576,7 @@ class Orchestrator:
         terminal_status = "FAILED"
 
         self.store.save_event(task_id, "plan_created", {"goal": goal, "steps": [step.__dict__ for step in current_plan.steps]})
-        max_rounds = 1 + self.recovery.max_recovery_attempts
+        max_rounds = 1 + self.recovery.max_recovery_attempts + MAX_CONVERSATION_REPLANS
         while rounds < max_rounds:
             rounds += 1
             if rounds > 1:
@@ -457,6 +705,21 @@ class Orchestrator:
                     )
                     state.checkpoint("AFTER_VERIFICATION", status="READY", phase="AFTER_VERIFICATION", step_id=step.id, successful=True)
                     self._save_checkpoint(state, "AFTER_VERIFICATION")
+                    current_plan, updated_decisions, conversation_blocked, conversation_updated = self._maybe_replan_from_followups(
+                        state,
+                        current_plan,
+                        prior=prior,
+                        retrieved=retrieved_payload,
+                        reflection_context=reflection_context,
+                        learned_context=learned_context,
+                    )
+                    if conversation_blocked is not None:
+                        return conversation_blocked
+                    if conversation_updated:
+                        security_decisions = updated_decisions
+                        latest_outcomes = self._verified_outcomes_for_plan(state, current_plan)
+                        recovery_requested = True
+                        break
                     continue
 
                 state.mark_action(
@@ -1149,7 +1412,32 @@ class Orchestrator:
         security_decisions = list(state.security_decisions.values())
         rounds = max(0, int(state.context.get("attempts", 0)))
         terminal_status = "FAILED"
-        max_rounds = max(rounds + 1, 1 + self.recovery.max_recovery_attempts)
+        max_rounds = max(rounds + 1, 1 + self.recovery.max_recovery_attempts) + MAX_CONVERSATION_REPLANS
+        if self.store.has_active_lease_context(state.task_id):
+            current_plan, updated_decisions, conversation_blocked, conversation_updated = self._maybe_replan_from_followups(
+                state,
+                current_plan,
+                prior=prior,
+                retrieved=retrieved_payload,
+                reflection_context=reflection_context,
+                learned_context=learned_context,
+            )
+            if conversation_blocked is not None:
+                return conversation_blocked
+            if conversation_updated:
+                security_decisions = [item.to_dict() for item in updated_decisions]
+                verified_previous_results = {}
+                for step in current_plan.steps:
+                    key = state.action_key_for_step(step)
+                    record = state.action_records.get(key)
+                    if key in state.completed_actions and isinstance(record, dict):
+                        step_result = self._step_result_from_dict(record.get("output"))
+                        if step_result is not None:
+                            verified_previous_results[step.id] = step_result
+                latest = self._verified_outcomes_for_plan(state, current_plan)
+                outcome_by_step = {item.step_id: item for item in all_outcomes}
+                outcome_by_step.update(latest)
+                all_outcomes = list(outcome_by_step.values())
         while rounds < max_rounds:
             rounds += 1
             recovery_requested = False
@@ -1168,7 +1456,7 @@ class Orchestrator:
                 task_id=state.task_id,
                 previous_results=dict(verified_previous_results),
                 approved_permissions=set(self.approved_permissions),
-                metadata={"attempt": rounds, "goal": state.goal},
+                metadata={"attempt": rounds, "goal": current_plan.goal},
                 security_controller=self.security,
                 approval_ids=state.approval_ids,
                 observability=self.observability,
@@ -1279,6 +1567,32 @@ class Orchestrator:
                     )
                     state.checkpoint("AFTER_VERIFICATION", status="READY", phase="AFTER_VERIFICATION", step_id=step.id, successful=True)
                     self._save_checkpoint(state, "AFTER_VERIFICATION")
+                    current_plan, updated_decisions, conversation_blocked, conversation_updated = self._maybe_replan_from_followups(
+                        state,
+                        current_plan,
+                        prior=prior,
+                        retrieved=retrieved_payload,
+                        reflection_context=reflection_context,
+                        learned_context=learned_context,
+                    )
+                    if conversation_blocked is not None:
+                        return conversation_blocked
+                    if conversation_updated:
+                        security_decisions = [item.to_dict() for item in updated_decisions]
+                        verified_previous_results = {}
+                        for current_step in current_plan.steps:
+                            current_key = state.action_key_for_step(current_step)
+                            current_record = state.action_records.get(current_key)
+                            if current_key in state.completed_actions and isinstance(current_record, dict):
+                                previous_result = self._step_result_from_dict(current_record.get("output"))
+                                if previous_result is not None:
+                                    verified_previous_results[current_step.id] = previous_result
+                        latest = self._verified_outcomes_for_plan(state, current_plan)
+                        outcome_by_step = {item.step_id: item for item in all_outcomes}
+                        outcome_by_step.update(latest)
+                        all_outcomes = list(outcome_by_step.values())
+                        recovery_requested = True
+                        break
                     continue
                 state.mark_action(
                     key,
@@ -1576,9 +1890,15 @@ class Orchestrator:
         state.checkpoint(checkpoint_type, status=status, phase=phase, step_id=step_id, successful=successful)
         self._save_checkpoint(state, checkpoint_type)
 
-    def _save_checkpoint(self, state: TaskState, checkpoint_type: str) -> None:
+    def _save_checkpoint(
+        self,
+        state: TaskState,
+        checkpoint_type: str,
+        *,
+        consume_message_ids: list[str] | tuple[str, ...] = (),
+    ) -> None:
         state.validate()
-        self.store.save_task_state(state, checkpoint_type)
+        self.store.save_task_state(state, checkpoint_type, consume_message_ids=consume_message_ids)
         special_events = {
             "TASK_CREATED": "TASK_CREATED",
             "TASK_COMPLETED": "TASK_COMPLETED",
