@@ -368,7 +368,7 @@ class Planner:
             candidate = tools.get(metadata["name"])
             propose = getattr(candidate, "planning_inputs", None)
             values = propose(goal) if callable(propose) else None
-            if isinstance(values, dict):
+            if isinstance(values, dict) and self._fallback_inputs_are_compatible(candidate, values):
                 return TaskPlan(
                     goal,
                     [PlanStep(
@@ -380,32 +380,68 @@ class Planner:
                     "LLM planner unavailable; bounded registered-tool proposal subject to normal policy checks",
                 )
         available_names = [metadata["name"] for metadata in available]
-        selected_name = _learned_preferred_tool(learned_strategies, available_names, self.learned_strategy_threshold)
-        avoided_names = _learned_avoided_tools(learned_strategies, self.learned_strategy_threshold)
-        if not selected_name and available_names and available_names[0] in avoided_names:
-            selected_name = next((name for name in available_names if name not in avoided_names), available_names[0])
-        selected_name = selected_name or available_names[0]
+        compatible_inputs: dict[str, dict[str, Any]] = {}
+        for name in available_names:
+            candidate = tools.get(name)
+            schema = getattr(candidate, "input_schema", lambda: {})()
+            if not isinstance(schema, dict):
+                continue
+            properties = schema.get("properties", {})
+            if not isinstance(properties, dict):
+                continue
+            input_values: dict[str, Any] = {}
+            query_definition = properties.get("query")
+            if isinstance(query_definition, dict) and query_definition.get("type") == "string":
+                input_values["query"] = goal
+            limit_definition = properties.get("limit")
+            if isinstance(limit_definition, dict) and limit_definition.get("type") == "integer":
+                limit = 6
+                minimum = limit_definition.get("minimum")
+                maximum = limit_definition.get("maximum")
+                if isinstance(minimum, int) and not isinstance(minimum, bool):
+                    limit = max(limit, minimum)
+                if isinstance(maximum, int) and not isinstance(maximum, bool):
+                    limit = min(limit, maximum)
+                input_values["limit"] = limit
+            if self._fallback_inputs_are_compatible(candidate, input_values):
+                compatible_inputs[name] = input_values
+
+        compatible_names = [name for name in available_names if name in compatible_inputs]
+        if not compatible_names:
+            raise PlanValidationError([
+                "no_compatible_tool_for_unavailable_planner",
+                "llm_provider_unavailable",
+            ])
+
+        baseline_name = compatible_names[0]
+        preferred_name = _learned_preferred_tool(
+            learned_strategies, compatible_names, self.learned_strategy_threshold
+        )
+        avoided_names = _learned_avoided_tools(
+            learned_strategies, self.learned_strategy_threshold
+        ) & set(compatible_names)
+        selected_name = preferred_name
+        if not selected_name and baseline_name in avoided_names:
+            selected_name = next(
+                (name for name in compatible_names if name not in avoided_names),
+                baseline_name,
+            )
+        selected_name = selected_name or baseline_name
         first_tool = tools.get(selected_name)
-        input_values: dict[str, Any] = {}
-        schema = getattr(first_tool, "input_schema", lambda: {})()
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        if "query" in properties:
-            input_values["query"] = goal
-        if "limit" in properties:
-            input_values["limit"] = 6
+        input_values = compatible_inputs[selected_name]
         success_criteria: dict[str, Any] = {}
         output_schema = getattr(first_tool, "output_schema", lambda: {})()
         if isinstance(output_schema, dict) and output_schema.get("required"):
             success_criteria = {"required_fields": list(output_schema["required"])}
         learned_note = ""
-        if selected_name != available_names[0] or learned_strategies:
+        if preferred_name or baseline_name in avoided_names:
             learned_note = f" Learned guidance considered: selected {selected_name}."
         return TaskPlan(
             goal=goal,
             steps=[
                 PlanStep(
                     id=str(uuid.uuid4()),
-                    objective="Execute the first registered safe tool as a compatibility fallback",
+                    objective="Execute a compatible registered safe tool as a compatibility fallback",
                     tool=selected_name,
                     input=input_values,
                     reason=(
@@ -422,6 +458,15 @@ class Planner:
                 + learned_note
             ),
         )
+
+    @staticmethod
+    def _fallback_inputs_are_compatible(tool: Any, values: dict[str, Any]) -> bool:
+        schema = getattr(tool, "input_schema", lambda: {})()
+        if not isinstance(schema, dict):
+            return False
+        errors: list[str] = []
+        Planner._validate_input("fallback", values, schema, errors)
+        return not errors
 
 
 def _learned_preferred_tool(strategies: list[dict[str, Any]], available_names: list[str], threshold: float) -> str:
