@@ -101,7 +101,7 @@ def test_schema_v12_reopens_with_auth_ownership_research_review_and_worker_table
     path = tmp_path / "schema-v8.sqlite3"
     store = Store(path)
     versions = [row["schema_version"] for row in store.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_users'").fetchone()
     assert store.db.execute("SELECT 1 FROM pragma_table_info('bugbounty_research_stages') WHERE name = 'lease_id'").fetchone()
     assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_research_stages_claim'").fetchone()

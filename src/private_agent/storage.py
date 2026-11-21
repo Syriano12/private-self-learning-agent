@@ -323,7 +323,10 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
+MAX_TASK_MESSAGE_LENGTH = MAX_TASK_GOAL_LENGTH
+MAX_TASK_CONVERSATION_MESSAGES = 32
+MAX_TASK_CONVERSATION_CHARS = 16_000
 
 _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
     2: {
@@ -443,6 +446,14 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
             "worker_id": "TEXT", "nonce": "TEXT", "seen_at": "TEXT", "request_digest": "TEXT",
         },
     },
+    13: {
+        "task_messages": {
+            "message_id": "TEXT", "task_id": "TEXT", "sequence": "INTEGER", "role": "TEXT",
+            "message_kind": "TEXT", "content": "TEXT", "status": "TEXT", "idempotency_key": "TEXT",
+            "request_fingerprint": "TEXT", "created_at": "TEXT", "consumed_at": "TEXT",
+            "consumed_checkpoint": "TEXT",
+        },
+    },
 }
 
 _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -470,6 +481,8 @@ _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
     "idx_remote_worker_jobs_claim": ("status", "worker_id", "created_at", "job_id"),
     "idx_remote_worker_jobs_lease": ("status", "lease_expires_at", "job_id"),
     "idx_remote_worker_jobs_idempotency": ("worker_id", "idempotency_key"),
+    "idx_task_messages_task_sequence": ("task_id", "sequence"),
+    "idx_task_messages_pending": ("task_id", "status", "sequence"),
 }
 
 
@@ -763,6 +776,12 @@ class Store:
                 ("index", "idx_remote_worker_jobs_lease"),
                 ("index", "idx_remote_worker_jobs_idempotency"),
             )
+        if version == 13:
+            return (
+                ("table", "task_messages"),
+                ("index", "idx_task_messages_task_sequence"),
+                ("index", "idx_task_messages_pending"),
+            )
         return ()
 
     def _assert_migration_objects(self, version: int) -> None:
@@ -803,9 +822,16 @@ class Store:
                 "task_owners": ("FOREIGN KEY (TASK_ID)", "FOREIGN KEY (USER_ID)"),
                 "bugbounty_finding_reviews": ("CHECK (EVIDENCE_VALIDATED IN (0, 1))",),
                 "remote_workers": ("CHECK (STATUS IN ('ACTIVE', 'ROTATED', 'REVOKED'))", "CHECK (ACCEPTANCE_STATUS IN ('UNVERIFIED', 'VERIFIED'))"),
-                "remote_worker_jobs": ("CHECK (STATUS IN ('QUEUED', 'LEASED', 'COMPLETED', 'FAILED', 'EXECUTION_UNKNOWN', 'BLOCKED'))",),
-                "remote_worker_nonces": ("PRIMARY KEY (WORKER_ID, NONCE)",),
-            }.get(name, ())
+                    "remote_worker_jobs": ("CHECK (STATUS IN ('QUEUED', 'LEASED', 'COMPLETED', 'FAILED', 'EXECUTION_UNKNOWN', 'BLOCKED'))",),
+                    "remote_worker_nonces": ("PRIMARY KEY (WORKER_ID, NONCE)",),
+                    "task_messages": (
+                        "CHECK (ROLE = 'USER')",
+                        "CHECK (MESSAGE_KIND IN ('INITIAL', 'FOLLOW_UP'))",
+                        "CHECK (STATUS IN ('PENDING', 'CONSUMED'))",
+                        "UNIQUE (TASK_ID, SEQUENCE)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                    ),
+                }.get(name, ())
                 for fragment in required_fragments:
                     if fragment not in table_sql:
                         raise UnsupportedSchemaVersion(
@@ -1359,6 +1385,28 @@ class Store:
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_worker_jobs_idempotency ON remote_worker_jobs(worker_id, idempotency_key)")
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (12, now()))
             return
+        if version == 13:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_messages (
+              message_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL CHECK (sequence >= 1),
+              role TEXT NOT NULL CHECK (role = 'USER'),
+              message_kind TEXT NOT NULL CHECK (message_kind IN ('INITIAL', 'FOLLOW_UP')),
+              content TEXT NOT NULL CHECK (length(trim(content)) > 0),
+              status TEXT NOT NULL CHECK (status IN ('PENDING', 'CONSUMED')),
+              idempotency_key TEXT,
+              request_fingerprint TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              consumed_at TEXT NOT NULL DEFAULT '',
+              consumed_checkpoint TEXT NOT NULL DEFAULT '',
+              UNIQUE (task_id, sequence),
+              UNIQUE (task_id, idempotency_key),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_messages_task_sequence ON task_messages(task_id, sequence)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_messages_pending ON task_messages(task_id, status, sequence)")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (13, now()))
+            return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
     def latest_owner_policy_version(self) -> int:
@@ -1620,16 +1668,91 @@ class Store:
             ),
         )
 
-    def save_task_state(self, state: Any, checkpoint_type: str, *, task_status: str | None = None) -> None:
+    def save_task_state(
+        self,
+        state: Any,
+        checkpoint_type: str,
+        *,
+        task_status: str | None = None,
+        consume_message_ids: list[str] | tuple[str, ...] = (),
+    ) -> None:
         """Persist state, checkpoint and action records in one SQLite transaction."""
         payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
         with self._lease_write(str(payload["task_id"])):
+            message_ids = tuple(dict.fromkeys(str(item) for item in consume_message_ids))
+            if message_ids:
+                task_id = str(payload["task_id"])
+                self._assert_verified_conversation_checkpoint_in_transaction(task_id)
+                placeholders = ",".join("?" for _ in message_ids)
+                rows = self.db.execute(
+                    f"SELECT message_id FROM task_messages WHERE task_id = ? AND status = 'PENDING' AND message_id IN ({placeholders})",
+                    (task_id, *message_ids),
+                ).fetchall()
+                if len(rows) != len(message_ids):
+                    raise ValueError("conversation_message_not_pending")
             self._persist_task_state_in_transaction(payload, checkpoint_type, task_status=task_status)
+            if message_ids:
+                stamp = now()
+                placeholders = ",".join("?" for _ in message_ids)
+                cursor = self.db.execute(
+                    f"UPDATE task_messages SET status = 'CONSUMED', consumed_at = ?, consumed_checkpoint = ? "
+                    f"WHERE task_id = ? AND status = 'PENDING' AND message_id IN ({placeholders})",
+                    (stamp, checkpoint_type, str(payload["task_id"]), *message_ids),
+                )
+                if cursor.rowcount != len(message_ids):
+                    raise ValueError("conversation_message_not_pending")
+
+    def _assert_verified_conversation_checkpoint_in_transaction(self, task_id: str) -> None:
+        """Require the persisted latest checkpoint to prove one completed action."""
+        from private_agent.core.task_state import StateIntegrityError, TaskState
+
+        checkpoint = self.db.execute(
+            "SELECT checkpoint_type FROM task_checkpoints WHERE task_id = ? ORDER BY sequence DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
+        if checkpoint is None or str(checkpoint["checkpoint_type"]) not in {"AFTER_VERIFICATION", "APPROVAL_REVALIDATED"} or row is None:
+            raise ValueError("conversation_safe_checkpoint_required")
+        try:
+            state = TaskState.from_dict(json.loads(str(row["state_json"])))
+        except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("conversation_task_state_untrusted") from exc
+        if state.status != "READY" or not state.current_step:
+            raise ValueError("conversation_safe_checkpoint_required")
+        verified = False
+        for key, record in state.action_records.items():
+            if not isinstance(record, dict) or record.get("step_id") != state.current_step:
+                continue
+            observation = state.observations.get(key)
+            verification = state.verification_results.get(key)
+            output = record.get("output")
+            if (
+                key in state.completed_actions
+                and record.get("action_key") == key
+                and record.get("input_fingerprint") == key
+                and record.get("status") == "VERIFIED"
+                and record.get("execution_status") == "success"
+                and isinstance(output, dict)
+                and output.get("status") == "success"
+                and isinstance(observation, dict)
+                and record.get("observation") == observation
+                and observation.get("execution_status") == "success"
+                and observation.get("observed_error") is None
+                and isinstance(verification, dict)
+                and record.get("verification") == verification
+                and verification.get("status") == "VERIFIED"
+                and verification.get("verified") is True
+            ):
+                verified = True
+                break
+        if not verified:
+            raise ValueError("conversation_verified_action_required")
 
     def create_queued_task(
         self,
         goal: str,
         *,
+        initial_message: str | None = None,
         task_id: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
@@ -1637,7 +1760,7 @@ class Store:
         max_attempts: int = 3,
         owner_user_id: str | None = None,
     ) -> dict[str, Any]:
-        """Atomically create a QUEUED state, checkpoint, queue row, and idempotency record."""
+        """Atomically create a QUEUED state, owner, queue, first message and idempotency record."""
         from private_agent.core.task_state import TaskState
 
         if not isinstance(goal, str):
@@ -1647,6 +1770,14 @@ class Store:
             raise ValueError("goal_required")
         if len(goal) > MAX_TASK_GOAL_LENGTH:
             raise ValueError("goal_too_long")
+        if initial_message is not None:
+            if not isinstance(initial_message, str):
+                raise ValueError("task_message_must_be_string")
+            initial_message = initial_message.strip()
+            if not initial_message:
+                raise ValueError("task_message_required")
+            if len(initial_message) > MAX_TASK_MESSAGE_LENGTH:
+                raise ValueError("task_message_too_long")
         if max_attempts < 1:
             raise ValueError("max_attempts_invalid")
         if idempotency_key is not None and not request_fingerprint:
@@ -1728,6 +1859,14 @@ class Store:
                     "INSERT INTO task_owners (task_id, user_id, created_at) VALUES (?, ?, ?)",
                     (state.task_id, owner_user_id, stamp),
                 )
+            if initial_message is not None:
+                self.db.execute(
+                    """INSERT INTO task_messages
+                    (message_id, task_id, sequence, role, message_kind, content, status,
+                     idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint)
+                    VALUES (?, ?, 1, 'USER', 'INITIAL', ?, 'CONSUMED', NULL, '', ?, ?, 'TASK_QUEUED')""",
+                    (str(uuid.uuid4()), state.task_id, initial_message, stamp, stamp),
+                )
             if idempotency_key:
                 self.db.execute(
                     """INSERT INTO api_idempotency_keys
@@ -1749,6 +1888,151 @@ class Store:
         finally:
             self._db_lock.release()
 
+    def task_messages(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return only user-authored messages, optionally enforcing task ownership."""
+        with self._db_lock:
+            if owner_user_id is None:
+                rows = self.db.execute(
+                    "SELECT message_id, task_id, sequence, role, message_kind, content, status, "
+                    "created_at, consumed_at, consumed_checkpoint FROM task_messages "
+                    "WHERE task_id = ? ORDER BY sequence",
+                    (str(task_id),),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT m.message_id, m.task_id, m.sequence, m.role, m.message_kind, m.content, "
+                    "m.status, m.created_at, m.consumed_at, m.consumed_checkpoint "
+                    "FROM task_messages AS m JOIN task_owners AS o ON o.task_id = m.task_id "
+                    "WHERE m.task_id = ? AND o.user_id = ? ORDER BY m.sequence",
+                    (str(task_id), str(owner_user_id)),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def append_task_message(
+        self,
+        task_id: str,
+        content: str,
+        *,
+        owner_user_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a follow-up as pending without changing task state or plan."""
+        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState
+
+        task_id = str(task_id)
+        if not isinstance(content, str):
+            raise ValueError("task_message_must_be_string")
+        content = content.strip()
+        if not content:
+            raise ValueError("task_message_required")
+        if len(content) > MAX_TASK_MESSAGE_LENGTH:
+            raise ValueError("task_message_too_long")
+        if owner_user_id is not None and (not isinstance(owner_user_id, str) or not owner_user_id.strip() or len(owner_user_id) > 256):
+            raise ValueError("task_owner_invalid")
+        if idempotency_key is not None and not request_fingerprint:
+            raise ValueError("message_request_fingerprint_required")
+        self._db_lock.acquire()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            owner = self.db.execute("SELECT user_id FROM task_owners WHERE task_id = ?", (task_id,)).fetchone()
+            if owner_user_id is not None and (owner is None or str(owner["user_id"]) != owner_user_id):
+                raise KeyError("task_not_found")
+            task_row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
+            queue_row = self.db.execute("SELECT queue_status FROM task_queue WHERE task_id = ?", (task_id,)).fetchone()
+            if task_row is None or queue_row is None:
+                raise KeyError("task_not_found")
+            try:
+                state = TaskState.from_dict(json.loads(str(task_row["state_json"])))
+            except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("task_state_untrusted") from exc
+            queue_status = str(queue_row["queue_status"])
+            if idempotency_key is not None:
+                existing = self.db.execute(
+                    "SELECT * FROM task_messages WHERE task_id = ? AND idempotency_key = ?",
+                    (task_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["request_fingerprint"]) != str(request_fingerprint):
+                        raise ValueError("message_idempotency_conflict")
+                    if (
+                        str(existing["status"]) == "PENDING"
+                        and (state.status in TERMINAL_STATUSES or queue_status in {"COMPLETED", "FAILED", "BLOCKED"})
+                    ):
+                        raise ValueError("conversation_terminal")
+                    result = dict(existing)
+                    result["replayed"] = True
+                    self.db.commit()
+                    return result
+            if state.status == "EXECUTION_UNKNOWN" or queue_status == "EXECUTION_UNKNOWN":
+                raise ValueError("conversation_execution_unknown")
+            if state.status in TERMINAL_STATUSES or queue_status in {"COMPLETED", "FAILED", "BLOCKED"}:
+                raise ValueError("conversation_terminal")
+            eligible = (
+                state.status == "QUEUED" and queue_status == "QUEUED"
+            ) or (
+                state.status == "WAITING_APPROVAL" and queue_status in {"WAITING_APPROVAL", "QUEUED", "LEASED"}
+            ) or (
+                queue_status == "LEASED" and state.status in {"PLANNING", "EXECUTING", "OBSERVING", "VERIFYING"}
+            )
+            if state.status == "READY" and queue_status == "LEASED" and state.pending_actions:
+                eligible = any(
+                    isinstance(record, dict)
+                    and record.get("step_id") == state.current_step
+                    and record.get("status") == "VERIFIED"
+                    and key in state.completed_actions
+                    for key, record in state.action_records.items()
+                )
+            if not eligible:
+                raise ValueError("conversation_not_accepting_messages")
+            totals = self.db.execute(
+                "SELECT COUNT(*) AS message_count, COALESCE(SUM(length(content)), 0) AS total_chars, "
+                "COALESCE(MAX(sequence), 0) AS last_sequence FROM task_messages WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if int(totals["message_count"] or 0) >= MAX_TASK_CONVERSATION_MESSAGES:
+                raise ValueError("conversation_message_limit")
+            if int(totals["total_chars"] or 0) + len(content) > MAX_TASK_CONVERSATION_CHARS:
+                raise ValueError("conversation_size_limit")
+            stamp = now()
+            message_id = str(uuid.uuid4())
+            sequence = int(totals["last_sequence"] or 0) + 1
+            self.db.execute(
+                """INSERT INTO task_messages
+                (message_id, task_id, sequence, role, message_kind, content, status,
+                 idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint)
+                VALUES (?, ?, ?, 'USER', 'FOLLOW_UP', ?, 'PENDING', ?, ?, ?, '', '')""",
+                (message_id, task_id, sequence, content, idempotency_key, str(request_fingerprint or ""), stamp),
+            )
+            result = dict(self.db.execute("SELECT * FROM task_messages WHERE message_id = ?", (message_id,)).fetchone())
+            result["replayed"] = False
+            self.db.commit()
+            return result
+        except Exception:
+            self.db.rollback()
+            raise
+        finally:
+            self._db_lock.release()
+
+    def pending_task_messages_for_worker(self, task_id: str) -> list[dict[str, Any]]:
+        """Read pending follow-ups only under the active worker lease at a verified checkpoint."""
+        if not self.has_active_lease_context(task_id):
+            raise QueueLeaseLost("conversation_worker_lease_required")
+        with self._db_lock:
+            self._assert_active_lease(str(task_id))
+            self._assert_verified_conversation_checkpoint_in_transaction(str(task_id))
+            rows = self.db.execute(
+                "SELECT message_id, task_id, sequence, content, created_at FROM task_messages "
+                "WHERE task_id = ? AND message_kind = 'FOLLOW_UP' AND status = 'PENDING' ORDER BY sequence",
+                (str(task_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _queue_status_for_task_status(status: str) -> str:
         return {
@@ -1761,7 +2045,7 @@ class Store:
 
     def _mark_expired_lease_in_transaction(self, row: sqlite3.Row, stamp: str) -> dict[str, Any]:
         """Fence an expired worker and conservatively persist an unknown outcome."""
-        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState
+        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState, TaskStopReasonCode
 
         task_id = str(row["task_id"])
         state_row = self.db.execute(
@@ -1805,6 +2089,14 @@ class Store:
                     )
                 else:
                     state.touch()
+                state.set_stop_reason(
+                    TaskStopReasonCode.EXECUTION_UNKNOWN,
+                    step_id=state.current_step or None,
+                    action_id=next(
+                        (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                        None,
+                    ),
+                )
                 self._persist_task_state_in_transaction(
                     state.to_dict(),
                     "EXECUTION_UNKNOWN",
@@ -2023,7 +2315,7 @@ class Store:
                 raise QueueLeaseLost(f"queue_lease_expired:{task_id}")
 
             if state_status is not None:
-                from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+                from private_agent.core.task_state import TaskState, TaskStopReasonCode, TERMINAL_STATUSES
 
                 state_row = self.db.execute(
                     "SELECT state_json FROM task_states WHERE task_id = ?",
@@ -2044,6 +2336,14 @@ class Store:
                                 phase="EXECUTION_UNKNOWN",
                                 successful=False,
                             )
+                        state.set_stop_reason(
+                            TaskStopReasonCode.EXECUTION_UNKNOWN,
+                            step_id=state.current_step or None,
+                            action_id=next(
+                                (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                                None,
+                            ),
+                        )
                     elif state_status == "FAILED" and state.status not in TERMINAL_STATUSES:
                         state.result = {
                             **state.result,
@@ -2051,6 +2351,14 @@ class Store:
                             "errors": list(state.result.get("errors", [])) + [error_message or error_code or "worker_failed"],
                         }
                         state.checkpoint("WORKER_FAILED", status="FAILED", phase="WORKER_FAILED", successful=False)
+                        state.set_stop_reason(
+                            TaskStopReasonCode.WORKER_FAILED,
+                            step_id=state.current_step or None,
+                            action_id=next(
+                                (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                                None,
+                            ),
+                        )
                     self._persist_task_state_in_transaction(
                         state.to_dict(),
                         "EXECUTION_UNKNOWN" if state_status == "EXECUTION_UNKNOWN" else "WORKER_FAILED",
@@ -2109,7 +2417,7 @@ class Store:
             if current is None or current["queue_status"] != "LEASED" or current["lease_id"] != lease_id or current["worker_id"] != worker_id:
                 raise QueueLeaseLost(f"queue_lease_lost:{task_id}")
 
-            from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+            from private_agent.core.task_state import TaskState, TaskStopReasonCode, TERMINAL_STATUSES
 
             state_row = self.db.execute(
                 "SELECT state_json FROM task_states WHERE task_id = ?",
@@ -2137,6 +2445,14 @@ class Store:
                         )
                     else:
                         state.touch()
+                    state.set_stop_reason(
+                        TaskStopReasonCode.EXECUTION_UNKNOWN,
+                        step_id=state.current_step or None,
+                        action_id=next(
+                            (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                            None,
+                        ),
+                    )
                     self._persist_task_state_in_transaction(
                         state.to_dict(),
                         "EXECUTION_UNKNOWN",
@@ -2947,14 +3263,10 @@ class Store:
             raise KnowledgeValidationError("knowledge_query_invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
             raise KnowledgeValidationError("knowledge_query_limit_invalid")
-        terms = [t.lower() for t in query.split() if len(t) > 2]
-        rows = self.db.execute("SELECT * FROM knowledge_items ORDER BY confidence DESC, updated_at DESC").fetchall()
-        scored = []
-        for row in rows:
-            text = f"{row['concept']} {row['content']} {row['domain']}".lower()
-            score = sum(term in text for term in terms)
-            if score: scored.append((score, dict(row)))
-        result = [item for _, item in sorted(scored, key=lambda x: (x[0], x[1]['confidence']), reverse=True)[:limit]]
+        # Legacy knowledge_items do not bind their status, reliability, source,
+        # evidence, or verification time to a trusted provenance attestation.
+        # Fail closed for planner retrieval without changing or deleting rows.
+        result: list[dict[str, Any]] = []
         self._emit_observability(
             "MEMORY_RETRIEVED",
             metadata={"memory_type": "knowledge", "result_count": len(result)},

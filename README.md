@@ -234,6 +234,7 @@ EXECUTING
 - observations وverification results.
 - recovery/replanning state.
 - approval IDs وsecurity decisions.
+- سبب توقف typed اختياري بمعرّفات step/action آمنة عند توفرها.
 - created/updated/checkpoint timestamps.
 - آخر checkpoint ناجح.
 
@@ -258,7 +259,9 @@ task_action_records
 
 يتم حفظ state snapshot وcheckpoint sequence وaction records وtask summary داخل transaction واحدة. لا يتم اعتبار action مكتملاً قبل حفظ observation والـverification بنتيجة `VERIFIED`. ولا تصبح المهمة `COMPLETED` قبل حفظ verification النهائية.
 
-`state_version=1` معروف فقط حالياً. أي state version غير معروف، أو state JSON تالف، أو fingerprint غير مطابق، أو transition غير مسموح، يفشل مغلقاً ولا يُخمّن أو يُصلح تلقائياً. جدول `task_state_schema` يثبت إصدار مخطط persistence الحالي لاستراتيجية migrations مستقبلية صريحة.
+`state_version=2` هو الإصدار الحالي. تُقرأ حالات v1 بعد التحقق من fingerprint التاريخي، ثم تُرحّل إلى v2 مع `stop_reason=null`؛ لا يُستنتج سبب بأثر رجعي من الحالة أو metadata. أي إصدار غير معروف أو JSON تالف أو fingerprint غير مطابق أو transition غير مسموح يفشل مغلقاً. يظل إصدار `task_state_schema` في SQLite مستقلاً عن إصدار JSON، ولا يتطلب هذا الحقل تغييراً في schema الجدول.
+
+أكواد سبب التوقف الداخلية المغلقة هي `APPROVAL_REQUIRED` و`POLICY_BLOCKED` و`EXECUTION_UNKNOWN` و`TASK_FAILED` و`WORKER_FAILED`. لا يخزن العقد نص استثناء أو وصفاً حراً؛ تُضاف معرفات step/action فقط عندما يكون مصدرها صريحاً. تُزال الأسباب عند الانتقال من انتظار الموافقة أو عدم يقين التنفيذ إلى الاستئناف.
 
 ### Resume and Phase 9
 
@@ -460,6 +463,8 @@ X-CSRF-Token: <matching CSRF cookie for POST/PATCH/DELETE>
 ### Typed responses and redaction
 
 الاستجابات تستخدم Pydantic models ولا تعيد SQLite rows أو `TaskState` الخام. Task state يعرض status/phase/step/plan version/action summaries/recovery/verification/checkpoint/approval state والتواريخ، لكنه لا يعرض plan inputs أو tool outputs أو authorization headers أو secrets.
+
+تتضمن استجابتا ملخص المهمة وتفاصيلها الحقل الاختياري `stop_reason`، إما `null` أو كائناً typed يحوي code مغلقاً و`step_id`/`action_id` آمنين عند توفرهما. لا يُبنى الحقل من `Event.metadata` أو رسائل الأخطاء الخام.
 
 كل خطأ له الشكل:
 

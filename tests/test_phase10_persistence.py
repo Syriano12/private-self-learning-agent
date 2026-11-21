@@ -9,7 +9,7 @@ import pytest
 from private_agent.core.execution import ExecutionContext
 from private_agent.core.orchestrator import Orchestrator, TaskInterrupted
 from private_agent.core.planner import PlanStep, TaskPlan
-from private_agent.core.task_state import InvalidStateTransition, StateIntegrityError, TaskState
+from private_agent.core.task_state import InvalidStateTransition, StateIntegrityError, TaskState, canonical_fingerprint
 from private_agent.security import SecurityController, SecurityPolicy
 from private_agent.storage import Store
 from private_agent.tools.contracts import ToolResult
@@ -27,6 +27,7 @@ class DurableTool:
         self.name = name
         self.outcomes = list(outcomes or [ToolResult.success({"result": name})])
         self.calls = 0
+        self.previous_results_seen: list[dict[str, object]] = []
         self.required_capabilities = list(capabilities or [])
         self.declared_capabilities = list(capabilities or [])
         self.risk_level = risk
@@ -43,6 +44,7 @@ class DurableTool:
 
     def execute(self, inputs: dict, context: ExecutionContext) -> ToolResult:
         self.calls += 1
+        self.previous_results_seen.append(dict(context.previous_results))
         return self.outcomes.pop(0) if self.outcomes else ToolResult.success({"result": self.name})
 
 
@@ -66,14 +68,21 @@ def registry(*items: DurableTool) -> ToolRegistry:
     return result
 
 
-def step(tool: str = "safe", *, step_id: str = "step-1", value: str = "x", criteria: dict | None = None) -> PlanStep:
+def step(
+    tool: str = "safe",
+    *,
+    step_id: str = "step-1",
+    value: str = "x",
+    criteria: dict | None = None,
+    depends_on: list[str] | None = None,
+) -> PlanStep:
     return PlanStep(
         step_id,
         "durable action",
         tool,
         {"value": value},
         "controlled test",
-        [],
+        depends_on or [],
         success_criteria=criteria or {"required_fields": ["result"]},
     )
 
@@ -99,8 +108,9 @@ def test_task_creation_and_durable_checkpoints(tmp_path: Path) -> None:
     assert state is not None
     assert state["task_id"] == result["task_id"]
     assert state["goal"] == "persist creation"
-    assert state["state_version"] == 1
+    assert state["state_version"] == 2
     assert state["status"] == "COMPLETED"
+    assert state["stop_reason"] is None
     assert state["last_successful_checkpoint"] == "TASK_COMPLETED"
     checkpoint_types = [row["checkpoint_type"] for row in store.task_checkpoints(result["task_id"])]
     assert checkpoint_types[:3] == ["TASK_CREATED", "TASK_PLANNING", "PLAN_CREATED"]
@@ -110,7 +120,33 @@ def test_task_creation_and_durable_checkpoints(tmp_path: Path) -> None:
     assert "AFTER_VERIFICATION" in checkpoint_types
     assert "TASK_COMPLETED" in checkpoint_types
     assert store.get_task_state_row(result["task_id"])["state_fingerprint"] == state["state_fingerprint"]
+    assert store.get_task_state_row(result["task_id"])["state_version"] == 2
     store.close()
+
+
+def test_v1_state_migrates_with_unavailable_reason_and_validates_legacy_fingerprint() -> None:
+    legacy_state = TaskState.create("legacy-task", "legacy failure")
+    legacy_state.transition("FAILED", phase="TASK_FAILED")
+    payload = legacy_state.to_dict()
+    payload.pop("stop_reason")
+    payload["state_version"] = 1
+    payload["state_fingerprint"] = ""
+    payload["state_fingerprint"] = canonical_fingerprint(payload)
+    # Old readers ignored unversioned fields. The migration does too, so an
+    # appended reason is never trusted as historical evidence.
+    payload["stop_reason"] = {"code": "TASK_FAILED", "step_id": "forged-legacy-reason"}
+
+    migrated = TaskState.from_dict(payload)
+
+    assert migrated.state_version == 2
+    assert migrated.status == "FAILED"
+    assert migrated.stop_reason is None
+    assert migrated.state_fingerprint != payload["state_fingerprint"]
+
+    corrupted = dict(payload)
+    corrupted["goal"] = "modified legacy state"
+    with pytest.raises(StateIntegrityError, match="state_fingerprint_mismatch"):
+        TaskState.from_dict(corrupted)
 
 
 def test_successful_resume_after_normal_interruption(tmp_path: Path) -> None:
@@ -333,7 +369,7 @@ def test_resume_continues_from_last_verified_step_without_reexecuting_it(tmp_pat
         registry(first_tool, second_tool),
         planner=StubPlanner([
             step("first", step_id="first-step"),
-            step("second", step_id="second-step"),
+            step("second", step_id="second-step", depends_on=["first-step"]),
         ]),
         checkpoint_hook=interrupt,
     )
@@ -351,16 +387,219 @@ def test_resume_continues_from_last_verified_step_without_reexecuting_it(tmp_pat
         registry(first_tool, second_tool),
         planner=StubPlanner([
             step("first", step_id="first-step"),
-            step("second", step_id="second-step"),
+            step("second", step_id="second-step", depends_on=["first-step"]),
         ]),
     )
     result = restarted.resume_task(task_id)
     assert result["final_status"] == "COMPLETED"
     assert first_tool.calls == 1
     assert second_tool.calls == 1
+    assert second_tool.previous_results_seen[0]["first-step"].output == {"result": "first"}
     state_after = TaskState.from_dict(restarted_store.get_task_state(task_id))
     assert first_key in state_after.completed_actions
     assert len(state_after.completed_actions) == 2
+    restarted_store.close()
+
+
+def test_resume_retry_from_failed_action_starts_with_clean_lifecycle_fields(tmp_path: Path) -> None:
+    path = tmp_path / "failed-action-retry.sqlite3"
+    tool = DurableTool("safe", [ToolResult.failed("temporary", "retry after resume"), ToolResult.success({"result": "ok"})])
+
+    def interrupt_after_failure(checkpoint: str, state: dict) -> None:
+        if checkpoint == "AFTER_VERIFICATION" and state.get("current_step") == "step-1":
+            raise TaskInterrupted("interrupted after failed action")
+
+    store = Store(path)
+    first = Orchestrator(
+        store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+        checkpoint_hook=interrupt_after_failure,
+    )
+    with pytest.raises(TaskInterrupted):
+        first.run("retry failed action")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    state_before = TaskState.from_dict(store.get_task_state(task_id))
+    key = state_before.failed_actions[0]
+    assert state_before.action_records[key]["status"] == "FAILED"
+    store.close()
+
+    def interrupt_after_retry_execution(checkpoint: str, state: dict) -> None:
+        if checkpoint == "AFTER_EXECUTION":
+            raise TaskInterrupted("interrupted after resumed execution")
+
+    retry_store = Store(path)
+    retry = Orchestrator(
+        retry_store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+        checkpoint_hook=interrupt_after_retry_execution,
+    )
+    with pytest.raises(TaskInterrupted):
+        retry.resume_task(task_id)
+    retry_state = TaskState.from_dict(retry_store.get_task_state(task_id))
+    retry_record = retry_state.action_records[key]
+    assert retry_record["status"] == "OBSERVING"
+    assert retry_record["execution_status"] == "success"
+    assert retry_record["observation"] is None
+    assert retry_record["verification"] is None
+    assert key not in retry_state.observations
+    assert key not in retry_state.verification_results
+    assert tool.calls == 2
+    retry_store.close()
+
+    final_store = Store(path)
+    final = Orchestrator(final_store, registry(tool), planner=StubPlanner([step("safe")]))
+    result = final.resume_task(task_id)
+    assert result["final_status"] == "COMPLETED"
+    assert tool.calls == 2
+    final_state = TaskState.from_dict(final_store.get_task_state(task_id))
+    assert key in final_state.completed_actions
+    assert key in final_state.failed_actions  # Failed attempts remain historical after a successful retry.
+    final_store.close()
+
+
+@pytest.mark.parametrize(
+    "record_issue",
+    [
+        "missing",
+        "conflicting",
+        "untrusted_output",
+        "tampered_output",
+        "malformed_unrelated_record",
+        "malformed_unrelated_dict",
+    ],
+)
+def test_resume_fails_closed_when_persisted_action_record_is_untrusted(tmp_path: Path, record_issue: str) -> None:
+    first_tool = DurableTool("first")
+    second_tool = DurableTool("second")
+    path = tmp_path / f"untrusted-record-{record_issue}.sqlite3"
+
+    def interrupt(checkpoint: str, state: dict) -> None:
+        if checkpoint == "AFTER_VERIFICATION" and state.get("current_step") == "first-step":
+            raise TaskInterrupted("interrupted between verified steps")
+
+    plan_steps = [
+        step("first", step_id="first-step"),
+        step("second", step_id="second-step", depends_on=["first-step"]),
+    ]
+    store = Store(path)
+    agent = Orchestrator(
+        store,
+        registry(first_tool, second_tool),
+        planner=StubPlanner(plan_steps),
+        checkpoint_hook=interrupt,
+    )
+    with pytest.raises(TaskInterrupted):
+        agent.run("untrusted multi-step resume")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    state = TaskState.from_dict(store.get_task_state(task_id))
+    first_key = state.completed_actions[0]
+    if record_issue == "missing":
+        state.action_records.pop(first_key)
+    elif record_issue == "conflicting":
+        state.action_records[first_key]["step_id"] = "different-step"
+    elif record_issue == "untrusted_output":
+        state.action_records[first_key]["output"]["status"] = "failed"
+    elif record_issue == "tampered_output":
+        state.action_records[first_key]["output"]["output"] = {"result": "tampered"}
+    elif record_issue == "malformed_unrelated_dict":
+        state.action_records["malformed-unrelated"] = {"status": "VERIFIED"}
+    else:
+        state.action_records["malformed-unrelated"] = None
+    state.touch()
+    if record_issue == "malformed_unrelated_record":
+        store.db.execute(
+            "UPDATE task_states SET state_json = ?, state_fingerprint = ? WHERE task_id = ?",
+            (json.dumps(state.to_dict(), ensure_ascii=False, sort_keys=True), state.state_fingerprint, task_id),
+        )
+        store.db.commit()
+    else:
+        store.save_task_state(state, "TEST_UNTRUSTED_ACTION_RECORD")
+    store.close()
+
+    restarted_store = Store(path)
+    restarted = Orchestrator(
+        restarted_store,
+        registry(first_tool, second_tool),
+        planner=StubPlanner(plan_steps),
+    )
+    result = restarted.resume_task(task_id)
+
+    assert result["final_status"] == "BLOCKED"
+    assert first_tool.calls == 1
+    assert second_tool.calls == 0
+    if record_issue in {"malformed_unrelated_record", "malformed_unrelated_dict"}:
+        persisted = restarted_store.get_task_state(task_id)
+        assert persisted["status"] == "BLOCKED"
+        assert persisted["action_records"]["malformed-unrelated"]["status"] == "FAILED"
+    restarted_store.close()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "lifecycle_issue", "expected_tool_calls"),
+    [
+        ("PLAN_CREATED", "not_started_has_output", 0),
+        ("BEFORE_EXECUTION", "executing_has_output", 0),
+        ("AFTER_EXECUTION", "observing_has_verification", 1),
+    ],
+)
+def test_resume_rejects_action_record_fields_from_a_later_lifecycle(
+    tmp_path: Path,
+    checkpoint: str,
+    lifecycle_issue: str,
+    expected_tool_calls: int,
+) -> None:
+    tool = DurableTool("safe")
+    path = tmp_path / f"lifecycle-{lifecycle_issue}.sqlite3"
+
+    def interrupt(name: str, state: dict) -> None:
+        if name == checkpoint:
+            raise TaskInterrupted("interrupted at lifecycle checkpoint")
+
+    store = Store(path)
+    agent = Orchestrator(
+        store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+        checkpoint_hook=interrupt,
+    )
+    with pytest.raises(TaskInterrupted):
+        agent.run("lifecycle validation")
+    task_id = store.db.execute("SELECT task_id FROM task_states").fetchone()[0]
+    state = TaskState.from_dict(store.get_task_state(task_id))
+    key = state.pending_actions[0]
+    if lifecycle_issue == "not_started_has_output":
+        record = state.action_record(key)
+        record["output"] = {"status": "success", "output": {"result": "forged"}}
+    else:
+        record = state.action_records[key]
+        if lifecycle_issue == "executing_has_output":
+            record["execution_status"] = "success"
+            record["output"] = {
+                "step_id": "step-1",
+                "tool_name": "safe",
+                "status": "success",
+                "output": {"result": "forged"},
+                "error": None,
+                "metadata": {},
+            }
+        else:
+            record["verification"] = {"status": "VERIFIED", "verified": True}
+    state.touch()
+    store.save_task_state(state, "TEST_INVALID_ACTION_LIFECYCLE")
+    store.close()
+
+    restarted_store = Store(path)
+    restarted = Orchestrator(
+        restarted_store,
+        registry(tool),
+        planner=StubPlanner([step("safe")]),
+    )
+    result = restarted.resume_task(task_id)
+
+    assert result["final_status"] == "BLOCKED"
+    assert tool.calls == expected_tool_calls
     restarted_store.close()
 
 
@@ -543,7 +782,7 @@ def test_atomic_checkpoint_rows_are_self_consistent_and_auditable(tmp_path: Path
     for checkpoint in checkpoints:
         payload = json.loads(checkpoint["state_json"])
         assert payload["state_fingerprint"] == checkpoint["state_fingerprint"]
-        assert payload["state_version"] == checkpoint["state_version"] == 1
+        assert payload["state_version"] == checkpoint["state_version"] == 2
     audit_types = {event["event_type"] for event in agent.security.audit.list(task_id=result["task_id"])} if agent.security else set()
     assert not audit_types or "CHECKPOINT_SAVED" in audit_types
     store.close()

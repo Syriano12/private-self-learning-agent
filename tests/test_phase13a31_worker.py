@@ -83,7 +83,11 @@ def test_independent_memory_writes_do_not_require_a_worker_lease(tmp_path: Path)
     store.save_reflection({"insight_id": "independent-reflection", "pattern": "safe", "confidence": 0.9})
     store.save_learned_strategy({"strategy_id": "independent-strategy", "status": "validated", "confidence": 0.9})
 
-    assert store.search_knowledge("independent")
+    knowledge_row = store.db.execute(
+        "SELECT verification_status FROM knowledge_items WHERE id = 'independent-knowledge'"
+    ).fetchone()
+    assert knowledge_row is not None
+    assert knowledge_row["verification_status"] == "needs_review"
     assert store.get_reflection("independent-reflection") is not None
     assert store.get_learned_strategy("independent-strategy") is not None
     store.close()
@@ -166,7 +170,9 @@ def test_expired_lease_becomes_execution_unknown_and_is_not_retried(tmp_path: Pa
     assert recovered["status"] == "EXECUTION_UNKNOWN"
     assert recovered["task_id"] == created["task_id"]
     assert service.orchestrator.tools._tools["safe"].calls == 0
-    assert store.get_task_state(created["task_id"])["status"] == "EXECUTION_UNKNOWN"
+    state = store.get_task_state(created["task_id"])
+    assert state["status"] == "EXECUTION_UNKNOWN"
+    assert state["stop_reason"]["code"] == "EXECUTION_UNKNOWN"
     assert store.task_queue_record(created["task_id"])["queue_status"] == "EXECUTION_UNKNOWN"
     assert worker.run_once()["status"] == "NO_TASK"
     store.close()
@@ -204,7 +210,9 @@ def test_failure_before_execution_is_failed_without_tool_side_effect(tmp_path: P
     assert result["status"] == "FAILED"
     assert result["error_code"] == "worker_failed"
     assert service.orchestrator.tools._tools["safe"].calls == 0
-    assert store.get_task_state(created["task_id"])["status"] == "FAILED"
+    state = store.get_task_state(created["task_id"])
+    assert state["status"] == "FAILED"
+    assert state["stop_reason"]["code"] == "WORKER_FAILED"
     assert store.task_queue_record(created["task_id"])["queue_status"] == "FAILED"
     store.close()
 
@@ -257,7 +265,9 @@ def test_interruption_after_execution_is_unknown_and_not_automatically_reexecute
 
     assert result["status"] == "EXECUTION_UNKNOWN"
     assert tool.calls == 1
-    assert store.get_task_state(created["task_id"])["status"] == "EXECUTION_UNKNOWN"
+    state = store.get_task_state(created["task_id"])
+    assert state["status"] == "EXECUTION_UNKNOWN"
+    assert state["stop_reason"]["code"] == "EXECUTION_UNKNOWN"
     assert store.task_queue_record(created["task_id"])["queue_status"] == "EXECUTION_UNKNOWN"
     assert worker.run_once()["status"] == "NO_TASK"
     assert tool.calls == 1
