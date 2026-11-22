@@ -992,6 +992,7 @@ class CapabilityCandidateAssessor:
             "approved": False,
             "reasons": ["static_assessment_only", "no_approval_or_permission_granted"],
             "required_checks": {
+                "candidate_assessment": passed,
                 "contract_validation": contract_report.passed,
                 "static_analysis": analysis.passed,
                 "independent_review": False,
@@ -1329,6 +1330,16 @@ class SkillLifecycleManager:
             runtime = execution_state["runtime"]
             cross = execution_state["cross"]
             approval = execution_state["approval"]
+        security_authorized = bool(
+            execution.allowed
+            and execution.receipt is not None
+            and execution.receipt.success
+        )
+        approval.required_checks["security_authorization"] = security_authorized
+        if not security_authorized and approval.approved:
+            approval.approved = False
+            approval.status = "QUARANTINED"
+            approval.reasons.append("security_authorization_not_verified")
         candidate.status = approval.status
         self.registry.persist_candidate(
             candidate,

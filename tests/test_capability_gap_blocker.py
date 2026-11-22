@@ -137,7 +137,11 @@ def test_unregistered_tool_request_blocks_before_execution_and_is_durable_and_vi
     assert body["status"] == "BLOCKED"
     assert body["current_phase"] == "CAPABILITY_GAP"
     assert body["recovery_state"]["reason"] == "capability_unavailable"
-    assert body["recovery_state"]["capability_gap"] == gap
+    response_gap = body["recovery_state"]["capability_gap"]
+    for key, value in gap.items():
+        assert response_gap[key] == value
+    assert response_gap["candidate_lifecycle"]["promotion_status"] == "BLOCKED"
+    assert response_gap["candidate_lifecycle"]["candidates"][0]["status"] == "NOT_PROPOSED"
     assert body["recovery_state"]["capability_gap"]["execution_attempted"] is False
     assert body["recovery_state"]["capability_gap"]["acquisition_attempted"] is False
     reopened.close()
@@ -239,7 +243,8 @@ def test_specialized_bug_bounty_route_blocks_when_selected_scanner_is_not_regist
     specialized_body = specialized.json()
     assert general_body["status"] == specialized_body["status"] == "BLOCKED"
     assert general_body["current_phase"] == "CAPABILITY_GAP"
-    assert specialized_body["recovery_state"] == general_body["recovery_state"] == persisted_after_restart["recovery_state"]
+    assert specialized_body["recovery_state"] == general_body["recovery_state"]
+    assert specialized_body["recovery_state"]["reason"] == persisted_after_restart["recovery_state"]["reason"]
     gap = specialized_body["recovery_state"]["capability_gap"]
     assert gap["code"] == "UNREGISTERED_TOOL_REQUEST"
     assert gap["summary"] == "The planner requested a tool that is not registered; no tool was executed or installed."
@@ -247,6 +252,10 @@ def test_specialized_bug_bounty_route_blocks_when_selected_scanner_is_not_regist
     assert gap["execution_attempted"] is False
     assert gap["acquisition_attempted"] is False
     assert gap["permissions_granted"] is False
+    assert gap["candidate_lifecycle"]["promotion_status"] == "BLOCKED"
+    assert gap["candidate_lifecycle"]["isolation_status"] == "UNAVAILABLE"
+    assert gap["candidate_lifecycle"]["candidates"][0]["status"] == "NOT_PROPOSED"
+    assert "sandbox_execution" in gap["candidate_lifecycle"]["blocking_gates"]
     assert specialized_body["run"] is None
     assert specialized_body["scan"] is None
     assert specialized_body["report"] == ""

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from private_agent.api import AgentAPIService, create_app
@@ -149,6 +151,14 @@ def _post_assessment(service: AgentAPIService, task_id: str, payload: dict[str, 
         )
 
 
+def _get_task(service: AgentAPIService, task_id: str):
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        return client.get(
+            f"/api/v1/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {API_TOKEN}"},
+        )
+
+
 def test_untrusted_candidate_is_rejected_and_never_registered_or_executed(tmp_path: Path) -> None:
     orchestrator, store, tools, task_id = _make_blocked_task(tmp_path)
     service = AgentAPIService(orchestrator, token=API_TOKEN)
@@ -224,6 +234,13 @@ def test_safe_candidate_assessment_is_durable_and_stays_inactive(tmp_path: Path)
     orchestrator, store, _tools, task_id = _make_blocked_task(tmp_path)
     service = AgentAPIService(orchestrator, token=API_TOKEN)
 
+    before = _get_task(service, task_id)
+    assert before.status_code == 200, before.text
+    before_gap = before.json()["recovery_state"]["capability_gap"]
+    assert before_gap["candidate_lifecycle"]["promotion_status"] == "BLOCKED"
+    assert before_gap["candidate_lifecycle"]["candidates"][0]["status"] == "NOT_PROPOSED"
+    assert before_gap["candidate_lifecycle"]["candidates"][0]["execution_attempted"] is False
+
     response = _post_assessment(service, task_id, _manifest())
 
     assert response.status_code == 201, response.text
@@ -238,6 +255,18 @@ def test_safe_candidate_assessment_is_durable_and_stays_inactive(tmp_path: Path)
     assert body["execution_attempted"] is False
     assert body["installation_attempted"] is False
     assert body["registration_attempted"] is False
+    assert body["promotion_status"] == "BLOCKED"
+    assert body["can_promote"] is False
+    assert body["gate_statuses"]["candidate_assessment"] == "PASSED"
+    assert body["gate_statuses"]["contract_validation"] == "PASSED"
+    assert body["gate_statuses"]["static_analysis"] == "PASSED"
+    assert body["gate_statuses"]["independent_review"] == "NOT_REVIEWED"
+    assert body["gate_statuses"]["isolation_validation"] == "BLOCKED"
+    assert body["gate_statuses"]["owner_approval"] == "NOT_GRANTED"
+    assert body["gate_statuses"]["sandbox_execution"] == "BLOCKED"
+    assert body["gate_statuses"]["security_authorization"] == "NOT_GRANTED"
+    assert "sandbox_execution" in body["blocking_gates"]
+    assert "security_authorization" in body["blocking_gates"]
     candidate_id = body["candidate_id"]
     stored = service.skill_registry.get_candidate(candidate_id)
     assert stored is not None
@@ -246,6 +275,16 @@ def test_safe_candidate_assessment_is_durable_and_stays_inactive(tmp_path: Path)
     assert assessment["source_sha256"] == body["source_sha256"]
     assert service.skill_registry.active("image_generator") is None
     assert store.db.execute("SELECT COUNT(*) FROM skills").fetchone()[0] == 0
+    after = _get_task(service, task_id)
+    assert after.status_code == 200, after.text
+    after_gap = after.json()["recovery_state"]["capability_gap"]
+    after_lifecycle = after_gap["candidate_lifecycle"]
+    assert after_lifecycle["isolation_status"] == "UNAVAILABLE"
+    assert after_lifecycle["execution_attempted"] is False
+    assert after_lifecycle["registration_attempted"] is False
+    assert after_lifecycle["permissions_granted"] is False
+    assert after_lifecycle["candidates"][0]["candidate_id"] == candidate_id
+    assert after_lifecycle["candidates"][0]["gate_statuses"] == body["gate_statuses"]
     store.close()
 
     reopened = Store(tmp_path / "candidate-assessment.sqlite3")
@@ -257,6 +296,10 @@ def test_safe_candidate_assessment_is_durable_and_stays_inactive(tmp_path: Path)
     )
     reopened_service = AgentAPIService(new_orchestrator, token=API_TOKEN)
     with TestClient(create_app(service=reopened_service), raise_server_exceptions=False) as client:
+        task_state = client.get(
+            f"/api/v1/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {API_TOKEN}"},
+        )
         loaded = client.get(
             f"/api/v1/capability-candidates/{candidate_id}",
             headers={"Authorization": f"Bearer {API_TOKEN}"},
@@ -266,14 +309,173 @@ def test_safe_candidate_assessment_is_durable_and_stays_inactive(tmp_path: Path)
             headers={"Authorization": f"Bearer {API_TOKEN}"},
             json=_manifest(),
         )
+    assert task_state.status_code == 200, task_state.text
+    reopened_lifecycle = task_state.json()["recovery_state"]["capability_gap"]["candidate_lifecycle"]
+    assert reopened_lifecycle["candidates"][0]["candidate_id"] == candidate_id
+    assert reopened_lifecycle["candidates"][0]["gate_statuses"] == body["gate_statuses"]
     assert loaded.status_code == 200, loaded.text
     assert loaded.json()["candidate_id"] == candidate_id
     assert loaded.json()["capability_gap_task_id"] == task_id
     assert loaded.json()["status"] == "CANDIDATE"
     assert loaded.json()["review_status"] == "PENDING_REVIEW"
+    assert loaded.json()["gate_statuses"] == body["gate_statuses"]
+    assert loaded.json()["can_promote"] is False
     assert duplicate.status_code == 409, duplicate.text
     assert reopened_service.skill_registry.active("image_generator") is None
     reopened.close()
+
+
+def test_candidate_lifecycle_aggregate_matches_candidate_states_without_execution() -> None:
+    gate_statuses = {
+        "candidate_assessment": "PASSED",
+        "contract_validation": "PASSED",
+        "static_analysis": "PASSED",
+        "independent_review": "PASSED",
+        "isolation_validation": "PASSED",
+        "owner_approval": "PASSED",
+        "mutation_threshold": "PASSED",
+        "sandbox_execution": "PASSED",
+        "runtime_verification": "PASSED",
+        "cross_verification": "PASSED",
+        "no_blocking_findings": "PASSED",
+        "security_authorization": "PASSED",
+    }
+    ready = {
+        "status": "APPROVED",
+        "promotion_status": "READY",
+        "can_promote": True,
+        "blocking_gates": [],
+        "gate_statuses": gate_statuses,
+        "execution_attempted": True,
+        "registration_attempted": False,
+        "permissions_granted": False,
+    }
+
+    ready_state = AgentAPIService._aggregate_capability_candidate_lifecycle([ready])
+
+    assert ready_state["promotion_status"] == "READY"
+    assert ready_state["can_promote"] is True
+    assert ready_state["isolation_status"] == "PASSED"
+    assert ready_state["blocking_gates"] == []
+
+    active = {
+        **ready,
+        "status": "ACTIVE",
+        "promotion_status": "PROMOTED",
+        "can_promote": False,
+        "registration_attempted": True,
+    }
+    active_state = AgentAPIService._aggregate_capability_candidate_lifecycle([active])
+
+    assert active_state["promotion_status"] == "PROMOTED"
+    assert active_state["can_promote"] is False
+    assert active_state["isolation_status"] == "PASSED"
+    assert active_state["registration_attempted"] is True
+
+    blocked = {
+        **ready,
+        "status": "CANDIDATE",
+        "promotion_status": "BLOCKED",
+        "can_promote": False,
+        "blocking_gates": ["isolation_validation", "security_authorization"],
+        "gate_statuses": {**gate_statuses, "isolation_validation": "BLOCKED", "sandbox_execution": "BLOCKED"},
+        "execution_attempted": False,
+    }
+    blocked_state = AgentAPIService._aggregate_capability_candidate_lifecycle([blocked])
+
+    assert blocked_state["promotion_status"] == "BLOCKED"
+    assert blocked_state["can_promote"] is False
+    assert blocked_state["isolation_status"] == "UNAVAILABLE"
+    assert blocked_state["isolation_reason"] == "external_sandbox_unavailable"
+    assert blocked_state["blocking_gates"] == ["isolation_validation", "security_authorization"]
+
+    partially_ready = AgentAPIService._aggregate_capability_candidate_lifecycle([ready, blocked])
+    assert partially_ready["promotion_status"] == "PARTIALLY_READY"
+    assert partially_ready["can_promote"] is False
+
+    remaining_ready = AgentAPIService._aggregate_capability_candidate_lifecycle([active, ready])
+    assert remaining_ready["promotion_status"] == "PARTIALLY_PROMOTED"
+    assert remaining_ready["can_promote"] is True
+
+    failed_isolation = {
+        **blocked,
+        "gate_statuses": {**blocked["gate_statuses"], "isolation_validation": "FAILED"},
+    }
+    mixed_isolation = AgentAPIService._aggregate_capability_candidate_lifecycle([blocked, failed_isolation])
+    assert mixed_isolation["isolation_status"] == "FAILED"
+    assert mixed_isolation["isolation_reason"] == "isolation_validation_failed_and_runtime_unavailable"
+
+
+def test_activation_requires_persisted_approval_and_security_authorization(tmp_path: Path) -> None:
+    orchestrator, store, tools, task_id = _make_blocked_task(tmp_path)
+    service = AgentAPIService(orchestrator, token=API_TOKEN)
+    assessed = _post_assessment(service, task_id, _manifest())
+    assert assessed.status_code == 201, assessed.text
+    body = assessed.json()
+    candidate = SimpleNamespace(
+        skill_id=body["candidate_id"],
+        name=body["target_tool"],
+        version=body["version"],
+    )
+
+    with pytest.raises(ValueError, match="skill_activation_gates_not_passed"):
+        service.skill_registry.activate(candidate)
+
+    record = service.skill_registry.get_candidate(body["candidate_id"])
+    assert record is not None
+    required_checks = {
+        "candidate_assessment": True,
+        "contract_validation": True,
+        "static_analysis": True,
+        "mutation_threshold": True,
+        "sandbox_execution": True,
+        "runtime_verification": True,
+        "cross_verification": True,
+        "no_blocking_findings": True,
+        "independent_review": True,
+        "isolation_validation": True,
+        "owner_approval": True,
+        "security_authorization": False,
+    }
+    persisted_approval = {
+        "skill_id": record["skill_id"],
+        "name": record["name"],
+        "version": record["version"],
+        "parent_version": record.get("parent_version"),
+        "status": "APPROVED",
+        "candidate": {**record["candidate"], "status": "APPROVED"},
+        "contract": record["contract"],
+        "analysis": record["analysis"],
+        "mutation": record["mutation"],
+        "runtime": record["runtime"],
+        "cross_verification": record["cross_verification"],
+        "approval": {"status": "APPROVED", "approved": True, "required_checks": required_checks},
+        "created_at": record["candidate"].get("created_at", ""),
+    }
+
+    required_checks.pop("candidate_assessment")
+    store.save_skill_candidate(persisted_approval)
+    with pytest.raises(ValueError, match="skill_activation_gates_not_passed"):
+        service.skill_registry.activate(candidate)
+
+    required_checks["candidate_assessment"] = True
+    store.save_skill_candidate(persisted_approval)
+    with pytest.raises(ValueError, match="skill_activation_gates_not_passed"):
+        service.skill_registry.activate(candidate)
+
+    required_checks["security_authorization"] = True
+    required_checks["independent_review"] = False
+    store.save_skill_candidate(persisted_approval)
+    with pytest.raises(ValueError, match="skill_activation_gates_not_passed"):
+        service.skill_registry.activate(candidate)
+
+    assert service.skill_registry.active("image_generator") is None
+    assert store.db.execute("SELECT COUNT(*) FROM skills").fetchone()[0] == 0
+    assert store.db.execute("SELECT status FROM skill_candidates WHERE skill_id = ?", (body["candidate_id"],)).fetchone()[0] == "APPROVED"
+    with pytest.raises(KeyError):
+        tools.get("image_generator")
+    assert tools.get("registered_read").calls == 0
+    store.close()
 
 
 def test_existing_registered_tool_still_requires_exact_security_approval(tmp_path: Path) -> None:
