@@ -45,6 +45,7 @@ class PlanStep:
     success_criteria: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
     output: dict[str, Any] = field(default_factory=dict)
+    input_bindings: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -73,6 +74,18 @@ PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
                     "permission_level": {"type": "string"},
                     "verifier": {"type": "string"},
                     "success_criteria": {"type": "object"},
+                    "input_bindings": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "source_step_id": {"type": "string"},
+                                "output_key": {"type": "string"},
+                            },
+                            "required": ["source_step_id", "output_key"],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
                 "required": ["id", "objective", "tool", "input", "reason", "depends_on"],
                 "additionalProperties": False,
@@ -352,6 +365,7 @@ class Planner:
                 "permission_level",
                 "verifier",
                 "success_criteria",
+                "input_bindings",
             }
             errors.extend(f"unknown_step_field:{index}.{key}" for key in raw_step if key not in allowed_step_keys)
             step_id = raw_step.get("id")
@@ -362,6 +376,7 @@ class Planner:
             depends_on = raw_step.get("depends_on")
             verifier = raw_step.get("verifier", "")
             success_criteria = raw_step.get("success_criteria", {})
+            input_bindings = raw_step.get("input_bindings", {})
 
             if not isinstance(step_id, str) or not step_id.strip():
                 errors.append(f"step_{index}_id_required")
@@ -390,6 +405,27 @@ class Planner:
             if not isinstance(success_criteria, dict):
                 errors.append(f"step_{step_id}_success_criteria_must_be_object")
                 success_criteria = {}
+            normalized_bindings: dict[str, dict[str, str]] = {}
+            if not isinstance(input_bindings, dict):
+                errors.append(f"step_{step_id}_input_bindings_must_be_object")
+                input_bindings = {}
+            for target, binding in input_bindings.items():
+                if (
+                    not isinstance(target, str)
+                    or not target
+                    or not isinstance(binding, dict)
+                    or set(binding) != {"source_step_id", "output_key"}
+                    or not isinstance(binding.get("source_step_id"), str)
+                    or not binding.get("source_step_id")
+                    or not isinstance(binding.get("output_key"), str)
+                    or not binding.get("output_key")
+                ):
+                    errors.append(f"step_{step_id}_input_binding_invalid:{target}")
+                    continue
+                normalized_bindings[target] = {
+                    "source_step_id": binding["source_step_id"],
+                    "output_key": binding["output_key"],
+                }
 
             if tool_name:
                 try:
@@ -400,7 +436,13 @@ class Planner:
                     errors.append(f"unknown_tool:{tool_name}")
                 if tool is not None:
                     tool_schema = getattr(tool, "input_schema", lambda: {})()
-                    self._validate_input(step_id, step_input, tool_schema, errors)
+                    self._validate_input(
+                        step_id,
+                        step_input,
+                        tool_schema,
+                        errors,
+                        bound_fields=set(normalized_bindings),
+                    )
                     declared_permission = getattr(tool, "permission_level", None)
                     requested_permission = raw_step.get("permission_level", declared_permission)
                     if requested_permission != declared_permission:
@@ -419,6 +461,7 @@ class Planner:
                     depends_on=depends_on,
                     verifier=verifier,
                     success_criteria=success_criteria,
+                    input_bindings=normalized_bindings,
                 )
             )
 
@@ -426,6 +469,44 @@ class Planner:
             for dependency in depends_on:
                 if dependency not in step_ids:
                     errors.append(f"unknown_dependency:{step_id}->{dependency}")
+        steps_by_id = {step.id: step for step in steps}
+        for step in steps:
+            if not step.input_bindings:
+                continue
+            try:
+                target_tool = tools.get(step.tool)
+                target_properties = target_tool.input_schema().get("properties", {})
+            except (KeyError, AttributeError, TypeError):
+                continue
+            for target, binding in step.input_bindings.items():
+                source_id = binding["source_step_id"]
+                output_key = binding["output_key"]
+                if target in step.input:
+                    errors.append(f"input_binding_conflicts_with_value:{step.id}.{target}")
+                target_schema = target_properties.get(target) if isinstance(target_properties, dict) else None
+                if not isinstance(target_schema, dict):
+                    errors.append(f"input_binding_target_unknown:{step.id}.{target}")
+                if source_id not in step.depends_on:
+                    errors.append(f"input_binding_source_not_dependency:{step.id}->{source_id}")
+                source_step = steps_by_id.get(source_id)
+                if source_step is None:
+                    continue
+                try:
+                    source_tool = tools.get(source_step.tool)
+                    source_schema = source_tool.output_schema()
+                except (KeyError, AttributeError, TypeError):
+                    continue
+                source_properties = source_schema.get("properties", {}) if isinstance(source_schema, dict) else {}
+                source_required = source_schema.get("required", []) if isinstance(source_schema, dict) else []
+                source_field_schema = source_properties.get(output_key) if isinstance(source_properties, dict) else None
+                if not isinstance(source_field_schema, dict) or output_key not in source_required:
+                    errors.append(f"input_binding_source_output_unavailable:{step.id}.{source_id}.{output_key}")
+                    continue
+                source_type = source_field_schema.get("type")
+                target_type = target_schema.get("type") if isinstance(target_schema, dict) else None
+                compatible = source_type == target_type or (source_type == "integer" and target_type == "number")
+                if source_type is None or target_type is None or not compatible:
+                    errors.append(f"input_binding_type_mismatch:{step.id}.{target}:{source_type}->{target_type}")
         if self._has_cycle(dependencies):
             errors.append("circular_dependency")
 
@@ -436,10 +517,18 @@ class Planner:
         return TaskPlan(goal=goal, steps=steps, rationale=rationale)
 
     @staticmethod
-    def _validate_input(step_id: str, values: dict[str, Any], schema: dict[str, Any], errors: list[str]) -> None:
+    def _validate_input(
+        step_id: str,
+        values: dict[str, Any],
+        schema: dict[str, Any],
+        errors: list[str],
+        *,
+        bound_fields: set[str] | None = None,
+    ) -> None:
         required = schema.get("required", []) if isinstance(schema, dict) else []
+        bound_fields = bound_fields or set()
         for name in required:
-            if name not in values:
+            if name not in values and name not in bound_fields:
                 errors.append(f"missing_required_input:{step_id}.{name}")
         properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
         if schema.get("additionalProperties") is False:

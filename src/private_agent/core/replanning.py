@@ -147,6 +147,7 @@ class Replanner:
             depends_on=[dep for dep in failed_step.depends_on if dep != failed_step.id],
             verifier="",
             success_criteria=dict(failed_step.success_criteria),
+            input_bindings={key: dict(value) for key, value in failed_step.input_bindings.items()},
         )
         steps: list[dict[str, Any]] = []
         replaced = False
@@ -205,6 +206,7 @@ class Replanner:
             "depends_on": step.depends_on,
             "verifier": step.verifier,
             "success_criteria": step.success_criteria,
+            "input_bindings": step.input_bindings,
         }
 
     def _plan_payload(self, plan: TaskPlan) -> dict[str, Any]:
