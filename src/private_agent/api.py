@@ -390,6 +390,7 @@ class BugBountyTaskResponse(APIModel):
     task_id: str
     status: str
     verification_status: str
+    recovery_state: dict[str, Any] = Field(default_factory=dict)
     run: dict[str, Any] | None = None
     scan: dict[str, Any] | None = None
     report: str = ""
@@ -1652,6 +1653,7 @@ class AgentAPIService:
             task_id=state.task_id,
             status=state.status,
             verification_status=_verification_status(state),
+            recovery_state=_public_value(state.recovery_state),
             run=safe_run,
             scan=safe_scan,
             report="" if report_suppressed else str(output.get("report", "")),

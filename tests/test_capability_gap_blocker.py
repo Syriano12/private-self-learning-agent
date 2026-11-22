@@ -191,7 +191,8 @@ def test_specialized_bug_bounty_route_blocks_when_selected_scanner_is_not_regist
     registry = ToolRegistry()
     registry.register(registered_tool)
     provider = StaticPlanProvider(_plan("Run bounded reconnaissance", "httpx_recon"))
-    store = Store(tmp_path / "bug-bounty-capability-gap.sqlite3")
+    db_path = tmp_path / "bug-bounty-capability-gap.sqlite3"
+    store = Store(db_path)
     orchestrator = Orchestrator(store, registry, planner=Planner(provider))
 
     result = orchestrator.run(
@@ -220,7 +221,36 @@ def test_specialized_bug_bounty_route_blocks_when_selected_scanner_is_not_regist
     assert persisted is not None
     assert persisted["status"] == "BLOCKED"
     assert persisted["recovery_state"]["capability_gap"]["requested_tools"] == ["httpx_recon"]
+
     store.close()
+    reopened = Store(db_path)
+    persisted_after_restart = reopened.get_task_state(result["task_id"])
+    assert persisted_after_restart is not None
+    assert persisted_after_restart["recovery_state"] == persisted["recovery_state"]
+    service = AgentAPIService(Orchestrator(reopened, registry, planner=Planner(provider)), token=API_TOKEN)
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        headers = {"Authorization": f"Bearer {API_TOKEN}"}
+        general = client.get(f"/api/v1/tasks/{result['task_id']}", headers=headers)
+        specialized = client.get(f"/api/v1/bug-bounty/tasks/{result['task_id']}", headers=headers)
+
+    assert general.status_code == 200, general.text
+    assert specialized.status_code == 200, specialized.text
+    general_body = general.json()
+    specialized_body = specialized.json()
+    assert general_body["status"] == specialized_body["status"] == "BLOCKED"
+    assert general_body["current_phase"] == "CAPABILITY_GAP"
+    assert specialized_body["recovery_state"] == general_body["recovery_state"] == persisted_after_restart["recovery_state"]
+    gap = specialized_body["recovery_state"]["capability_gap"]
+    assert gap["code"] == "UNREGISTERED_TOOL_REQUEST"
+    assert gap["summary"] == "The planner requested a tool that is not registered; no tool was executed or installed."
+    assert gap["requested_tools"] == ["httpx_recon"]
+    assert gap["execution_attempted"] is False
+    assert gap["acquisition_attempted"] is False
+    assert gap["permissions_granted"] is False
+    assert specialized_body["run"] is None
+    assert specialized_body["scan"] is None
+    assert specialized_body["report"] == ""
+    reopened.close()
 
 
 def test_repeated_unregistered_tool_requests_remain_a_single_truthful_capability_gap(tmp_path: Path) -> None:
