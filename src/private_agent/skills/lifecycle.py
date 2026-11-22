@@ -834,6 +834,205 @@ class LifecycleResult:
         }
 
 
+class CapabilityCandidateAssessmentError(ValueError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class CapabilityCandidateAssessor:
+    """Persist static evidence for a proposal bound to a real capability gap."""
+
+    MAX_SOURCE_BYTES = 64 * 1024
+    SAFE_TOOL_REFERENCE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+    def __init__(self, registry: SkillRegistry, tool_registry: Any) -> None:
+        self.registry = registry
+        self.tool_registry = tool_registry
+        self.contract_validator = SkillContractValidator()
+        self.analyzer = SkillStaticAnalyzer()
+
+    def assess_for_gap(
+        self,
+        candidate: SkillCandidate,
+        *,
+        gap_task_id: str,
+        target_tool: str,
+    ) -> dict[str, Any]:
+        if not isinstance(target_tool, str):
+            raise CapabilityCandidateAssessmentError("candidate_target_mismatch")
+        # Keep registration stable from the absence check through durable save.
+        # ToolRegistry's lock is process-local; it does not coordinate separate processes.
+        with self.tool_registry.guard_unregistered(target_tool) as is_unregistered:
+            if not is_unregistered:
+                raise CapabilityCandidateAssessmentError("capability_gap_resolved")
+            return self._assess_for_gap_under_registry_lock(
+                candidate,
+                gap_task_id=gap_task_id,
+                target_tool=target_tool,
+            )
+
+    def _assess_for_gap_under_registry_lock(
+        self,
+        candidate: SkillCandidate,
+        *,
+        gap_task_id: str,
+        target_tool: str,
+    ) -> dict[str, Any]:
+        if type(candidate) is not SkillCandidate:
+            raise CapabilityCandidateAssessmentError("candidate_manifest_invalid")
+        if (
+            not isinstance(target_tool, str)
+            or not self.SAFE_TOOL_REFERENCE.fullmatch(target_tool)
+            or candidate.name != target_tool
+        ):
+            raise CapabilityCandidateAssessmentError("candidate_target_mismatch")
+        if not isinstance(gap_task_id, str) or not gap_task_id or len(gap_task_id) > 128:
+            raise CapabilityCandidateAssessmentError("capability_gap_task_id_invalid")
+
+        task_state = self.registry.store.get_task_state(gap_task_id)
+        if task_state is None:
+            raise CapabilityCandidateAssessmentError("capability_gap_task_not_found")
+        recovery = task_state.get("recovery_state")
+        gap = recovery.get("capability_gap") if isinstance(recovery, dict) else None
+        requested_tools = gap.get("requested_tools") if isinstance(gap, dict) else None
+        if (
+            task_state.get("status") != "BLOCKED"
+            or not isinstance(recovery, dict)
+            or recovery.get("reason") != "capability_unavailable"
+            or not isinstance(gap, dict)
+            or gap.get("code") != "UNREGISTERED_TOOL_REQUEST"
+            or not isinstance(requested_tools, list)
+            or target_tool not in requested_tools
+        ):
+            raise CapabilityCandidateAssessmentError("candidate_not_bound_to_capability_gap")
+
+        try:
+            source_size = len(candidate.source.encode("utf-8"))
+        except (AttributeError, UnicodeEncodeError):
+            raise CapabilityCandidateAssessmentError("candidate_source_invalid") from None
+        if source_size > self.MAX_SOURCE_BYTES:
+            raise CapabilityCandidateAssessmentError("candidate_source_too_large")
+        for name in ("declared_capabilities", "allowed_imports", "allowed_network_domains"):
+            values = getattr(candidate, name, None)
+            if (
+                not isinstance(values, list)
+                or len(values) > 64
+                or any(not isinstance(value, str) or len(value) > 128 for value in values)
+            ):
+                raise CapabilityCandidateAssessmentError("candidate_manifest_invalid")
+        if not isinstance(candidate.expected_inputs, dict) or not isinstance(candidate.expected_outputs, dict):
+            raise CapabilityCandidateAssessmentError("candidate_manifest_invalid")
+        if self.registry.store.get_skill_version(candidate.name, int(candidate.version)) is not None:
+            raise CapabilityCandidateAssessmentError("candidate_version_conflict")
+
+        # Rebuild from data fields only; never carry an in-process callable into
+        # assessment. The contract deliberately grants no network/filesystem access.
+        assessed = SkillCandidate(
+            skill_id=candidate.skill_id,
+            name=candidate.name,
+            version=candidate.version,
+            description=candidate.description,
+            source=candidate.source,
+            entry_point=candidate.entry_point,
+            declared_capabilities=list(candidate.declared_capabilities),
+            required_resources={},
+            allowed_imports=list(candidate.allowed_imports),
+            allowed_network_domains=list(candidate.allowed_network_domains),
+            expected_inputs=dict(candidate.expected_inputs),
+            expected_outputs=dict(candidate.expected_outputs),
+            tests=[],
+            metadata={},
+            provenance={},
+            status="CANDIDATE",
+            parent_version=candidate.parent_version,
+            created_at=candidate.created_at,
+        )
+        contract = SkillContract(
+            declared_capabilities=[],
+            network_allowed=False,
+            filesystem_allowed=False,
+            allowed_network_domains=[],
+            workspace_root="",
+        )
+        contract_report = self.contract_validator.validate(assessed, contract)
+        try:
+            analysis = self.analyzer.analyze(assessed, contract)
+        except (RecursionError, MemoryError):
+            analysis = StaticAnalysisReport(
+                False,
+                [SkillFinding("ERROR", "analysis_resource_limit", {}, "Static analysis exceeded its resource limit", "source_sha256_only", True)],
+            )
+
+        passed = contract_report.passed and analysis.passed
+        assessed.status = "CANDIDATE" if passed else "REJECTED"
+        source_sha256 = hashlib.sha256(assessed.source.encode("utf-8")).hexdigest()
+        review_status = "PENDING_REVIEW" if passed else "REJECTED_AUTOMATED"
+        assessment = {
+            "mode": "bounded_static_only",
+            "capability_gap_task_id": gap_task_id,
+            "target_tool": target_tool,
+            "capability_gap_code": "UNREGISTERED_TOOL_REQUEST",
+            "source_sha256": source_sha256,
+            "review_status": review_status,
+            "execution_attempted": False,
+            "installation_attempted": False,
+            "registration_attempted": False,
+            "permissions_granted": False,
+        }
+        assessed.metadata = {"capability_assessment": assessment}
+        assessed.provenance = {
+            "source": "capability_gap_candidate_assessment",
+            "capability_gap_task_id": gap_task_id,
+            "target_tool": target_tool,
+            "source_sha256": source_sha256,
+        }
+        approval_record = {
+            "status": review_status,
+            "approved": False,
+            "reasons": ["static_assessment_only", "no_approval_or_permission_granted"],
+            "required_checks": {
+                "contract_validation": contract_report.passed,
+                "static_analysis": analysis.passed,
+                "independent_review": False,
+                "isolation_validation": False,
+                "owner_approval": False,
+                "registration": False,
+                "execution": False,
+            },
+        }
+        self.registry.persist_candidate(
+            assessed,
+            contract={
+                "assessment_contract": contract.to_dict(),
+                "validation": contract_report.to_dict(),
+                "permissions_granted": False,
+            },
+            analysis=analysis,
+            approval=approval_record,
+            status=assessed.status,
+        )
+        saved = self.registry.get_candidate(assessed.skill_id)
+        if saved is None:
+            raise CapabilityCandidateAssessmentError("candidate_persistence_conflict")
+        self.registry.store.save_skill_event(
+            assessed.skill_id,
+            "candidate_assessed_for_capability_gap",
+            {
+                "capability_gap_task_id": gap_task_id,
+                "target_tool": target_tool,
+                "source_sha256": source_sha256,
+                "status": assessed.status,
+                "review_status": review_status,
+                "execution_attempted": False,
+                "installation_attempted": False,
+                "registration_attempted": False,
+                "permissions_granted": False,
+            },
+        )
+        return saved
+
+
 @dataclass
 class ActiveExecutionResult:
     status: str

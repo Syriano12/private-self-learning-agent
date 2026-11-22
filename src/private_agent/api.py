@@ -55,6 +55,8 @@ from private_agent.bugbounty.reviews import FindingReview, FindingReviewDecision
 from private_agent.bugbounty.remote_worker import RemoteWorkerProtocol, WorkerAuthentication, WorkerProtocolError
 from private_agent.observability import ObservabilityMonitor, safe_metadata
 from private_agent.security import ApprovalRequest, SecurityController
+from private_agent.skills.lifecycle import CapabilityCandidateAssessor, CapabilityCandidateAssessmentError, SkillCandidate
+from private_agent.skills.registry import SkillRegistry
 from private_agent.skills.runtime_preflight import run_host_preflight
 from private_agent.storage import QueueLeaseLost, Store
 from private_agent.bugbounty.trusted_tools import load_tool_spec_from_environment
@@ -119,6 +121,76 @@ class TaskCreateRequest(APIModel):
         if not value:
             raise ValueError("goal_required")
         return value
+
+
+class CapabilityCandidateAssessmentRequest(APIModel):
+    target_tool: str = Field(min_length=1, max_length=128)
+    version: int = Field(ge=1, le=1_000_000)
+    description: str = Field(default="", max_length=1024)
+    source: str = Field(min_length=1, max_length=65_536)
+    entry_point: str = Field(min_length=1, max_length=128)
+    declared_capabilities: list[str] = Field(default_factory=list, max_length=64)
+    allowed_imports: list[str] = Field(default_factory=list, max_length=64)
+    allowed_network_domains: list[str] = Field(default_factory=list, max_length=64)
+    expected_inputs: dict[str, Any] = Field(default_factory=dict)
+    expected_outputs: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target_tool")
+    @classmethod
+    def valid_target_tool(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+            raise ValueError("candidate_target_tool_invalid")
+        return value
+
+    @field_validator("entry_point")
+    @classmethod
+    def valid_entry_point(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,127}", value):
+            raise ValueError("candidate_entry_point_invalid")
+        return value
+
+    @field_validator("source")
+    @classmethod
+    def bounded_source_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > CapabilityCandidateAssessor.MAX_SOURCE_BYTES:
+            raise ValueError("candidate_source_too_large")
+        return value
+
+    @field_validator("declared_capabilities", "allowed_imports", "allowed_network_domains")
+    @classmethod
+    def bounded_manifest_strings(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() or len(item) > 128 or any(ord(char) < 32 for char in item) for item in value):
+            raise ValueError("candidate_manifest_value_invalid")
+        return value
+
+    @field_validator("expected_inputs", "expected_outputs")
+    @classmethod
+    def bounded_contract_objects(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, RecursionError):
+            raise ValueError("candidate_contract_invalid") from None
+        if len(encoded) > 8_192:
+            raise ValueError("candidate_contract_too_large")
+        return value
+
+
+class CapabilityCandidateAssessmentResponse(APIModel):
+    candidate_id: str
+    capability_gap_task_id: str
+    target_tool: str
+    version: int
+    status: str
+    review_status: str
+    source_sha256: str
+    contract: dict[str, Any]
+    analysis: dict[str, Any]
+    execution_attempted: bool
+    installation_attempted: bool
+    registration_attempted: bool
+    permissions_granted: bool
+    created_at: str
+    request_id: str = ""
 
 
 class BugBountyCreateRequest(APIModel):
@@ -805,6 +877,8 @@ class AgentAPIService:
         self.auth_manager = AuthManager(self.store)
         self.public_policy_retriever = PublicPolicyRetriever()
         self.remote_worker_protocol = RemoteWorkerProtocol(self.store)
+        self.skill_registry = SkillRegistry(self.store)
+        self.capability_candidate_assessor = CapabilityCandidateAssessor(self.skill_registry, orchestrator.tools)
         self.require_owner_auth = os.getenv("AGENT_REQUIRE_OWNER_AUTH", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.auto_requeue_approvals = False
         self._lock = threading.RLock()
@@ -1520,6 +1594,98 @@ class AgentAPIService:
     def get_task(self, task_id: str, *, request_id: str = "", principal: AuthenticatedPrincipal | None = None) -> TaskStateResponse:
         self._assert_task_access(task_id, principal)
         return self.task_state_response(self._state(task_id), request_id=request_id)
+
+    @staticmethod
+    def _capability_candidate_response(
+        record: dict[str, Any], *, request_id: str = ""
+    ) -> CapabilityCandidateAssessmentResponse:
+        candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        assessment = metadata.get("capability_assessment") if isinstance(metadata.get("capability_assessment"), dict) else {}
+        if assessment.get("mode") != "bounded_static_only":
+            raise APIError(404, "capability_candidate_not_found", "Capability candidate assessment was not found")
+        return CapabilityCandidateAssessmentResponse(
+            candidate_id=str(record.get("skill_id", "")),
+            capability_gap_task_id=str(assessment.get("capability_gap_task_id", "")),
+            target_tool=str(assessment.get("target_tool", "")),
+            version=int(record.get("version", 0)),
+            status=str(record.get("status", "")),
+            review_status=str(record.get("approval", {}).get("status", assessment.get("review_status", "NOT_REVIEWED")))
+            if isinstance(record.get("approval"), dict) else str(assessment.get("review_status", "NOT_REVIEWED")),
+            source_sha256=str(assessment.get("source_sha256", "")),
+            contract=record.get("contract") if isinstance(record.get("contract"), dict) else {},
+            analysis=record.get("analysis") if isinstance(record.get("analysis"), dict) else {},
+            execution_attempted=bool(assessment.get("execution_attempted", False)),
+            installation_attempted=bool(assessment.get("installation_attempted", False)),
+            registration_attempted=bool(assessment.get("registration_attempted", False)),
+            permissions_granted=bool(assessment.get("permissions_granted", False)),
+            created_at=str(candidate.get("created_at", "")),
+            request_id=request_id,
+        )
+
+    def assess_capability_candidate(
+        self,
+        task_id: str,
+        payload: CapabilityCandidateAssessmentRequest,
+        *,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> CapabilityCandidateAssessmentResponse:
+        if principal is None or principal.role != ROLE_OWNER:
+            raise APIError(403, "forbidden", "Only the owner can assess capability candidates")
+        self._assert_task_access(task_id, principal)
+        candidate = SkillCandidate(
+            skill_id=str(uuid.uuid4()),
+            name=payload.target_tool,
+            version=payload.version,
+            description=payload.description,
+            source=payload.source,
+            entry_point=payload.entry_point,
+            declared_capabilities=list(payload.declared_capabilities),
+            allowed_imports=list(payload.allowed_imports),
+            allowed_network_domains=list(payload.allowed_network_domains),
+            expected_inputs=dict(payload.expected_inputs),
+            expected_outputs=dict(payload.expected_outputs),
+            metadata={},
+            provenance={},
+            status="CANDIDATE",
+        )
+        with self._lock:
+            try:
+                record = self.capability_candidate_assessor.assess_for_gap(
+                    candidate,
+                    gap_task_id=task_id,
+                    target_tool=payload.target_tool,
+                )
+            except CapabilityCandidateAssessmentError as exc:
+                if exc.code == "capability_gap_task_not_found":
+                    code, status_code = exc.code, 404
+                elif exc.code in {
+                    "candidate_version_conflict",
+                    "candidate_persistence_conflict",
+                    "candidate_not_bound_to_capability_gap",
+                    "capability_gap_resolved",
+                }:
+                    code, status_code = exc.code, 409
+                else:
+                    code, status_code = exc.code, 422
+                raise APIError(status_code, code, "Capability candidate assessment could not be completed") from exc
+        response = self._capability_candidate_response(record, request_id=request_id)
+        return response
+
+    def get_capability_candidate_assessment(
+        self,
+        candidate_id: str,
+        *,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> CapabilityCandidateAssessmentResponse:
+        if principal is None or principal.role != ROLE_OWNER:
+            raise APIError(403, "forbidden", "Only the owner can inspect capability candidates")
+        record = self.skill_registry.get_candidate(candidate_id)
+        if record is None:
+            raise APIError(404, "capability_candidate_not_found", "Capability candidate assessment was not found")
+        return self._capability_candidate_response(record, request_id=request_id)
 
     @staticmethod
     def _bug_bounty_output(state: TaskState) -> dict[str, Any] | None:
@@ -2482,6 +2648,46 @@ def create_app(
     ) -> TaskStateResponse:
         request.state.task_id = task_id
         return service.get_task(task_id, request_id=_request_id(request), principal=principal)
+
+    @router.post(
+        "/tasks/{task_id}/capability-candidates/assess",
+        response_model=CapabilityCandidateAssessmentResponse,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(_require_roles(ROLE_OWNER)), Depends(_csrf_protect)],
+    )
+    def assess_capability_candidate(
+        request: Request,
+        payload: CapabilityCandidateAssessmentRequest,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> CapabilityCandidateAssessmentResponse:
+        request.state.task_id = task_id
+        return service.assess_capability_candidate(
+            task_id,
+            payload,
+            request_id=_request_id(request),
+            principal=principal,
+        )
+
+    @router.get(
+        "/capability-candidates/{candidate_id}",
+        response_model=CapabilityCandidateAssessmentResponse,
+        dependencies=[Depends(_require_roles(ROLE_OWNER))],
+    )
+    def get_capability_candidate_assessment(
+        request: Request,
+        candidate_id: str = APIPath(..., min_length=1, max_length=128),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> CapabilityCandidateAssessmentResponse:
+        result = service.get_capability_candidate_assessment(
+            candidate_id,
+            request_id=_request_id(request),
+            principal=principal,
+        )
+        request.state.task_id = result.capability_gap_task_id
+        return result
 
     @router.post(
         "/tasks/{task_id}/resume",
