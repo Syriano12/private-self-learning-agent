@@ -420,7 +420,19 @@ class GenericExecutor:
                     {"dependency": dependency},
                 )
             dependency_result = context.previous_results[dependency]
-            if dependency_result.status != "success":
+            if not isinstance(dependency_result, StepResult):
+                return (
+                    "dependency_result_invalid",
+                    f"Dependency result is malformed: {dependency}",
+                    {"dependency": dependency},
+                )
+            if dependency_result.step_id != dependency:
+                return (
+                    "dependency_identity_mismatch",
+                    f"Dependency result does not belong to the requested step: {dependency}",
+                    {"dependency": dependency, "result_step_id": dependency_result.step_id},
+                )
+            if dependency_result.status != "success" or dependency_result.error is not None:
                 return (
                     "dependency_failed",
                     f"Dependency did not succeed: {dependency}",

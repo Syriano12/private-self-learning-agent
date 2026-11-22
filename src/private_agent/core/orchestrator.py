@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import inspect
+import json
 import re
 from time import monotonic
 from typing import Any
@@ -615,7 +616,7 @@ class Orchestrator:
             recovery_requested = False
             latest_outcomes = {}
             pending_steps = [
-                step for step in current_plan.steps
+                step for step in self._ordered_plan_steps(current_plan)
                 if state.action_key_for_step(step) not in set(state.completed_actions)
             ]
             if not pending_steps:
@@ -623,7 +624,7 @@ class Orchestrator:
                 break
             execution_context = ExecutionContext(
                 task_id=task_id,
-                previous_results=dict(verified_previous_results),
+                previous_results={},
                 approved_permissions=set(self.approved_permissions),
                 metadata={"attempt": rounds, "goal": current_plan.goal},
                 security_controller=self.security,
@@ -662,9 +663,9 @@ class Orchestrator:
                     step_id=step.id,
                     metadata={"tool_name": step.tool, "round": rounds},
                 )
-                step_result = self._execute_one(step, execution_context)
+                step_context = self._isolated_execution_context(execution_context, verified_previous_results)
+                step_result = self._execute_one(step, step_context)
                 all_step_results.append(step_result)
-                execution_context.previous_results[step.id] = step_result
                 state.mark_action(
                     key,
                     status="OBSERVING",
@@ -832,6 +833,7 @@ class Orchestrator:
                     break
 
                 state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
+                verified_previous_results.clear()
                 self._emit_observability(
                     "PLAN_UPDATED",
                     task_id=task_id,
@@ -1545,12 +1547,9 @@ class Orchestrator:
                 security_decisions = [item.to_dict() for item in updated_decisions]
                 verified_previous_results = {}
                 for step in current_plan.steps:
-                    key = state.action_key_for_step(step)
-                    record = state.action_records.get(key)
-                    if key in state.completed_actions and isinstance(record, dict):
-                        step_result = self._step_result_from_dict(record.get("output"))
-                        if step_result is not None:
-                            verified_previous_results[step.id] = step_result
+                    step_result = self._verified_result_from_action_record(state, step)
+                    if step_result is not None:
+                        verified_previous_results[step.id] = step_result
                 latest = self._verified_outcomes_for_plan(state, current_plan)
                 outcome_by_step = {item.step_id: item for item in all_outcomes}
                 outcome_by_step.update(latest)
@@ -1563,7 +1562,7 @@ class Orchestrator:
                 if outcome.verification_status == "VERIFIED"
             }
             pending_steps = [
-                step for step in current_plan.steps
+                step for step in self._ordered_plan_steps(current_plan)
                 if state.action_key_for_step(step) not in set(state.completed_actions)
             ]
             if not pending_steps:
@@ -1571,7 +1570,7 @@ class Orchestrator:
                 break
             context = ExecutionContext(
                 task_id=state.task_id,
-                previous_results=dict(verified_previous_results),
+                previous_results={},
                 approved_permissions=set(self.approved_permissions),
                 metadata={"attempt": rounds, "goal": current_plan.goal},
                 security_controller=self.security,
@@ -1621,7 +1620,8 @@ class Orchestrator:
                         step_id=step.id,
                         metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
                     )
-                    step_result = self._execute_one(step, context)
+                    step_context = self._isolated_execution_context(context, verified_previous_results)
+                    step_result = self._execute_one(step, step_context)
                     state.mark_action(
                         key,
                         status="OBSERVING",
@@ -1638,7 +1638,6 @@ class Orchestrator:
                     )
                     self._save_checkpoint_after(state, "AFTER_EXECUTION", step.id)
                 all_step_results.append(step_result)
-                context.previous_results[step.id] = step_result
                 outcome, diagnosis, action = self._observe_verify_diagnose(
                     state.task_id, step, step_result, rounds, experience
                 )
@@ -1668,6 +1667,7 @@ class Orchestrator:
                     },
                 )
                 if outcome.verification_status == "VERIFIED" and outcome.execution_status == "success":
+                    verified_previous_results[step.id] = step_result
                     state.mark_action(
                         key,
                         status="VERIFIED",
@@ -1698,12 +1698,9 @@ class Orchestrator:
                         security_decisions = [item.to_dict() for item in updated_decisions]
                         verified_previous_results = {}
                         for current_step in current_plan.steps:
-                            current_key = state.action_key_for_step(current_step)
-                            current_record = state.action_records.get(current_key)
-                            if current_key in state.completed_actions and isinstance(current_record, dict):
-                                previous_result = self._step_result_from_dict(current_record.get("output"))
-                                if previous_result is not None:
-                                    verified_previous_results[current_step.id] = previous_result
+                            previous_result = self._verified_result_from_action_record(state, current_step)
+                            if previous_result is not None:
+                                verified_previous_results[current_step.id] = previous_result
                         latest = self._verified_outcomes_for_plan(state, current_plan)
                         outcome_by_step = {item.step_id: item for item in all_outcomes}
                         outcome_by_step.update(latest)
@@ -1770,6 +1767,7 @@ class Orchestrator:
                     errors.append(str(exc))
                     break
                 state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
+                verified_previous_results.clear()
                 self._emit_observability(
                     "PLAN_UPDATED",
                     task_id=state.task_id,
@@ -2182,6 +2180,96 @@ class Orchestrator:
         experience.add_action(action)
         diagnosis = self.diagnoser.diagnose(step_result=step_result, observation=observation, verification=verification)
         return outcome, diagnosis, action
+
+    @staticmethod
+    def _ordered_plan_steps(plan: TaskPlan) -> list[PlanStep]:
+        ordered, error = GenericExecutor._dependency_order(plan.steps)
+        if error is not None:
+            raise StateIntegrityError(f"invalid_plan_dependencies:{error}")
+        return ordered
+
+    def _verified_result_from_action_record(self, state: TaskState, step: PlanStep) -> StepResult | None:
+        key = state.action_key_for_step(step)
+        record = state.action_records.get(key)
+        verification = record.get("verification") if isinstance(record, dict) else None
+        record_observation = record.get("observation") if isinstance(record, dict) else None
+        if (
+            key not in state.completed_actions
+            or not isinstance(record, dict)
+            or record.get("action_key") != key
+            or record.get("status") != "VERIFIED"
+            or record.get("step_id") != step.id
+            or record.get("tool_name") != step.tool
+            or record.get("input_fingerprint") != key
+            or record.get("execution_status") != "success"
+            or not isinstance(verification, dict)
+            or verification.get("status") != "VERIFIED"
+            or verification.get("verified") is not True
+            or state.verification_results.get(key) != verification
+            or not isinstance(record_observation, dict)
+            or record_observation != state.observations.get(key)
+            or record_observation.get("task_id") != state.task_id
+            or record_observation.get("step_id") != step.id
+            or record_observation.get("tool_name") != step.tool
+            or record_observation.get("execution_status") != "success"
+            or record_observation.get("observed_error") is not None
+        ):
+            return None
+        result = self._step_result_from_dict(record.get("output"))
+        if (
+            result is None
+            or result.step_id != step.id
+            or result.tool_name != step.tool
+            or result.status != "success"
+            or result.error is not None
+            or record_observation.get("observed_output") != result.output
+        ):
+            return None
+        return result
+
+    def _isolated_execution_context(
+        self,
+        base: ExecutionContext,
+        verified_results: dict[str, StepResult],
+    ) -> ExecutionContext:
+        previous_results: dict[str, StepResult] = {}
+        for step_id, result in verified_results.items():
+            if (
+                not isinstance(result, StepResult)
+                or result.step_id != step_id
+                or result.status != "success"
+                or result.error is not None
+            ):
+                raise StateIntegrityError("verified_dependency_result_identity_mismatch")
+            try:
+                payload = json.loads(json.dumps(result.to_dict(), ensure_ascii=False, allow_nan=False))
+            except (TypeError, ValueError) as exc:
+                raise StateIntegrityError("verified_dependency_result_not_json_safe") from exc
+            copied = self._step_result_from_dict(payload)
+            if (
+                copied is None
+                or copied.step_id != step_id
+                or copied.tool_name != result.tool_name
+                or copied.status != "success"
+                or copied.error is not None
+            ):
+                raise StateIntegrityError("verified_dependency_result_copy_invalid")
+            previous_results[step_id] = copied
+        try:
+            limits = json.loads(json.dumps(base.limits, ensure_ascii=False, allow_nan=False))
+            metadata = json.loads(json.dumps(base.metadata, ensure_ascii=False, allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise StateIntegrityError("execution_context_not_json_safe") from exc
+        return ExecutionContext(
+            task_id=base.task_id,
+            previous_results=previous_results,
+            approved_permissions=set(base.approved_permissions),
+            limits=limits,
+            metadata=metadata,
+            security_controller=self.security,
+            approval_ids=dict(base.approval_ids),
+            observability=base.observability,
+        )
 
     def _execute_one(self, step: PlanStep, context: ExecutionContext) -> StepResult:
         if callable(getattr(self.executor, "execute_step", None)):
