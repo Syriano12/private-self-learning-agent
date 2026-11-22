@@ -129,14 +129,74 @@ class SkillRegistry:
             return None
         return _decode_candidate_row(max(active, key=lambda row: int(row["version"])))
 
+    def candidates_for_capability_gap(self, task_id: str, target_tools: list[str]) -> list[dict[str, Any]]:
+        matches: list[dict[str, Any]] = []
+        for name in sorted(set(target_tools)):
+            for row in self.store.all_skill_candidates(name):
+                record = _decode_candidate_row(row)
+                if record is None:
+                    continue
+                candidate = record.get("candidate", {})
+                metadata = candidate.get("metadata", {}) if isinstance(candidate, dict) else {}
+                assessment = metadata.get("capability_assessment", {}) if isinstance(metadata, dict) else {}
+                if (
+                    assessment.get("mode") == "bounded_static_only"
+                    and assessment.get("capability_gap_task_id") == task_id
+                    and assessment.get("target_tool") == name
+                ):
+                    matches.append(record)
+        return sorted(
+            matches,
+            key=lambda record: (
+                str(record.get("candidate", {}).get("name", "")),
+                int(record.get("candidate", {}).get("version", 0)),
+            ),
+        )
+
     def activate(self, candidate: Any, *, approval: Any | None = None) -> dict[str, Any]:
+        record = self.get_candidate(str(getattr(candidate, "skill_id", "")))
+        if record is None:
+            raise ValueError("skill_activation_candidate_not_persisted")
+        persisted_candidate = record.get("candidate", {})
+        if (
+            not isinstance(persisted_candidate, dict)
+            or persisted_candidate.get("name") != getattr(candidate, "name", None)
+            or int(persisted_candidate.get("version", 0)) != int(getattr(candidate, "version", 0))
+        ):
+            raise ValueError("skill_activation_candidate_mismatch")
+        metadata = persisted_candidate.get("metadata") if isinstance(persisted_candidate.get("metadata"), dict) else {}
+        capability_assessment = metadata.get("capability_assessment") if isinstance(metadata.get("capability_assessment"), dict) else {}
+        decision = record.get("approval") if isinstance(record.get("approval"), dict) else {}
+        required_checks = decision.get("required_checks") if isinstance(decision.get("required_checks"), dict) else {}
+        required_activation_checks = {
+            "contract_validation",
+            "static_analysis",
+            "mutation_threshold",
+            "sandbox_execution",
+            "runtime_verification",
+            "cross_verification",
+            "no_blocking_findings",
+            "security_authorization",
+        }
+        if capability_assessment.get("mode") == "bounded_static_only":
+            required_activation_checks.update({
+                "candidate_assessment",
+                "independent_review",
+                "isolation_validation",
+                "owner_approval",
+            })
+        if (
+            record.get("status") != "APPROVED"
+            or decision.get("status") != "APPROVED"
+            or decision.get("approved") is not True
+            or not required_activation_checks.issubset(required_checks)
+            or any(required_checks.get(name) is not True for name in required_activation_checks)
+        ):
+            raise ValueError("skill_activation_gates_not_passed")
         existing = self.active(candidate.name)
         if existing and int(candidate.version) <= int(existing["version"]):
             raise ValueError("active_skill_version_must_increase")
-        if self.store.get_skill_candidate(candidate.skill_id) is None:
-            self.persist_candidate(candidate, approval=approval, status="ACTIVE")
-        else:
-            self.store.update_skill_status(candidate.skill_id, "ACTIVE")
+        self.store.update_skill_status(candidate.skill_id, "ACTIVE")
         with self.store._db_lock, self.store.db:
             self.store.db.execute(
                 "INSERT OR REPLACE INTO skills VALUES (?,?,?,?,?,?,?,?,?,?)",

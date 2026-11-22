@@ -182,6 +182,10 @@ class CapabilityCandidateAssessmentResponse(APIModel):
     version: int
     status: str
     review_status: str
+    promotion_status: str = "BLOCKED"
+    can_promote: bool = False
+    blocking_gates: list[str] = Field(default_factory=list)
+    gate_statuses: dict[str, str] = Field(default_factory=dict)
     source_sha256: str
     contract: dict[str, Any]
     analysis: dict[str, Any]
@@ -1482,7 +1486,7 @@ class AgentAPIService:
             pending_actions=list(state.pending_actions),
             failed_actions=list(state.failed_actions),
             actions=actions,
-            recovery_state=_public_value(state.recovery_state),
+            recovery_state=self._capability_gap_recovery_state(state),
             verification_status=_verification_status(state),
             checkpoint=CheckpointResponse(
                 last_checkpoint_at=state.last_checkpoint_at,
@@ -1596,6 +1600,222 @@ class AgentAPIService:
         return self.task_state_response(self._state(task_id), request_id=request_id)
 
     @staticmethod
+    def _candidate_lifecycle_state(record: dict[str, Any]) -> dict[str, Any]:
+        contract = record.get("contract") if isinstance(record.get("contract"), dict) else {}
+        validation = contract.get("validation") if isinstance(contract.get("validation"), dict) else {}
+        analysis = record.get("analysis") if isinstance(record.get("analysis"), dict) else {}
+        mutation = record.get("mutation") if isinstance(record.get("mutation"), dict) else {}
+        runtime = record.get("runtime") if isinstance(record.get("runtime"), dict) else {}
+        sandbox = runtime.get("sandbox") if isinstance(runtime.get("sandbox"), dict) else {}
+        runtime_verification = runtime.get("verification") if isinstance(runtime.get("verification"), dict) else {}
+        cross = record.get("cross_verification") if isinstance(record.get("cross_verification"), dict) else {}
+        approval = record.get("approval") if isinstance(record.get("approval"), dict) else {}
+        checks = approval.get("required_checks") if isinstance(approval.get("required_checks"), dict) else {}
+        candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        assessment = metadata.get("capability_assessment") if isinstance(metadata.get("capability_assessment"), dict) else {}
+
+        def result_gate(value: Any) -> str:
+            return "PASSED" if value is True else "FAILED" if value is False else "NOT_RUN"
+
+        assessment_passed = (
+            assessment.get("mode") == "bounded_static_only"
+            and record.get("status") in {"CANDIDATE", "APPROVED", "ACTIVE"}
+            and validation.get("passed") is True
+            and analysis.get("passed") is True
+            and checks.get("candidate_assessment") is True
+        )
+        assessment_status = (
+            "NOT_RUN" if not assessment
+            else "PASSED" if assessment_passed
+            else "FAILED" if checks.get("candidate_assessment") is False or record.get("status") == "REJECTED"
+            else "NOT_REVIEWED"
+        )
+        is_capability_assessment = assessment.get("mode") == "bounded_static_only"
+        registered = str(record.get("status", "")) == "ACTIVE"
+        gate_statuses = {
+            "candidate_assessment": assessment_status,
+            "contract_validation": result_gate(validation.get("passed")),
+            "static_analysis": result_gate(analysis.get("passed")),
+            "independent_review": "PASSED" if checks.get("independent_review") is True else "NOT_REVIEWED",
+            "isolation_validation": "PASSED" if checks.get("isolation_validation") is True else "BLOCKED" if is_capability_assessment else "NOT_RUN",
+            "owner_approval": "PASSED" if checks.get("owner_approval") is True else "NOT_GRANTED",
+            "mutation_threshold": result_gate(mutation.get("passed")),
+            "sandbox_execution": "PASSED" if sandbox.get("status") == "PASSED" else "BLOCKED",
+            "runtime_verification": result_gate(runtime_verification.get("passed")) if runtime_verification else "BLOCKED",
+            "cross_verification": result_gate(cross.get("passed")),
+            "no_blocking_findings": "PASSED" if checks.get("no_blocking_findings") is True else "NOT_REVIEWED",
+            "security_authorization": "PASSED" if checks.get("security_authorization") is True else "NOT_GRANTED",
+        }
+        satisfied = {"PASSED"}
+        blocking_gates = [name for name, gate_status in gate_statuses.items() if gate_status not in satisfied]
+        status = str(record.get("status", ""))
+        required_for_promotion = {
+            "candidate_assessment", "contract_validation", "static_analysis", "independent_review",
+            "isolation_validation", "owner_approval",
+            "mutation_threshold", "sandbox_execution", "runtime_verification", "cross_verification",
+            "no_blocking_findings", "security_authorization",
+        }
+        can_promote = (
+            status == "APPROVED"
+            and approval.get("status") == "APPROVED"
+            and approval.get("approved") is True
+            and all(gate_statuses[name] == "PASSED" for name in required_for_promotion)
+        )
+        promotion_status = (
+            "PROMOTED" if registered
+            else "REJECTED" if status == "REJECTED"
+            else "READY" if can_promote
+            else "BLOCKED"
+        )
+        return {
+            "promotion_status": promotion_status,
+            "can_promote": can_promote,
+            "blocking_gates": blocking_gates,
+            "gate_statuses": gate_statuses,
+        }
+
+    @staticmethod
+    def _aggregate_capability_candidate_lifecycle(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+        active_count = sum(item.get("status") == "ACTIVE" for item in summaries)
+        ready_count = sum(item.get("can_promote") is True for item in summaries)
+        if summaries and active_count == len(summaries):
+            promotion_status = "PROMOTED"
+        elif active_count:
+            promotion_status = "PARTIALLY_PROMOTED"
+        elif ready_count == len(summaries) and ready_count:
+            promotion_status = "READY"
+        elif ready_count:
+            promotion_status = "PARTIALLY_READY"
+        elif summaries and all(item.get("status") == "REJECTED" for item in summaries):
+            promotion_status = "REJECTED"
+        else:
+            promotion_status = "BLOCKED"
+
+        isolation_states = [
+            (item.get("gate_statuses") or {}).get("isolation_validation", "NOT_RUN")
+            for item in summaries
+        ]
+        execution_states = [
+            (item.get("gate_statuses") or {}).get("sandbox_execution", "NOT_RUN")
+            for item in summaries
+        ]
+        if isolation_states and all(
+            isolation == "PASSED" and execution == "PASSED"
+            for isolation, execution in zip(isolation_states, execution_states)
+        ):
+            isolation_status = "PASSED"
+            isolation_reason = ""
+        elif "FAILED" in isolation_states or "FAILED" in execution_states:
+            isolation_status = "FAILED"
+            isolation_reason = (
+                "isolation_validation_failed_and_runtime_unavailable"
+                if "BLOCKED" in isolation_states or "BLOCKED" in execution_states
+                else "isolation_validation_failed"
+            )
+        elif "BLOCKED" in isolation_states or "BLOCKED" in execution_states or not summaries:
+            isolation_status = "UNAVAILABLE"
+            isolation_reason = "external_sandbox_unavailable"
+        else:
+            isolation_status = "NOT_VALIDATED"
+            isolation_reason = "isolation_validation_not_run"
+
+        blocking_gates = sorted({
+            gate
+            for item in summaries
+            if item.get("status") != "ACTIVE" and item.get("can_promote") is not True
+            for gate in item.get("blocking_gates", [])
+        })
+        outstanding = [item for item in summaries if item.get("status") != "ACTIVE"]
+        return {
+            "promotion_status": promotion_status,
+            "can_promote": bool(outstanding) and all(item.get("can_promote") is True for item in outstanding),
+            "isolation_status": isolation_status,
+            "isolation_reason": isolation_reason,
+            "execution_attempted": any(item.get("execution_attempted", False) for item in summaries),
+            "registration_attempted": any(
+                item.get("registration_attempted", False) or item.get("status") == "ACTIVE"
+                for item in summaries
+            ),
+            "permissions_granted": any(item.get("permissions_granted", False) for item in summaries),
+            "blocking_gates": blocking_gates,
+            "candidates": summaries,
+        }
+
+    def _capability_gap_recovery_state(self, state: TaskState) -> dict[str, Any]:
+        recovery = _public_value(state.recovery_state)
+        if not isinstance(recovery, dict):
+            return {}
+        gap = recovery.get("capability_gap")
+        if not isinstance(gap, dict):
+            return recovery
+        requested = gap.get("requested_tools") if isinstance(gap.get("requested_tools"), list) else []
+        target_tools = [name for name in requested if isinstance(name, str)]
+        records = self.skill_registry.candidates_for_capability_gap(state.task_id, target_tools)
+        latest_by_tool: dict[str, dict[str, Any]] = {}
+        for record in records:
+            candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+            name = str(candidate.get("name", ""))
+            previous = latest_by_tool.get(name)
+            if previous is None or int(candidate.get("version", 0)) > int(previous.get("candidate", {}).get("version", 0)):
+                latest_by_tool[name] = record
+
+        summaries: list[dict[str, Any]] = []
+        for name in sorted(set(target_tools)):
+            record = latest_by_tool.get(name)
+            if record is None:
+                summaries.append({
+                    "target_tool": name,
+                    "candidate_id": "",
+                    "status": "NOT_PROPOSED",
+                    "review_status": "NOT_STARTED",
+                    "promotion_status": "BLOCKED",
+                    "can_promote": False,
+                    "blocking_gates": [
+                        "candidate_assessment", "contract_validation", "static_analysis", "independent_review",
+                        "isolation_validation", "owner_approval", "mutation_threshold", "sandbox_execution",
+                        "runtime_verification", "cross_verification", "no_blocking_findings", "security_authorization",
+                    ],
+                    "gate_statuses": {
+                        "candidate_assessment": "NOT_RUN",
+                        "contract_validation": "NOT_RUN",
+                        "static_analysis": "NOT_RUN",
+                        "independent_review": "NOT_REVIEWED",
+                        "isolation_validation": "BLOCKED",
+                        "owner_approval": "NOT_GRANTED",
+                        "mutation_threshold": "NOT_RUN",
+                        "sandbox_execution": "BLOCKED",
+                        "runtime_verification": "BLOCKED",
+                        "cross_verification": "NOT_RUN",
+                        "no_blocking_findings": "NOT_REVIEWED",
+                        "security_authorization": "NOT_GRANTED",
+                    },
+                    "execution_attempted": False,
+                    "registration_attempted": False,
+                    "permissions_granted": False,
+                })
+                continue
+            candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+            metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+            assessment = metadata.get("capability_assessment") if isinstance(metadata.get("capability_assessment"), dict) else {}
+            approval = record.get("approval") if isinstance(record.get("approval"), dict) else {}
+            summaries.append({
+                "target_tool": name,
+                "candidate_id": str(record.get("skill_id", "")),
+                "version": int(record.get("version", 0)),
+                "status": str(record.get("status", "")),
+                "review_status": str(approval.get("status", assessment.get("review_status", "NOT_REVIEWED"))),
+                **self._candidate_lifecycle_state(record),
+                "execution_attempted": bool(assessment.get("execution_attempted", False))
+                or bool((record.get("runtime") or {}).get("sandbox")),
+                "registration_attempted": bool(assessment.get("registration_attempted", False))
+                or str(record.get("status", "")) == "ACTIVE",
+                "permissions_granted": bool(assessment.get("permissions_granted", False)),
+            })
+        gap["candidate_lifecycle"] = self._aggregate_capability_candidate_lifecycle(summaries)
+        return recovery
+
+    @staticmethod
     def _capability_candidate_response(
         record: dict[str, Any], *, request_id: str = ""
     ) -> CapabilityCandidateAssessmentResponse:
@@ -1612,6 +1832,7 @@ class AgentAPIService:
             status=str(record.get("status", "")),
             review_status=str(record.get("approval", {}).get("status", assessment.get("review_status", "NOT_REVIEWED")))
             if isinstance(record.get("approval"), dict) else str(assessment.get("review_status", "NOT_REVIEWED")),
+            **AgentAPIService._candidate_lifecycle_state(record),
             source_sha256=str(assessment.get("source_sha256", "")),
             contract=record.get("contract") if isinstance(record.get("contract"), dict) else {},
             analysis=record.get("analysis") if isinstance(record.get("analysis"), dict) else {},
@@ -1819,7 +2040,7 @@ class AgentAPIService:
             task_id=state.task_id,
             status=state.status,
             verification_status=_verification_status(state),
-            recovery_state=_public_value(state.recovery_state),
+            recovery_state=self._capability_gap_recovery_state(state),
             run=safe_run,
             scan=safe_scan,
             report="" if report_suppressed else str(output.get("report", "")),
