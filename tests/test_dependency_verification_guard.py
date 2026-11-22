@@ -96,6 +96,10 @@ def make_registry(*tools) -> ToolRegistry:
     return registry
 
 
+def forbid_unverified_batch_execution(*args, **kwargs) -> None:
+    pytest.fail("Orchestrator must not route task steps through GenericExecutor.execute_plan")
+
+
 def make_raw_plan() -> dict:
     return {
         "goal": "prove verified dependency handling",
@@ -194,7 +198,10 @@ class LaterToolProbe(RegisteredProbeTool):
         return ToolResult.success({"result": "ACTUAL-LATER"})
 
 
-def test_orchestrator_isolates_context_and_orders_forward_dependency_with_repeated_tool_names(tmp_path: Path) -> None:
+def test_orchestrator_isolates_context_and_orders_forward_dependency_with_repeated_tool_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(GenericExecutor, "execute_plan", forbid_unverified_batch_execution)
     store = Store(tmp_path / "dependency-guard.sqlite3")
     call_order: list[tuple[str, str]] = []
     repeat = RepeatedToolProbe(store, call_order)
@@ -249,7 +256,10 @@ def test_orchestrator_isolates_context_and_orders_forward_dependency_with_repeat
     assert agent._verified_result_from_action_record(mismatched_state, source_step) is None
 
 
-def test_resume_rehydrates_verified_result_before_forward_dependent_action(tmp_path: Path) -> None:
+def test_resume_rehydrates_verified_result_before_forward_dependent_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(GenericExecutor, "execute_plan", forbid_unverified_batch_execution)
     path = tmp_path / "dependency-resume.sqlite3"
     store = Store(path)
     call_order: list[tuple[str, str]] = []

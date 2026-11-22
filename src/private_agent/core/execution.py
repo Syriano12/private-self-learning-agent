@@ -119,6 +119,13 @@ class GenericExecutor:
         plan: TaskPlan,
         context: ExecutionContext | None = None,
     ) -> list[StepResult]:
+        """Run a low-level plan; dependency checks here do not verify outcomes.
+
+        Dependencies are gated only on successful ``StepResult`` values. Task
+        flows that require verified dependencies must be driven by
+        ``Orchestrator``, which executes and verifies each step before exposing
+        its result to later steps.
+        """
         execution_context = context or ExecutionContext(security_controller=self.security_controller)
         ordered_steps, dependency_error = self._dependency_order(plan.steps)
         if dependency_error is not None:
