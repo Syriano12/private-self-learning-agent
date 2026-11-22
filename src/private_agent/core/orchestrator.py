@@ -552,12 +552,18 @@ class Orchestrator:
 
         final_outcomes = list(latest_outcomes.values())
         verification_payload = self._task_verification(final_outcomes)
-        if verification_payload["verified"]:
+        if self._task_verification_allows_completion(verification_payload):
             terminal_status = "COMPLETED"
         elif terminal_status == "COMPLETED":
             terminal_status = "FAILED"
 
         experience.final_outcome = terminal_status
+        experience.verification_status = str(verification_payload["status"])
+        experience.verification_scope = str(verification_payload.get("verification_scope", ""))
+        impact_verified = verification_payload.get("security_impact_verified")
+        experience.security_impact_verified = impact_verified if isinstance(impact_verified, bool) else None
+        experience.identity = {}
+        experience.build_identity()
         result = {
             "task_id": task_id,
             "goal": goal,
@@ -1137,11 +1143,17 @@ class Orchestrator:
 
         final_outcomes = list(latest_outcomes.values())
         verification_payload = self._task_verification(final_outcomes)
-        if verification_payload["verified"]:
+        if self._task_verification_allows_completion(verification_payload):
             terminal_status = "COMPLETED"
         elif terminal_status == "COMPLETED":
             terminal_status = "FAILED"
         experience.final_outcome = terminal_status
+        experience.verification_status = str(verification_payload["status"])
+        experience.verification_scope = str(verification_payload.get("verification_scope", ""))
+        impact_verified = verification_payload.get("security_impact_verified")
+        experience.security_impact_verified = impact_verified if isinstance(impact_verified, bool) else None
+        experience.identity = {}
+        experience.build_identity()
         result = {
             "task_id": state.task_id,
             "goal": state.goal,
@@ -1292,6 +1304,9 @@ class Orchestrator:
             identity=dict(payload.get("identity", {})),
             metadata=dict(payload.get("metadata", {})),
             created_at=str(payload.get("created_at", "")) or None or ExperienceRecord.__dataclass_fields__["created_at"].default_factory(),
+            verification_status=str(payload.get("verification_status", "")),
+            verification_scope=str(payload.get("verification_scope", "")),
+            security_impact_verified=payload.get("security_impact_verified") if isinstance(payload.get("security_impact_verified"), bool) else None,
         )
 
     @staticmethod
@@ -1623,6 +1638,26 @@ class Orchestrator:
         }
 
     @staticmethod
+    def _task_verification_allows_completion(payload: dict[str, Any]) -> bool:
+        if payload.get("verified") is True:
+            return True
+        details = payload.get("details", {})
+        step_statuses = details.get("step_statuses", []) if isinstance(details, dict) else []
+        return (
+            payload.get("status") == "INSUFFICIENT"
+            and payload.get("verification_scope") == "STATIC_ONLY"
+            and payload.get("security_impact_verified") is False
+            and isinstance(details, dict)
+            and details.get("code") == "security_impact_not_verified"
+            and details.get("verification_scope") == "STATIC_ONLY"
+            and details.get("security_impact_verified") is False
+            and isinstance(step_statuses, list)
+            and bool(step_statuses)
+            and len(step_statuses) == details.get("step_count")
+            and all(status == "VERIFIED" for status in step_statuses)
+        )
+
+    @staticmethod
     def _task_verification(outcomes: list[StepOutcome]) -> dict[str, Any]:
         if not outcomes:
             return {
@@ -1644,16 +1679,56 @@ class Orchestrator:
             status = "INSUFFICIENT"
         else:
             status = "VERIFIED"
-        return {
+        limited_scope_steps: list[StepOutcome] = []
+        limited_scopes: list[str] = []
+        for outcome in outcomes:
+            verification = outcome.verification if isinstance(outcome.verification, dict) else {}
+            details = verification.get("details", {})
+            if isinstance(details, dict) and details.get("security_impact_verified") is False:
+                scope = details.get("verification_scope")
+                if isinstance(scope, str) and scope:
+                    limited_scope_steps.append(outcome)
+                    limited_scopes.append(scope)
+        limited_scope_completion = status == "VERIFIED" and bool(limited_scope_steps)
+        if limited_scope_completion:
+            status = "INSUFFICIENT"
+        scope_label = (
+            "STATIC_ONLY"
+            if limited_scope_steps and all(scope.startswith("static_") for scope in limited_scopes)
+            else "LIMITED"
+            if limited_scope_steps
+            else "TASK_CRITERIA"
+        )
+        details_payload: dict[str, Any] = {"step_count": len(outcomes), "step_statuses": statuses}
+        if limited_scope_steps:
+            details_payload.update(
+                {
+                    "verification_scope": scope_label,
+                    "security_impact_verified": False,
+                    "limited_step_ids": [outcome.step_id for outcome in limited_scope_steps],
+                }
+            )
+        if limited_scope_completion:
+            details_payload["code"] = "security_impact_not_verified"
+        reason = (
+            "Step checks passed within a limited static-only scope; security impact was not verified"
+            if limited_scope_completion
+            else f"Step verification statuses: {', '.join(statuses)}"
+        )
+        payload = {
             "status": status,
             "verified": status == "VERIFIED",
-            "reason": f"Step verification statuses: {', '.join(statuses)}",
+            "reason": reason,
             "evidence": [{"step_id": outcome.step_id, "status": outcome.verification_status} for outcome in outcomes],
             "verifier_type": "orchestrator",
-            "details": {"step_count": len(outcomes), "step_statuses": statuses},
+            "verification_scope": scope_label,
+            "details": details_payload,
             "criteria": {},
             "errors": [],
         }
+        if limited_scope_steps:
+            payload["security_impact_verified"] = False
+        return payload
 
     @staticmethod
     def _collect_sources(outcomes: list[StepOutcome]) -> list[dict[str, Any]]:

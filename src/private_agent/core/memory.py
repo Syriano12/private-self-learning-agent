@@ -119,24 +119,87 @@ class SQLiteExperienceMemory(ExperienceMemory):
         return payload if isinstance(payload, dict) else None
 
     def _to_candidate(self, payload: dict[str, Any]) -> RetrievedExperience:
-        identity = payload.get("identity") if isinstance(payload.get("identity"), dict) else {}
+        identity = dict(payload.get("identity")) if isinstance(payload.get("identity"), dict) else {}
+        explicit_verification_status = payload.get("verification_status")
+        final_outcome = payload.get("final_outcome")
+        valid_statuses = {"VERIFIED", "FAILED", "INSUFFICIENT", "BLOCKED"}
+        consistent_verification = (
+            isinstance(explicit_verification_status, str)
+            and explicit_verification_status in valid_statuses
+            and identity.get("verification_status") == explicit_verification_status
+            and identity.get("outcome") == final_outcome
+            and isinstance(payload.get("verification_scope"), str)
+            and bool(payload.get("verification_scope"))
+            and identity.get("verification_scope") == payload.get("verification_scope")
+            and (payload.get("security_impact_verified") is None or type(payload.get("security_impact_verified")) is bool)
+            and (identity.get("security_impact_verified") is None or type(identity.get("security_impact_verified")) is bool)
+            and identity.get("security_impact_verified") == payload.get("security_impact_verified")
+            and not (
+                explicit_verification_status == "VERIFIED"
+                and (final_outcome != "COMPLETED" or payload.get("security_impact_verified") is False)
+            )
+        )
+        if consistent_verification:
+            identity["verification_status"] = explicit_verification_status
+            identity["verification_scope"] = payload["verification_scope"]
+            identity["security_impact_verified"] = payload.get("security_impact_verified")
+        elif isinstance(explicit_verification_status, str) and explicit_verification_status:
+            identity["verification_status"] = "UNVERIFIED"
+            identity["verification_scope"] = "CONFLICTED"
+            identity["security_impact_verified"] = None
+        else:
+            identity["verification_status"] = (
+                "UNVERIFIED" if final_outcome == "COMPLETED"
+                else str(final_outcome or "UNVERIFIED")
+            )
+            identity["verification_scope"] = (
+                "EXECUTION_ONLY" if final_outcome == "COMPLETED" else "UNKNOWN"
+            )
+            identity["security_impact_verified"] = None
         actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+        actions = [action for action in actions if isinstance(action, dict)]
         strategy_used = [str(action.get("tool_name")) for action in actions if action.get("tool_name")]
         recovery = [str(action.get("recovery", {}).get("strategy")) for action in actions if isinstance(action.get("recovery"), dict) and action.get("recovery", {}).get("strategy")]
         failures = [str(action.get("diagnosis", {}).get("failure_type")) for action in actions if isinstance(action.get("diagnosis"), dict) and action.get("diagnosis", {}).get("failure_type")]
         evidence: list[dict[str, Any]] = []
+        verified_action_tools: list[str] = []
+        verified_final_action_tool = ""
         for action in actions:
+            tool_name = action.get("tool_name")
+            if isinstance(tool_name, str) and tool_name:
+                verified_final_action_tool = ""
             verification = action.get("verification")
-            if isinstance(verification, dict):
-                evidence.extend(verification.get("evidence", [])[: self.max_evidence_per_experience])
-            if len(evidence) >= self.max_evidence_per_experience:
-                break
+            if not isinstance(verification, dict):
+                continue
+            raw_evidence = verification.get("evidence")
+            action_evidence = [item for item in raw_evidence if isinstance(item, dict)] if isinstance(raw_evidence, list) else []
+            if (
+                isinstance(tool_name, str)
+                and tool_name
+                and action.get("execution_status") == "success"
+                and verification.get("status") == "VERIFIED"
+                and verification.get("verified") is not False
+                and action_evidence
+            ):
+                verified_action_tools.append(tool_name)
+                verified_final_action_tool = tool_name
+                remaining = self.max_evidence_per_experience - len(evidence)
+                evidence.extend(action_evidence[:remaining])
+        identity["verified_action_tools"] = list(dict.fromkeys(verified_action_tools))
+        identity["verified_final_action_tool"] = verified_final_action_tool
+        if (
+            identity.get("verification_status") == "VERIFIED"
+            and (not strategy_used or verified_final_action_tool != strategy_used[-1])
+        ):
+            identity["verification_status"] = "UNVERIFIED"
+            identity["verification_scope"] = "ACTION_UNVERIFIED"
+            identity["security_impact_verified"] = None
         return RetrievedExperience(
             experience_id=str(payload.get("task_id", "")),
             relevance=0.0,
             task_summary=str(payload.get("goal", ""))[:500],
-            strategy_used=list(dict.fromkeys(strategy_used)),
-            outcome=str(payload.get("final_outcome", "")),
+            strategy_used=strategy_used,
+            outcome=str(final_outcome or ""),
             failure_diagnosis=list(dict.fromkeys(failures)),
             recovery_strategy=list(dict.fromkeys(recovery)),
             verification_evidence=evidence[: self.max_evidence_per_experience],
@@ -183,9 +246,18 @@ class SQLiteExperienceMemory(ExperienceMemory):
             if matches:
                 score += min(0.1, matches * 0.05)
                 reasons.append(f"constraint_match:{matches}")
-        if candidate.outcome == "COMPLETED" and score > 0:
+        if (
+            candidate.outcome == "COMPLETED"
+            and score > 0
+            and identity.get("verification_status") == "VERIFIED"
+            and identity.get("security_impact_verified") is not False
+            and bool(candidate.strategy_used)
+            and identity.get("verified_final_action_tool") == candidate.strategy_used[-1]
+        ):
             score += 0.05
             reasons.append("verified_outcome")
+        elif candidate.outcome == "COMPLETED" and score > 0:
+            reasons.append("completed_outcome")
         elif candidate.outcome in {"FAILED", "BLOCKED", "ABORTED"}:
             reasons.append("failure_warning")
         return min(1.0, score), reasons
