@@ -2272,15 +2272,9 @@ class Orchestrator:
         )
 
     def _execute_one(self, step: PlanStep, context: ExecutionContext) -> StepResult:
-        if callable(getattr(self.executor, "execute_step", None)):
-            return self.executor.execute_step(step, context)
-        results = self.executor.execute_plan(
-            TaskPlan(context.metadata.get("goal", ""), [step], "checkpointed single-step execution"),
-            context,
-        )
-        if not results:
-            return StepResult.failed(step.id, step.tool, "empty_executor_result", "Executor returned no step result")
-        return results[0]
+        # Production owns a GenericExecutor and must execute one step at a time:
+        # execute_plan gates dependencies on execution success, not verification.
+        return self.executor.execute_step(step, context)
 
     def _apply_decision(
         self,
