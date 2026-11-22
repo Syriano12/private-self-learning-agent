@@ -47,6 +47,39 @@ class FollowupPlanner:
         return TaskPlan(goal, [first, network], "plan incorporating user follow-up")
 
 
+class DependentSafeFollowupPlanner:
+    provider = None
+    max_steps = 12
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create(self, goal, tools, prior_knowledge, **kwargs):
+        del tools, prior_knowledge, kwargs
+        self.calls += 1
+        first = PlanStep(
+            id="first-step",
+            objective="perform the already verified safe step",
+            tool="safe",
+            input={"value": "first"},
+            reason="initial safe action",
+            depends_on=[],
+            success_criteria={"required_fields": ["result"]},
+        )
+        if self.calls == 1:
+            return TaskPlan(goal, [first], "initial plan")
+        followup = PlanStep(
+            id="followup-step",
+            objective="perform a dependent low-risk follow-up action",
+            tool="followup",
+            input={"value": "followup"},
+            reason="created only after the follow-up was received",
+            depends_on=["first-step"],
+            success_criteria={"required_fields": ["result"]},
+        )
+        return TaskPlan(goal, [first, followup], "plan incorporating user follow-up")
+
+
 def test_schema_12_migrates_to_conversation_schema_14(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "schema-12.sqlite3"
     monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 12)
@@ -331,6 +364,40 @@ def test_followup_is_consumed_after_verified_action_then_replanned_and_reauthori
     assert completed["status"] == "COMPLETED"
     assert network.calls == 1
     assert store.task_queue_record(created["task_id"])["queue_status"] == "COMPLETED"
+    store.close()
+
+
+def test_low_risk_followup_dependency_uses_verified_result_without_resume(tmp_path: Path) -> None:
+    safe = APITestTool("safe")
+    followup = APITestTool("followup")
+    service, store, _ = make_service(tmp_path, safe)
+    service.orchestrator.tools.register(followup)
+    planner = DependentSafeFollowupPlanner()
+    service.orchestrator.planner = planner
+    created = store.create_queued_task(
+        "complete the first safe action",
+        initial_message="complete the first safe action",
+    )
+
+    original_execute = safe.execute
+
+    def inject_followup(inputs, context):
+        if safe.calls == 0:
+            queued = service.append_task_message(created["task_id"], "Then perform one dependent safe action")
+            assert queued.status == "PENDING"
+        return original_execute(inputs, context)
+
+    safe.execute = inject_followup
+    worker = BackgroundWorker(service.orchestrator, worker_id="worker-dependent-conversation")
+    completed = worker.run_once()
+
+    assert completed["status"] == "COMPLETED", completed
+    assert safe.calls == 1
+    assert followup.calls == 1
+    assert planner.calls == 2
+    persisted = TaskState.from_dict(store.get_task_state(created["task_id"]))
+    assert persisted.status == "COMPLETED"
+    assert store.task_messages(created["task_id"])[-1]["status"] == "CONSUMED"
     store.close()
 
 
