@@ -7,7 +7,10 @@ import pytest
 from private_agent.bugbounty.scanners import ScannerLimits
 from private_agent.tools.scanners import HttpxReconTool
 from private_agent.skills.sandbox_runtime import RuntimeActivationProof
-from private_agent.skills.runtime_preflight import HostPreflightStatus, run_host_preflight
+from private_agent.skills.runtime_preflight import HostPreflightStatus, _check_cgroups, run_host_preflight
+
+
+_CGROUP2_MOUNTINFO = "36 25 0:32 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw\n"
 
 
 def test_current_or_missing_runtime_is_reported_without_claiming_isolation() -> None:
@@ -20,6 +23,122 @@ def test_current_or_missing_runtime_is_reported_without_claiming_isolation() -> 
     assert report.check("filesystem_restrictions").status is not HostPreflightStatus.PASS
     assert report.host_ready is False
     assert report.can_run_acceptance is False
+
+
+def test_cgroup_preflight_checks_current_scope_and_writable_delegation() -> None:
+    scope = "/sys/fs/cgroup/test.scope"
+    files = {
+        "/proc/self/cgroup": "0::/test.scope\n",
+        "/proc/self/mountinfo": _CGROUP2_MOUNTINFO,
+        f"{scope}/cgroup.controllers": "cpu memory pids\n",
+        f"{scope}/cgroup.subtree_control": "",
+    }
+    writable_paths: set[str] = set()
+
+    def read(path: str) -> str:
+        return files.get(path, "")
+
+    def access(path: str, mode: int, *, effective_ids: bool) -> bool:
+        assert effective_ids is True
+        return mode != 0 and path in writable_paths
+
+    unproven = _check_cgroups(read, access)
+    assert unproven.status is HostPreflightStatus.INCONCLUSIVE
+    assert unproven.detail == "cgroup_delegation_unverified"
+    assert unproven.evidence["scope_writable"] is False
+    assert unproven.evidence["missing_enabled_controllers"] == ["cpu", "memory", "pids"]
+
+    writable_paths.update({scope, f"{scope}/cgroup.subtree_control"})
+    ready = _check_cgroups(read, access)
+    assert ready.status is HostPreflightStatus.INCONCLUSIVE
+    assert ready.detail == "cgroup_runtime_enforcement_unverified"
+    assert ready.evidence["runtime_enforcement_verified"] is False
+
+    files[f"{scope}/cgroup.subtree_control"] = "cpu memory pids\n"
+    writable_paths.clear()
+    writable_paths.add(scope)
+    already_enabled = _check_cgroups(read, access)
+    assert already_enabled.status is HostPreflightStatus.INCONCLUSIVE
+    assert already_enabled.evidence["scope_writable"] is True
+
+
+def test_cgroup_preflight_does_not_use_root_controllers_as_scope_proof() -> None:
+    scope = "/sys/fs/cgroup/test.scope"
+    files = {
+        "/proc/self/cgroup": "0::/test.scope\n",
+        "/proc/self/mountinfo": _CGROUP2_MOUNTINFO,
+        "/sys/fs/cgroup/cgroup.controllers": "cpu memory pids\n",
+        f"{scope}/cgroup.controllers": "memory pids\n",
+        f"{scope}/cgroup.subtree_control": "",
+    }
+
+    result = _check_cgroups(
+        lambda path: files.get(path, ""),
+        lambda _path, _mode, **_kwargs: True,
+    )
+
+    assert result.status is HostPreflightStatus.INCONCLUSIVE
+    assert result.detail == "resource_controllers_unverified_in_current_cgroup"
+    assert result.evidence["available_controllers"] == ["memory", "pids"]
+    assert result.evidence["missing_controllers"] == ["cpu"]
+
+
+def test_cgroup_preflight_rejects_unverified_mount_root() -> None:
+    files = {
+        "/proc/self/cgroup": "0::/test.scope\n",
+        "/proc/self/mountinfo": "36 25 0:32 /user.slice /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+    }
+
+    result = _check_cgroups(lambda path: files.get(path, ""))
+
+    assert result.status is HostPreflightStatus.INCONCLUSIVE
+    assert result.detail == "cgroup_v2_mount_mapping_unverified"
+
+
+def test_cgroup_preflight_rejects_duplicate_matching_mounts() -> None:
+    files = {
+        "/proc/self/cgroup": "0::/test.scope\n",
+        "/proc/self/mountinfo": _CGROUP2_MOUNTINFO
+        + "37 25 0:33 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+    }
+
+    result = _check_cgroups(lambda path: files.get(path, ""))
+
+    assert result.status is HostPreflightStatus.INCONCLUSIVE
+    assert result.detail == "cgroup_v2_mount_mapping_unverified"
+    assert result.evidence["matching_mount_count"] == 2
+
+
+def test_cgroup_preflight_rejects_multiple_unified_memberships() -> None:
+    result = _check_cgroups(lambda path: "0::/one\n0::/two\n" if path == "/proc/self/cgroup" else "")
+
+    assert result.status is HostPreflightStatus.INCONCLUSIVE
+    assert result.detail == "cgroup_membership_unverified"
+
+
+def test_cgroup_preflight_rejects_untrusted_membership_paths() -> None:
+    result = _check_cgroups(lambda _path: "0::/../../etc\n")
+
+    assert result.status is HostPreflightStatus.INCONCLUSIVE
+    assert result.detail == "cgroup_membership_unverified"
+
+
+def test_cgroup_preflight_access_errors_remain_inconclusive() -> None:
+    scope = "/sys/fs/cgroup/test.scope"
+    files = {
+        "/proc/self/cgroup": "0::/test.scope\n",
+        "/proc/self/mountinfo": _CGROUP2_MOUNTINFO,
+        f"{scope}/cgroup.controllers": "cpu memory pids\n",
+        f"{scope}/cgroup.subtree_control": "cpu memory pids\n",
+    }
+
+    def fail_access(*_args, **_kwargs):
+        raise OSError("permission metadata unavailable")
+
+    result = _check_cgroups(lambda path: files.get(path, ""), fail_access)
+
+    assert result.status is HostPreflightStatus.INCONCLUSIVE
+    assert result.detail == "cgroup_delegation_unverified"
 
 
 def test_android_termux_host_is_not_accepted_for_scanner_isolation() -> None:
