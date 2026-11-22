@@ -87,6 +87,8 @@ class Orchestrator:
         self.reflection_memory = reflection_memory or SQLiteReflectionMemory(store)
         self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
         self.learning_memory = learning_memory or SQLiteLearningMemory(store)
+        if isinstance(self.planner, Planner):
+            self.planner.set_learning_memory(self.learning_memory)
         self.learning_engine = learning_engine or LearningEngine(self.learning_memory)
         self.checkpoint_hook = checkpoint_hook
         self.observability = observability or ObservabilityMonitor(store)
