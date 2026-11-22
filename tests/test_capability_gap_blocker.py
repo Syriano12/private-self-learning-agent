@@ -6,11 +6,12 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from private_agent.auth import AuthManager
 from private_agent.api import AgentAPIService, create_app
 from private_agent.core.llm import LLMResponse
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import Planner
-from private_agent.storage import Store
+from private_agent.storage import Store, now
 from private_agent.tools.contracts import ToolResult
 from private_agent.tools.research import ToolRegistry
 
@@ -292,3 +293,113 @@ def test_repeated_unregistered_tool_requests_remain_a_single_truthful_capability
     assert result["capability_gap"]["unavailable_tool_count"] == 1
     assert result["capability_gap"]["execution_attempted"] is False
     store.close()
+
+
+def test_bug_bounty_recovery_state_parity_after_sqlite_reopen_for_owner(
+    tmp_path: Path, request: Any
+) -> None:
+    db_path = tmp_path / "bug-bounty-recovery-state.sqlite3"
+    store = Store(db_path)
+    request.addfinalizer(store.close)
+    auth = AuthManager(store)
+    owner = auth.initialize_owner("ashbm1995@gmail.com", "owner-password-for-tests-123")
+    operator = auth.create_user(
+        "recovery-state-operator@example.com",
+        "operator-password-for-tests-123",
+        "OPERATOR",
+        actor_user_id=owner.user_id,
+    )
+
+    registered_tool = CountingReadTool()
+    registry = ToolRegistry()
+    registry.register(registered_tool)
+    provider = StaticPlanProvider(_plan("Run bounded reconnaissance", "httpx_recon"))
+    orchestrator = Orchestrator(store, registry, planner=Planner(provider))
+    bug_bounty_context = {
+        "task_kind": "bug_bounty",
+        "bugbounty_request": {
+            "scanner": "httpx",
+            "scope": {"program_id": "synthetic-local-fixture"},
+            "target": "https://example.invalid/health",
+            "identity": "synthetic",
+            "resource_id": "synthetic-resource",
+        },
+    }
+    blocked = orchestrator.run("Run bounded reconnaissance", task_context=bug_bounty_context)
+    blocked_task_id = blocked["task_id"]
+    persisted_nonempty = store.get_task_state(blocked_task_id)
+    assert persisted_nonempty is not None
+    assert persisted_nonempty["recovery_state"]
+
+    empty_task = store.create_queued_task(
+        "Synthetic Bug Bounty task with no recovery state",
+        initial_message="Synthetic Bug Bounty task with no recovery state",
+        context=bug_bounty_context,
+        owner_user_id=owner.user_id,
+    )
+    empty_task_id = str(empty_task["task_id"])
+    # Direct Orchestrator.run() bypasses API owner assignment; add the same owner record for this access-control fixture.
+    with store._db_lock, store.db:
+        store.db.execute(
+            "INSERT INTO task_owners (task_id, user_id, created_at) VALUES (?, ?, ?)",
+            (blocked_task_id, owner.user_id, now()),
+        )
+    store.close()
+
+    reopened = Store(db_path)
+    request.addfinalizer(reopened.close)
+    reopened_nonempty = reopened.get_task_state(blocked_task_id)
+    reopened_empty = reopened.get_task_state(empty_task_id)
+    assert reopened_nonempty is not None
+    assert reopened_nonempty["recovery_state"] == persisted_nonempty["recovery_state"]
+    assert reopened_empty is not None
+    assert reopened_empty["recovery_state"] == {}
+
+    service = AgentAPIService(
+        Orchestrator(reopened, registry, planner=Planner(provider)),
+        token=None,
+    )
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        owner_login = client.post(
+            "/api/v1/auth/login",
+            json={"email": "ashbm1995@gmail.com", "password": "owner-password-for-tests-123"},
+        )
+        assert owner_login.status_code == 200, owner_login.text
+        assert owner_login.json()["user"]["user_id"] == owner.user_id
+        assert owner_login.json()["user"]["role"] == "OWNER"
+
+        for task_id, persisted in (
+            (blocked_task_id, reopened_nonempty),
+            (empty_task_id, reopened_empty),
+        ):
+            general = client.get(f"/api/v1/tasks/{task_id}")
+            specialized = client.get(f"/api/v1/bug-bounty/tasks/{task_id}")
+            assert general.status_code == 200, general.text
+            assert specialized.status_code == 200, specialized.text
+            general_recovery_state = general.json()["recovery_state"]
+            specialized_recovery_state = specialized.json()["recovery_state"]
+            assert general_recovery_state == specialized_recovery_state
+            if persisted["recovery_state"]:
+                assert set(general_recovery_state) == set(persisted["recovery_state"])
+                assert general_recovery_state["reason"] == persisted["recovery_state"]["reason"]
+                stored_gap = persisted["recovery_state"]["capability_gap"]
+                response_gap = general_recovery_state["capability_gap"]
+                assert {
+                    key: value for key, value in response_gap.items() if key != "candidate_lifecycle"
+                } == stored_gap
+                assert response_gap["candidate_lifecycle"]["candidates"][0]["target_tool"] == "httpx_recon"
+            else:
+                assert general_recovery_state == {}
+                assert specialized_recovery_state == {}
+
+        client.cookies.clear()
+        operator_login = client.post(
+            "/api/v1/auth/login",
+            json={"email": "recovery-state-operator@example.com", "password": "operator-password-for-tests-123"},
+        )
+        assert operator_login.status_code == 200, operator_login.text
+        assert operator_login.json()["user"]["user_id"] == operator.user_id
+        for task_id in (blocked_task_id, empty_task_id):
+            assert client.get(f"/api/v1/tasks/{task_id}").status_code == 404
+            assert client.get(f"/api/v1/bug-bounty/tasks/{task_id}").status_code == 404
+    reopened.close()
