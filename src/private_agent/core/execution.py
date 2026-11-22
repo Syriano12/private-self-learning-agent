@@ -22,6 +22,7 @@ class ExecutionContext:
     security_controller: Any | None = None
     approval_ids: dict[str, str] = field(default_factory=dict)
     observability: Any | None = None
+    verified_result_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -260,12 +261,23 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
+        resolved_input, binding_error = self._resolve_input_bindings(step, tool, execution_context)
+        if binding_error is not None:
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                binding_error[0],
+                "A declared input binding could not be resolved from a verified dependency",
+                details=binding_error[1],
+                metadata=self._timed(base_metadata, started),
+            ))
+
         security_action = None
         security_action = trusted_controller.action_for_tool(
             execution_context.task_id,
             step.id,
             tool,
-            step.input,
+            resolved_input,
             goal=str(execution_context.metadata.get("goal", "")),
         )
         security_decision = trusted_controller.authorize(
@@ -306,7 +318,7 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
-        input_errors = validate_schema_value(step.input, tool.input_schema(), path="input")
+        input_errors = validate_schema_value(resolved_input, tool.input_schema(), path="input")
         if input_errors:
             return finish(StepResult.failed(
                 step.id,
@@ -332,13 +344,13 @@ class GenericExecutor:
         def operation() -> Any:
             if callable(trusted_execute):
                 return trusted_execute(
-                    step.input,
+                    resolved_input,
                     execution_context,
                     operation_binding=operation_binding,
                     authorization=security_decision,
                     operation=operation,
                 )
-            return tool.execute(step.input, execution_context)
+            return tool.execute(resolved_input, execution_context)
 
         operation_binding = trusted_controller._bind_operation(
             security_action,
@@ -413,6 +425,75 @@ class GenericExecutor:
             or ToolError("tool_failed", "Tool returned a failure without a structured error"),
             metadata={**tool_result.metadata, **self._timed(base_metadata, started)},
         ))
+
+    def _resolve_input_bindings(
+        self,
+        step: PlanStep,
+        tool: Any,
+        context: ExecutionContext,
+    ) -> tuple[dict[str, Any], tuple[str, dict[str, Any]] | None]:
+        if not isinstance(step.input, dict):
+            return {}, ("input_binding_input_invalid", {"step_id": step.id})
+        resolved = dict(step.input)
+        bindings = step.input_bindings
+        if not isinstance(bindings, dict):
+            return resolved, ("input_bindings_invalid", {"step_id": step.id})
+        if not bindings:
+            return resolved, None
+        target_input_schema = tool.input_schema()
+        if not isinstance(target_input_schema, dict):
+            return resolved, ("input_binding_target_schema_invalid", {"step_id": step.id})
+        target_properties = target_input_schema.get("properties", {})
+        if not isinstance(target_properties, dict):
+            return resolved, ("input_binding_target_schema_invalid", {"step_id": step.id})
+        for target, binding in bindings.items():
+            if (
+                not isinstance(target, str)
+                or target in resolved
+                or not isinstance(binding, dict)
+                or set(binding) != {"source_step_id", "output_key"}
+            ):
+                return resolved, ("input_binding_invalid", {"step_id": step.id, "target": str(target)})
+            source_id = binding.get("source_step_id")
+            output_key = binding.get("output_key")
+            if not isinstance(source_id, str) or source_id not in step.depends_on:
+                return resolved, ("input_binding_source_not_dependency", {"step_id": step.id, "source_step_id": source_id})
+            if source_id not in context.verified_result_ids:
+                return resolved, ("input_binding_source_unverified", {"step_id": step.id, "source_step_id": source_id})
+            source_result = context.previous_results.get(source_id)
+            if (
+                not isinstance(source_result, StepResult)
+                or source_result.step_id != source_id
+                or source_result.status != "success"
+                or source_result.error is not None
+                or not isinstance(source_result.output, dict)
+            ):
+                return resolved, ("input_binding_source_untrusted", {"step_id": step.id, "source_step_id": source_id})
+            try:
+                source_tool = self.tools.get(source_result.tool_name)
+                source_schema = source_tool.output_schema()
+            except (KeyError, AttributeError, TypeError):
+                return resolved, ("input_binding_source_tool_unavailable", {"step_id": step.id, "source_step_id": source_id})
+            source_properties = source_schema.get("properties", {}) if isinstance(source_schema, dict) else {}
+            source_required = source_schema.get("required", []) if isinstance(source_schema, dict) else []
+            if not isinstance(output_key, str) or not output_key or not isinstance(source_properties, dict) or not isinstance(source_required, list):
+                return resolved, ("input_binding_output_unavailable", {"step_id": step.id, "source_step_id": source_id})
+            target_schema = target_properties.get(target)
+            source_field_schema = source_properties.get(output_key)
+            if (
+                output_key not in source_result.output
+                or output_key not in source_required
+                or not isinstance(source_field_schema, dict)
+                or not isinstance(target_schema, dict)
+            ):
+                return resolved, ("input_binding_output_unavailable", {"step_id": step.id, "source_step_id": source_id, "output_key": output_key})
+            if validate_schema_value(source_result.output, source_schema, path=f"output.{source_id}"):
+                return resolved, ("input_binding_source_output_invalid", {"step_id": step.id, "source_step_id": source_id})
+            value = source_result.output[output_key]
+            if validate_schema_value(value, target_schema, path=f"input.{target}"):
+                return resolved, ("input_binding_value_invalid", {"step_id": step.id, "source_step_id": source_id, "target": target})
+            resolved[target] = value
+        return resolved, None
 
     @staticmethod
     def _check_dependencies(

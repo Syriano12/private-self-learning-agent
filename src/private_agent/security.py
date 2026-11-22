@@ -2585,6 +2585,12 @@ class SecurityController:
         decisions: list[PolicyDecision] = []
         approval_ids = approval_ids or {}
         for step in plan.steps:
+            if getattr(step, "input_bindings", None):
+                # The exact action fingerprint is not known until every source
+                # dependency is VERIFIED. Orchestrator performs preflight with
+                # the resolved input immediately before execution; never issue
+                # an approval for this incomplete, raw plan input.
+                continue
             tool = tools.get(step.tool)
             action = self.action_for_tool(task_id, step.id, tool, step.input, goal=str(plan.goal))
             approval_id = approval_ids.get(step.id) or approval_ids.get(step.tool, "")
