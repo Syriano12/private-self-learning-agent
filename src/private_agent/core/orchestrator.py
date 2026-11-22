@@ -203,7 +203,9 @@ class Orchestrator:
         # Authorization is pending, but no execution has started. Preserve the
         # durable action as NOT_STARTED so resume validation cannot mistake a
         # policy stop for a malformed execution record.
-        state.action_record(key)["approval_id"] = decision.approval_id
+        record = state.action_record(key)
+        record["step_id"] = step.id
+        record["approval_id"] = decision.approval_id
         state.touch()
         checkpoint = "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED"
         state.checkpoint(

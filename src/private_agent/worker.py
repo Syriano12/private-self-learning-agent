@@ -773,6 +773,13 @@ class BackgroundWorker:
             except ValueError as exc:
                 if str(exc) in {"approval_not_approved", "task_not_waiting_approval"}:
                     continue
+                if str(exc) in {"approval_policy_stale", "approval_policy_unavailable"}:
+                    self._emit_event(
+                        "worker_approval_requeue_deferred",
+                        task_id=task_id,
+                        error_code=str(exc),
+                    )
+                    continue
                 raise
 
     def _process_claim(

@@ -2271,6 +2271,10 @@ class AgentAPIService:
                         code = str(exc)
                         if code == "approval_not_approved":
                             raise APIError(409, "approval_not_approved", "Task approvals are not all approved", task_id=task_id) from exc
+                        if code == "approval_policy_stale":
+                            raise APIError(409, "approval_stale", "A task approval is no longer valid under the current security policy", task_id=task_id) from exc
+                        if code == "approval_policy_unavailable":
+                            raise APIError(503, "approval_policy_unavailable", "The current security policy could not be checked", task_id=task_id) from exc
                         raise APIError(409, "task_not_requeueable", "Task is not safely requeueable", task_id=task_id) from exc
                     return self.task_state_response(self._state(task_id), request_id=request_id)
                 raise APIError(
@@ -2322,6 +2326,23 @@ class AgentAPIService:
                 actor = "api-owner" if principal is None or principal.is_legacy else principal.user_id
                 approved = self.security.approval_gate.approve(request.approval_id, actor=actor)  # type: ignore[union-attr]
             except ValueError as exc:
+                error_code = str(exc).split(":", 1)[0]
+                if error_code == "approval_policy_stale":
+                    raise APIError(
+                        409,
+                        "approval_stale",
+                        "Approval was invalidated by a newer security policy",
+                        approval_id=request.approval_id,
+                        task_id=request.task_id,
+                    ) from exc
+                if error_code == "approval_policy_unavailable":
+                    raise APIError(
+                        503,
+                        "approval_policy_unavailable",
+                        "The current security policy could not be checked",
+                        approval_id=request.approval_id,
+                        task_id=request.task_id,
+                    ) from exc
                 raise APIError(409, "approval_not_pending", "Approval is no longer pending", approval_id=request.approval_id, task_id=request.task_id) from exc
             if self.auto_requeue_approvals:
                 try:
@@ -2332,6 +2353,23 @@ class AgentAPIService:
                     # bound to the current execution checks.
                     pass
                 except ValueError as exc:
+                    error_code = str(exc).split(":", 1)[0]
+                    if error_code == "approval_policy_stale":
+                        raise APIError(
+                            409,
+                            "approval_stale",
+                            "Approval was recorded but became stale before the task could be requeued",
+                            approval_id=approved.approval_id,
+                            task_id=approved.task_id,
+                        ) from exc
+                    if error_code == "approval_policy_unavailable":
+                        raise APIError(
+                            503,
+                            "approval_policy_unavailable",
+                            "Approval was recorded but the current policy could not be checked for requeue",
+                            approval_id=approved.approval_id,
+                            task_id=approved.task_id,
+                        ) from exc
                     if str(exc) not in {"approval_not_approved", "task_not_waiting_approval"}:
                         raise APIError(
                             409,
