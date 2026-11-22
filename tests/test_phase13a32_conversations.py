@@ -367,6 +367,59 @@ def test_followup_is_consumed_after_verified_action_then_replanned_and_reauthori
     store.close()
 
 
+def test_unchanged_followup_plan_preserves_verified_outcome(tmp_path: Path) -> None:
+    class UnchangedPlanner:
+        provider = None
+        max_steps = 12
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def create(self, goal, tools, prior_knowledge, **kwargs):
+            del tools, prior_knowledge, kwargs
+            self.calls.append(goal)
+            step = PlanStep(
+                id="first-step",
+                objective="perform the already verified safe step",
+                tool="safe",
+                input={"value": "first"},
+                reason="initial safe action",
+                depends_on=[],
+                success_criteria={"required_fields": ["result"]},
+            )
+            return TaskPlan(goal, [step], "same plan after follow-up")
+
+    safe = APITestTool("safe")
+    service, store, _ = make_service(tmp_path, safe)
+    planner = UnchangedPlanner()
+    service.orchestrator.planner = planner
+    created = store.create_queued_task("complete the first safe action", initial_message="complete the first safe action")
+
+    original_execute = safe.execute
+
+    def inject_followup(inputs, context):
+        if safe.calls == 0:
+            queued = service.append_task_message(created["task_id"], "The verified first step is sufficient; add no action")
+            assert queued.status == "PENDING"
+        return original_execute(inputs, context)
+
+    safe.execute = inject_followup
+    completed = BackgroundWorker(service.orchestrator, worker_id="worker-unchanged-followup").run_once()
+
+    assert completed["status"] == "COMPLETED", completed
+    assert safe.calls == 1
+    assert len(planner.calls) == 2
+    assert "The verified first step is sufficient; add no action" in planner.calls[1]
+    result = completed["result"]
+    assert result["verification"]["verified"] is True
+    assert [item["verification_status"] for item in result["final_step_outcomes"]] == ["VERIFIED"]
+    persisted = TaskState.from_dict(store.get_task_state(created["task_id"]))
+    assert persisted.plan_version == 2
+    assert persisted.status == "COMPLETED"
+    assert store.task_messages(created["task_id"])[-1]["status"] == "CONSUMED"
+    store.close()
+
+
 def test_low_risk_followup_dependency_uses_verified_result_without_resume(tmp_path: Path) -> None:
     safe = APITestTool("safe")
     followup = APITestTool("followup")

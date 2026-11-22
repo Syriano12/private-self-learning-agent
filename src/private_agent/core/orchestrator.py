@@ -620,6 +620,10 @@ class Orchestrator:
                 if state.action_key_for_step(step) not in set(state.completed_actions)
             ]
             if not pending_steps:
+                # A follow-up replan can retain only verified steps. Restore
+                # their outcomes before final verification instead of losing
+                # them when the next round resets latest_outcomes.
+                latest_outcomes = self._verified_outcomes_for_plan(state, current_plan)
                 terminal_status = "COMPLETED"
                 break
             execution_context = ExecutionContext(
