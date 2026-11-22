@@ -19,6 +19,20 @@ class PlanValidationError(ValueError):
         super().__init__("Invalid plan: " + "; ".join(errors))
 
 
+class CapabilityUnavailableError(PlanValidationError):
+    """A requested planner tool is absent from the live registry."""
+
+    def __init__(self, unavailable_tools: list[str], *, reason: str = "unregistered_tool") -> None:
+        self.unavailable_tools = tuple(dict.fromkeys(unavailable_tools))
+        self.reason = reason
+        errors = (
+            [f"unknown_tool:{name}" for name in self.unavailable_tools]
+            if self.unavailable_tools
+            else ["no_tools_registered"]
+        )
+        super().__init__(errors)
+
+
 @dataclass
 class PlanStep:
     id: str
@@ -298,6 +312,7 @@ class Planner:
         permissions: dict[str, str] | None = None,
     ) -> TaskPlan:
         errors: list[str] = []
+        unavailable_tools: list[str] = []
         if not isinstance(payload, dict):
             raise PlanValidationError(["plan_must_be_object"])
         allowed_plan_keys = {"goal", "rationale", "steps"}
@@ -381,6 +396,7 @@ class Planner:
                     tool = tools.get(tool_name)
                 except KeyError:
                     tool = None
+                    unavailable_tools.append(tool_name)
                     errors.append(f"unknown_tool:{tool_name}")
                 if tool is not None:
                     tool_schema = getattr(tool, "input_schema", lambda: {})()
@@ -414,6 +430,8 @@ class Planner:
             errors.append("circular_dependency")
 
         if errors:
+            if unavailable_tools and all(error.startswith("unknown_tool:") for error in errors):
+                raise CapabilityUnavailableError(unavailable_tools)
             raise PlanValidationError(errors)
         return TaskPlan(goal=goal, steps=steps, rationale=rationale)
 
@@ -473,7 +491,7 @@ class Planner:
     ) -> TaskPlan:
         available = tools.available()
         if not available:
-            raise PlanValidationError(["no_tools_registered", "llm_provider_unavailable"])
+            raise CapabilityUnavailableError([], reason="no_registered_tools")
         # Trusted registered tools may propose a relevant input without I/O.
         # This is still only a proposal: create() applies the normal validator,
         # and Orchestrator/GenericExecutor apply the unchanged authorization.

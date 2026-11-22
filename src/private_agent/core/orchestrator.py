@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import inspect
+import re
 from time import monotonic
 from typing import Any
 
@@ -11,7 +12,7 @@ from private_agent.core.experience import ExperienceAction, ExperienceRecord
 from private_agent.core.learning import LearningEngine, LearningMemory, SQLiteLearningMemory
 from private_agent.core.memory import ExperienceMemory, ExperienceQuery, SQLiteExperienceMemory
 from private_agent.core.observation import Observation, StepOutcome
-from private_agent.core.planner import PlanStep, Planner, TaskPlan
+from private_agent.core.planner import CapabilityUnavailableError, PlanStep, Planner, PlanValidationError, TaskPlan
 from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
@@ -31,6 +32,9 @@ from private_agent.tools.research import ToolRegistry
 
 class TaskInterrupted(RuntimeError):
     """Internal deterministic interruption seam used to prove checkpoint resume behavior."""
+
+
+_SAFE_TOOL_REFERENCE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 class Orchestrator:
@@ -195,6 +199,10 @@ class Orchestrator:
                     required_fields = ["scan"]
                 else:
                     raise ValueError("scanner_type_unsupported")
+                try:
+                    self.tools.get(tool_name)
+                except KeyError as exc:
+                    raise CapabilityUnavailableError([tool_name]) from exc
                 initial_plan = TaskPlan(
                     goal=goal,
                     steps=[PlanStep(
@@ -210,6 +218,22 @@ class Orchestrator:
                 )
             else:
                 initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
+        except CapabilityUnavailableError as exc:
+            registered_names = [str(metadata["name"]) for metadata in self.tools.available()]
+            registered_set = set(registered_names)
+            if exc.reason == "no_registered_tools":
+                if registered_names:
+                    raise PlanValidationError(["capability_registry_changed_during_planning"]) from exc
+                unavailable_names: list[str] = []
+            else:
+                unavailable_names = [name for name in exc.unavailable_tools if name not in registered_set]
+                if not unavailable_names:
+                    raise PlanValidationError(["capability_registry_changed_during_planning"]) from exc
+            return self._capability_gap_result(
+                state,
+                unavailable_tool_names=unavailable_names,
+                registered_tool_names=registered_names,
+            )
         except Exception as exc:
             self._emit_observability(
                 "PLAN_REJECTED",
@@ -643,6 +667,88 @@ class Orchestrator:
         ]
         self.store.save_episode(str(uuid.uuid4()), task_id, goal, storage_status, lessons, result["experience"]["actions"])
         self._persist_knowledge(result["sources"], goal, verification_payload)
+        return result
+
+    def _capability_gap_result(
+        self,
+        state: TaskState,
+        *,
+        unavailable_tool_names: list[str],
+        registered_tool_names: list[str],
+    ) -> dict[str, Any]:
+        requested_tools = sorted({
+            name for name in unavailable_tool_names
+            if isinstance(name, str) and _SAFE_TOOL_REFERENCE.fullmatch(name)
+        })[:20]
+        registered_tools = sorted({
+            name for name in registered_tool_names
+            if isinstance(name, str) and _SAFE_TOOL_REFERENCE.fullmatch(name)
+        })[:50]
+        code = "UNREGISTERED_TOOL_REQUEST" if unavailable_tool_names else "NO_REGISTERED_TOOLS"
+        summary = (
+            "The planner requested a tool that is not registered; no tool was executed or installed."
+            if unavailable_tool_names
+            else "No tools are registered for planning; no tool was executed or installed."
+        )
+        gap = {
+            "code": code,
+            "source": "planner_registry_validation",
+            "summary": summary,
+            "requested_tools": requested_tools,
+            "unavailable_tool_count": len(unavailable_tool_names),
+            "registered_tools": registered_tools,
+            "execution_attempted": False,
+            "acquisition_attempted": False,
+            "permissions_granted": False,
+        }
+        state.recovery_state = {"reason": "capability_unavailable", "capability_gap": gap}
+        result = {
+            "task_id": state.task_id,
+            "goal": state.goal,
+            "sources": [],
+            "errors": ["capability_unavailable"],
+            "attempts": 0,
+            "step_results": [],
+            "observations": [],
+            "step_outcomes": [],
+            "final_step_outcomes": [],
+            "verification": self._task_verification([]),
+            "diagnoses": [],
+            "recovery_attempts": [],
+            "security_decisions": [],
+            "capability_gap": gap,
+            "final_status": "BLOCKED",
+        }
+        state.result = result
+        state.context["attempts"] = 0
+        state.checkpoint(
+            "CAPABILITY_GAP_DETECTED",
+            status="BLOCKED",
+            phase="CAPABILITY_GAP",
+            successful=False,
+        )
+        self._save_checkpoint(state, "CAPABILITY_GAP_DETECTED")
+        self.store.save_event(state.task_id, "capability_gap_detected", gap)
+        self._emit_observability(
+            "TASK_BLOCKED",
+            task_id=state.task_id,
+            severity="ERROR",
+            metadata={
+                "reason": "capability_unavailable",
+                "gap_code": code,
+                "unavailable_tool_count": len(unavailable_tool_names),
+                "execution_attempted": False,
+                "acquisition_attempted": False,
+            },
+        )
+        self.store.save_task(
+            state.task_id,
+            state.goal,
+            "blocked",
+            {"goal": state.goal, "rationale": "Planning stopped at the registered-tool boundary", "steps": []},
+            result,
+            0,
+        )
         return result
 
     def _security_blocked_result(
