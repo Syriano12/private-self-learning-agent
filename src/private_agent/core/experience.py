@@ -62,6 +62,9 @@ class ExperienceRecord:
     identity: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    verification_status: str = ""
+    verification_scope: str = ""
+    security_impact_verified: bool | None = None
 
     def add_action(self, action: ExperienceAction) -> None:
         self.actions.append(action)
@@ -89,7 +92,9 @@ class ExperienceRecord:
             "failure_types": failure_types,
             "recovery_strategies": recovery_strategies,
             "outcome": self.final_outcome,
-            "verification_status": "VERIFIED" if self.final_outcome == "COMPLETED" else self.final_outcome,
+            "verification_status": self.verification_status or (self.final_outcome if self.final_outcome and self.final_outcome != "COMPLETED" else "UNVERIFIED"),
+            "verification_scope": self.verification_scope or ("EXECUTION_ONLY" if self.final_outcome == "COMPLETED" else "UNKNOWN"),
+            "security_impact_verified": self.security_impact_verified,
         }
         return self.identity
 

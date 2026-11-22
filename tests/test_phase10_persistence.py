@@ -576,3 +576,22 @@ def test_invalid_transition_and_missing_verification_fail_closed() -> None:
     state.touch()
     with pytest.raises(StateIntegrityError, match="completed_without_persisted_verification"):
         state.validate()
+    state.result = {
+        "final_status": "COMPLETED",
+        "verification": {
+            "status": "INSUFFICIENT",
+            "verified": False,
+            "verification_scope": "STATIC_ONLY",
+            "security_impact_verified": False,
+            "details": {
+                "code": "security_impact_not_verified",
+                "verification_scope": "STATIC_ONLY",
+                "security_impact_verified": False,
+                "step_count": 1,
+                "step_statuses": ["VERIFIED"],
+            },
+        },
+    }
+    state.touch()
+    with pytest.raises(StateIntegrityError, match="completed_without_persisted_verification"):
+        state.validate()

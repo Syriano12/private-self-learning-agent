@@ -732,8 +732,12 @@ def _decode_task_cursor(cursor: str) -> tuple[str, str]:
 def _verification_status(state: TaskState) -> str:
     verification_status = "NOT_STARTED"
     statuses = [str(item.get("status", "")) for item in state.verification_results.values() if isinstance(item, dict)]
-    if any(item in {"FAILED", "BLOCKED", "INSUFFICIENT"} for item in statuses):
+    if "BLOCKED" in statuses:
+        verification_status = "BLOCKED"
+    elif "FAILED" in statuses:
         verification_status = "FAILED"
+    elif "INSUFFICIENT" in statuses:
+        verification_status = "INSUFFICIENT"
     elif statuses and all(item == "VERIFIED" for item in statuses):
         verification_status = "VERIFIED"
     elif statuses:
