@@ -308,6 +308,17 @@ class KnowledgeAttestor:
         self.key_id = sha256_hex(self._key)[:16]
         self._issuer_authorizer = issuer_authorizer
 
+    def with_issuer_authorizer(
+        self,
+        issuer_authorizer: Callable[
+            [KnowledgeSource, KnowledgeClaim, list[KnowledgeEvidence]], str | None
+        ],
+    ) -> KnowledgeAttestor:
+        """Return a signer bound to a server-provided authorization decision."""
+        if not callable(issuer_authorizer):
+            raise _error("knowledge_attestation_issuer_authorizer_invalid")
+        return KnowledgeAttestor(self._key, issuer_authorizer=issuer_authorizer)
+
     def issue(
         self,
         source: KnowledgeSource,
@@ -315,6 +326,7 @@ class KnowledgeAttestor:
         evidence: list[KnowledgeEvidence],
         *,
         verified_at: str | None = None,
+        attestation_id: str | None = None,
     ) -> KnowledgeAttestation:
         if self._issuer_authorizer is None:
             raise _error("attestation_issuer_unauthorized")
@@ -355,7 +367,7 @@ class KnowledgeAttestor:
             raise _error("attestation_issuer_unauthorized") from exc
         checked_at = _timestamp(verified_at or _now(), "attestation_verified_at")
         unsigned = KnowledgeAttestation(
-            attestation_id=str(uuid.uuid4()),
+            attestation_id=(attestation_id if attestation_id is not None else str(uuid.uuid4())),
             source_snapshot=source.to_dict(),
             claim_snapshot=claim.to_dict(),
             evidence_snapshots=[item.to_dict() for item in evidence],

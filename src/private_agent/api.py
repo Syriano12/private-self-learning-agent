@@ -25,6 +25,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from private_agent.core.llm import build_provider
+from private_agent.core.knowledge import (
+    KnowledgeClaim,
+    KnowledgeEvidence,
+    KnowledgeSource,
+    KnowledgeValidationError,
+    sha256_hex,
+)
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH, TASK_STATUSES, StateIntegrityError, TaskState
 from private_agent.auth import (
@@ -295,6 +302,14 @@ class FindingReviewResponse(APIModel):
     evidence_validated: bool = False
     actor_user_id: str = ""
     created_at: str
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
+
+
+class FindingKnowledgeAttestationResponse(APIModel):
+    review_id: str
+    attestation: dict[str, Any]
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
@@ -1076,6 +1091,202 @@ class AgentAPIService:
                 "learning": {"non_authoritative": True},
             }, requires_lease=False)
         return FindingReviewResponse(**review.to_dict(), request_id=request_id)
+
+    def issue_finding_knowledge_attestation(
+        self,
+        task_id: str,
+        review_id: str,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str = "",
+    ) -> FindingKnowledgeAttestationResponse:
+        task_id = _safe_id(task_id, "task_id")
+        review_id = _safe_id(review_id, "review_id")
+        if (
+            principal is None
+            or principal.role != ROLE_OWNER
+            or principal.is_legacy
+            or principal.auth_type != "session"
+            or not principal.user_id
+            or not principal.session_id
+        ):
+            raise APIError(
+                403,
+                "authenticated_reviewer_session_required",
+                "A verified owner session is required to issue knowledge attestations",
+                task_id=task_id,
+            )
+        active_reviewer = next(
+            (user for user in self.auth_manager.list_users() if user.user_id == principal.user_id),
+            None,
+        )
+        if active_reviewer is None or active_reviewer.role != ROLE_OWNER or active_reviewer.status != ACTIVE:
+            raise APIError(403, "owner_review_required", "Only the active owner may issue knowledge attestations", task_id=task_id)
+
+        review_repository = FindingReviewRepository(self.store)
+        review = review_repository.get_by_id(review_id)
+        if review is None or review.task_id != task_id:
+            raise APIError(404, "finding_review_not_found", "Finding review was not found", task_id=task_id)
+        if review.owner_user_id != principal.user_id or review.actor_user_id != principal.user_id:
+            raise APIError(403, "reviewer_identity_mismatch", "The authenticated owner did not create this review", task_id=task_id)
+        if review.decision != FindingReviewDecision.CONFIRM.value or not review.evidence_validated:
+            raise APIError(409, "review_not_confirmed", "Only a confirmed review with validated evidence can be attested", task_id=task_id)
+
+        _state, _raw, finding = self._finding_for_review(task_id, review.finding_id, principal)
+        evidence_digest = finding._evidence_digest()
+        evidence_errors = validate_confirmed_evidence(finding, target_state=finding.state)
+        if (
+            finding.state not in {FindingState.REPORT_READY, FindingState.HUMAN_REVIEWED}
+            or evidence_errors
+            or finding.validation_status != "VALIDATED"
+            or not evidence_digest
+            or finding.validated_evidence_sha256 != evidence_digest
+            or review.evidence_sha256 != evidence_digest
+        ):
+            raise APIError(409, "review_evidence_stale", "The reviewed evidence no longer matches the validated finding", task_id=task_id)
+
+        source_id = f"source-review-{review.review_id}"
+        claim_id = f"claim-review-{review.review_id}"
+        evidence_id = f"evidence-review-{review.review_id}"
+        evidence_binding = {
+            "review_id": review.review_id,
+            "decision": review.decision,
+            "evidence_sha256": evidence_digest,
+        }
+        evidence_excerpt = json.dumps(
+            evidence_binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        source_document = {
+            "review": {
+                "review_id": review.review_id,
+                "task_id": review.task_id,
+                "finding_id": review.finding_id,
+                "owner_user_id": review.owner_user_id,
+                "actor_user_id": review.actor_user_id,
+                "decision": review.decision,
+                "evidence_validated": review.evidence_validated,
+                "evidence_sha256": evidence_digest,
+                "created_at": review.created_at,
+            },
+            "finding": {
+                "vulnerability_class": finding.vulnerability_class,
+                "state": finding.state.value,
+                "validation_status": finding.validation_status,
+                "evidence_count": len(finding.evidence),
+            },
+            "evidence_binding": evidence_binding,
+        }
+        source_content = json.dumps(
+            source_document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        source = KnowledgeSource(
+            source_id=source_id,
+            canonical_uri=f"local://bug-bounty/reviews/{review.review_id}",
+            source_type="local",
+            source_class="local_verified",
+            retrieved_at=review.created_at,
+            content_sha256=sha256_hex(source_content),
+            revision=review.evidence_sha256,
+            metadata={
+                "review_id": review.review_id,
+                "task_id": review.task_id,
+                "finding_id": review.finding_id,
+                "evidence_sha256": evidence_digest,
+            },
+            created_at=review.created_at,
+            content=source_content,
+        )
+        claim = KnowledgeClaim(
+            claim_id=claim_id,
+            domain="cybersecurity.bugbounty",
+            subject=f"finding:{finding.finding_id}",
+            predicate="owner_confirmed_after_evidence_gate",
+            object_text=(
+                f"Owner-confirmed {finding.vulnerability_class} finding "
+                f"{finding.finding_id} with validated evidence digest {evidence_digest}"
+            ),
+            knowledge_type="reviewed_security_finding",
+            verification_status="verified",
+            status="SUPPORTED",
+            confidence=finding.confidence,
+            observed_at=review.created_at,
+            last_verified_at=review.created_at,
+            version=1,
+            metadata={
+                "review_id": review.review_id,
+                "finding_id": review.finding_id,
+                "evidence_sha256": evidence_digest,
+            },
+            created_at=review.created_at,
+            updated_at=review.created_at,
+        )
+        evidence = [
+            KnowledgeEvidence(
+                evidence_id=evidence_id,
+                claim_id=claim_id,
+                source_id=source_id,
+                # Owner reviews are issued after the worker lease ends. Keep
+                # task_id bound in the signed source/metadata, but do not claim
+                # this control-plane write was made under the worker lease.
+                locator="persisted owner review and Evidence Gate digest",
+                excerpt=evidence_excerpt,
+                verification_status="verified",
+                observed_at=review.created_at,
+                metadata={
+                    "task_id": task_id,
+                    "review_id": review.review_id,
+                    "evidence_sha256": evidence_digest,
+                },
+                created_at=review.created_at,
+            )
+        ]
+
+        def authorize_issuer(
+            candidate_source: KnowledgeSource,
+            candidate_claim: KnowledgeClaim,
+            candidate_evidence: list[KnowledgeEvidence],
+        ) -> str | None:
+            current_review = review_repository.get_by_id(review_id)
+            if (
+                current_review != review
+                or current_review is None
+                or current_review.task_id != task_id
+                or current_review.decision != FindingReviewDecision.CONFIRM.value
+                or not current_review.evidence_validated
+                or current_review.owner_user_id != principal.user_id
+                or current_review.actor_user_id != principal.user_id
+                or current_review.evidence_sha256 != evidence_digest
+                or candidate_source.to_dict() != source.to_dict()
+                or candidate_source.content != source_content
+                or candidate_claim.to_dict() != claim.to_dict()
+                or candidate_evidence != evidence
+            ):
+                return None
+            return principal.user_id
+
+        try:
+            saved = self.store.issue_attested_knowledge_bundle(
+                source,
+                claim,
+                evidence,
+                issuer_authorizer=authorize_issuer,
+                verified_at=review.created_at,
+                attestation_id=f"attestation-{review.review_id}",
+            )
+        except KnowledgeValidationError as exc:
+            error_code = str(exc)
+            status_code = 503 if error_code == "knowledge_attestation_key_missing" else 409
+            raise APIError(
+                status_code,
+                error_code,
+                "Knowledge attestation could not be issued",
+                task_id=task_id,
+            ) from exc
+        return FindingKnowledgeAttestationResponse(
+            review_id=review.review_id,
+            attestation=saved["attestation"],
+            request_id=request_id,
+        )
 
     def list_finding_reviews(
         self, task_id: str, *, principal: AuthenticatedPrincipal | None = None, request_id: str = "",
@@ -2316,6 +2527,23 @@ def create_app(
     ) -> FindingReviewResponse:
         request.state.task_id = task_id
         return service.review_bug_bounty_finding(task_id, finding_id, payload, principal=principal, request_id=_request_id(request))
+
+    @router.post(
+        "/bug-bounty/tasks/{task_id}/reviews/{review_id}/knowledge-attestation",
+        response_model=FindingKnowledgeAttestationResponse,
+        dependencies=[Depends(_require_roles(ROLE_OWNER)), Depends(_csrf_protect)],
+    )
+    def issue_finding_knowledge_attestation(
+        request: Request,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        review_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> FindingKnowledgeAttestationResponse:
+        request.state.task_id = task_id
+        return service.issue_finding_knowledge_attestation(
+            task_id, review_id, principal=principal, request_id=_request_id(request)
+        )
 
     @router.get("/bug-bounty/tasks/{task_id}/reviews", response_model=list[FindingReviewResponse])
     def list_finding_reviews(
