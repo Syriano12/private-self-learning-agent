@@ -464,6 +464,7 @@ class TaskState:
             raise StateIntegrityError("plan_must_be_object")
         if _contains_redacted(self.plan):
             raise StateIntegrityError("redacted_execution_input_requires_resolution")
+        valid_actions: set[str] = set()
         if self.plan:
             if self.plan_version < 1 or not self.plan_fingerprint:
                 raise StateIntegrityError("plan_version_and_fingerprint_required")
@@ -481,7 +482,27 @@ class TaskState:
         if self.status == "COMPLETED":
             verification = self.result.get("verification", {})
             if verification.get("verified") is not True:
-                raise StateIntegrityError("completed_without_persisted_verification")
+                details = verification.get("details", {}) if isinstance(verification, dict) else {}
+                step_statuses = details.get("step_statuses", []) if isinstance(details, dict) else []
+                limited_static_completion = (
+                    self.result.get("final_status") == "COMPLETED"
+                    and verification.get("status") == "INSUFFICIENT"
+                    and verification.get("verification_scope") == "STATIC_ONLY"
+                    and verification.get("security_impact_verified") is False
+                    and details.get("code") == "security_impact_not_verified"
+                    and details.get("verification_scope") == "STATIC_ONLY"
+                    and details.get("security_impact_verified") is False
+                    and isinstance(step_statuses, list)
+                    and len(step_statuses) == len(valid_actions)
+                    and details.get("step_count") == len(valid_actions)
+                    and all(item == "VERIFIED" for item in step_statuses)
+                    and bool(valid_actions)
+                    and len(self.completed_actions) == len(valid_actions)
+                    and set(self.completed_actions) == valid_actions
+                    and all(self.action_records.get(key, {}).get("status") == "VERIFIED" for key in valid_actions)
+                )
+                if not limited_static_completion:
+                    raise StateIntegrityError("completed_without_persisted_verification")
         expected = self.state_fingerprint
         if not expected:
             raise StateIntegrityError("state_fingerprint_required")

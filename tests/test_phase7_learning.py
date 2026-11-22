@@ -331,7 +331,7 @@ def test_reflection_conflict_detection_covers_successful_original_and_failed_alt
                     ["CHANGE_TOOL"],
                     [{"type": "proof"}],
                     ["goal"],
-                    {"task_type": "research"},
+                    {"task_type": "research", "verification_status": "VERIFIED", "security_impact_verified": None, "verified_action_tools": ["tool_b"], "verified_final_action_tool": "tool_b"},
                 ),
                 RetrievedExperience(
                     "conflict-1",
@@ -343,7 +343,7 @@ def test_reflection_conflict_detection_covers_successful_original_and_failed_alt
                     [],
                     [{"type": "proof"}],
                     ["goal"],
-                    {"task_type": "research"},
+                    {"task_type": "research", "verification_status": "VERIFIED", "security_impact_verified": None, "verified_action_tools": ["tool_a"], "verified_final_action_tool": "tool_a"},
                 ),
                 RetrievedExperience(
                     "conflict-2",

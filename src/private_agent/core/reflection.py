@@ -173,10 +173,23 @@ class ReflectionEngine:
         unique = {insight.insight_id: insight for insight in insights}
         return sorted(unique.values(), key=lambda item: (-item.confidence, item.pattern, item.insight_id))
 
+    @staticmethod
+    def _has_verified_completed_outcome(candidate: RetrievedExperience) -> bool:
+        identity = candidate.identity if isinstance(candidate.identity, dict) else {}
+        verified_final_action_tool = identity.get("verified_final_action_tool")
+        return (
+            candidate.outcome == "COMPLETED"
+            and identity.get("verification_status") == "VERIFIED"
+            and identity.get("security_impact_verified") is not False
+            and bool(candidate.strategy_used)
+            and isinstance(verified_final_action_tool, str)
+            and verified_final_action_tool == candidate.strategy_used[-1]
+        )
+
     def _recovery_patterns(self, candidates: list[RetrievedExperience], query: ExperienceQuery) -> list[ReflectionInsight]:
         groups: dict[tuple[Any, ...], list[RetrievedExperience]] = {}
         for candidate in candidates:
-            if candidate.outcome != "COMPLETED" or len(candidate.strategy_used) < 2:
+            if not self._has_verified_completed_outcome(candidate) or len(candidate.strategy_used) < 2:
                 continue
             failed_tool, alternative_tool = candidate.strategy_used[0], candidate.strategy_used[-1]
             if not failed_tool or not alternative_tool or failed_tool == alternative_tool:
@@ -203,7 +216,7 @@ class ReflectionEngine:
                             or alternative_tool in candidate.strategy_used
                         )
                     )
-                    or (candidate.outcome == "COMPLETED" and len(candidate.strategy_used) == 1)
+                    or (self._has_verified_completed_outcome(candidate) and len(candidate.strategy_used) == 1)
                 )
             ]
             ids = _ids(supporting)
@@ -239,7 +252,7 @@ class ReflectionEngine:
             conflicts = [
                 candidate
                 for candidate in candidates
-                if candidate.outcome == "COMPLETED"
+                if self._has_verified_completed_outcome(candidate)
                 and candidate.strategy_used
                 and candidate.strategy_used[0] == failed_tool
                 and set(failures).intersection(candidate.failure_diagnosis)

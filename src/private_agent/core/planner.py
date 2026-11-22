@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from private_agent.core.llm import LLMProvider
+from private_agent.tools.github_access import RepositoryAccessError, parse_repository
 from private_agent.tools.research import ToolRegistry
 
 
@@ -15,6 +17,20 @@ class PlanValidationError(ValueError):
     def __init__(self, errors: list[str]) -> None:
         self.errors = errors
         super().__init__("Invalid plan: " + "; ".join(errors))
+
+
+class CapabilityUnavailableError(PlanValidationError):
+    """A requested planner tool is absent from the live registry."""
+
+    def __init__(self, unavailable_tools: list[str], *, reason: str = "unregistered_tool") -> None:
+        self.unavailable_tools = tuple(dict.fromkeys(unavailable_tools))
+        self.reason = reason
+        errors = (
+            [f"unknown_tool:{name}" for name in self.unavailable_tools]
+            if self.unavailable_tools
+            else ["no_tools_registered"]
+        )
+        super().__init__(errors)
 
 
 @dataclass
@@ -128,6 +144,16 @@ class Planner:
                     tools=tools,
                     permissions=permissions,
                 )
+        learned_route = self._owner_reviewed_idor_route(
+            goal, tools, prior_knowledge, permissions
+        )
+        if learned_route is not None:
+            return self.validate(
+                learned_route,
+                goal=goal,
+                tools=tools,
+                permissions=permissions,
+            )
         if self.provider is None:
             fallback = self._unavailable_fallback(goal, tools, prior_knowledge, learned_strategies or [])
             return self.validate(
@@ -176,6 +202,107 @@ class Planner:
         )
         return self.validate(response.data, goal=goal, tools=tools, permissions=permissions)
 
+    def _owner_reviewed_idor_route(
+        self,
+        goal: str,
+        tools: ToolRegistry,
+        prior_knowledge: list[dict[str, Any]],
+        permissions: dict[str, str] | None,
+    ) -> dict[str, Any] | None:
+        """Use an active owner-reviewed finding only as a local investigation hint.
+
+        This intentionally transfers only a class-level investigation strategy:
+        it does not assert that the new repository has the old finding or reuse
+        the old finding as evidence. The goal must independently request an
+        IDOR/BOLA review, the local read-only tool must be configured for the
+        exact repository, and the ordinary plan and security checks still run.
+        """
+        if not re.search(r"\b(?:idor|bola)\b", goal, re.IGNORECASE):
+            return None
+
+        matching_claim = False
+        for claim in prior_knowledge:
+            if not isinstance(claim, dict):
+                continue
+            metadata = claim.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            object_text = str(claim.get("object_text", ""))
+            if not re.search(r"\b(?:idor|bola)\b", object_text, re.IGNORECASE):
+                continue
+            if (
+                claim.get("knowledge_type") != "reviewed_security_finding"
+                or claim.get("domain") != "cybersecurity.bugbounty"
+                or claim.get("predicate") != "owner_confirmed_after_evidence_gate"
+                or claim.get("status") != "SUPPORTED"
+                or claim.get("verification_status") != "verified"
+                or any(claim.get(flag) is not True for flag in (
+                    "is_attested", "is_active", "is_fresh", "is_verified"
+                ))
+                or not claim.get("attestation_id")
+                or not metadata.get("review_id")
+                or not metadata.get("evidence_sha256")
+                or claim.get("conflict_count", 0) != 0
+                or claim.get("conflict_suppression_ids", [])
+            ):
+                continue
+            matching_claim = True
+            break
+        if not matching_claim:
+            return None
+
+        candidates = re.findall(r"https://github\.com/[^\s<>\"'()\[\]]+", goal)
+        if not candidates:
+            candidates = re.findall(r"(?<![\w/])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", goal)
+        repositories: set[str] = set()
+        for candidate in candidates:
+            try:
+                repositories.add(parse_repository(candidate.rstrip(".,;:!")))
+            except RepositoryAccessError:
+                continue
+        if len(repositories) != 1:
+            return None
+        repository = next(iter(repositories))
+
+        try:
+            investigator = tools.get("investigate_repository_bug")
+        except KeyError:
+            return None
+        inspector = getattr(investigator, "inspector", None)
+        local_repositories = getattr(inspector, "local_repositories", None)
+        required_capabilities = set(getattr(investigator, "required_capabilities", []))
+        permission_level = getattr(investigator, "permission_level", None)
+        if (
+            not isinstance(local_repositories, dict)
+            or repository.lower() not in local_repositories
+            or "NETWORK_ACCESS" in required_capabilities
+            or permission_level != "public_read"
+            or (permissions is not None and permissions.get("investigate_repository_bug") != permission_level)
+        ):
+            return None
+
+        output_schema = getattr(investigator, "output_schema", lambda: {})()
+        required_fields = list(output_schema.get("required", [])) if isinstance(output_schema, dict) else []
+        return {
+            "goal": goal,
+            "rationale": (
+                "A class-matched owner-reviewed IDOR/BOLA claim selected a bounded local investigation strategy only; "
+                "it does not establish a finding in this repository or grant authority."
+            ),
+            "steps": [{
+                "id": str(uuid.uuid4()),
+                "objective": "Re-examine the requested IDOR/BOLA boundary using bounded local evidence",
+                "tool": "investigate_repository_bug",
+                "input": {"repository": repository, "bug_report": goal},
+                "reason": (
+                    "Relevant attested memory may guide tool choice, but the new task's findings remain untrusted "
+                    "until independently checked; normal plan and security authorization remain authoritative."
+                ),
+                "depends_on": [],
+                "success_criteria": {"required_fields": required_fields},
+            }],
+        }
+
     def validate(
         self,
         payload: Any,
@@ -185,6 +312,7 @@ class Planner:
         permissions: dict[str, str] | None = None,
     ) -> TaskPlan:
         errors: list[str] = []
+        unavailable_tools: list[str] = []
         if not isinstance(payload, dict):
             raise PlanValidationError(["plan_must_be_object"])
         allowed_plan_keys = {"goal", "rationale", "steps"}
@@ -268,6 +396,7 @@ class Planner:
                     tool = tools.get(tool_name)
                 except KeyError:
                     tool = None
+                    unavailable_tools.append(tool_name)
                     errors.append(f"unknown_tool:{tool_name}")
                 if tool is not None:
                     tool_schema = getattr(tool, "input_schema", lambda: {})()
@@ -301,6 +430,8 @@ class Planner:
             errors.append("circular_dependency")
 
         if errors:
+            if unavailable_tools and all(error.startswith("unknown_tool:") for error in errors):
+                raise CapabilityUnavailableError(unavailable_tools)
             raise PlanValidationError(errors)
         return TaskPlan(goal=goal, steps=steps, rationale=rationale)
 
@@ -360,7 +491,7 @@ class Planner:
     ) -> TaskPlan:
         available = tools.available()
         if not available:
-            raise PlanValidationError(["no_tools_registered", "llm_provider_unavailable"])
+            raise CapabilityUnavailableError([], reason="no_registered_tools")
         # Trusted registered tools may propose a relevant input without I/O.
         # This is still only a proposal: create() applies the normal validator,
         # and Orchestrator/GenericExecutor apply the unchanged authorization.

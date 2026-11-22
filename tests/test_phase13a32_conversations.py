@@ -47,7 +47,7 @@ class FollowupPlanner:
         return TaskPlan(goal, [first, network], "plan incorporating user follow-up")
 
 
-def test_schema_12_migrates_to_conversation_schema_13(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_schema_12_migrates_to_conversation_schema_14(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "schema-12.sqlite3"
     monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 12)
     original = Store(path)
@@ -56,14 +56,42 @@ def test_schema_12_migrates_to_conversation_schema_13(tmp_path: Path, monkeypatc
     ).fetchone() is None
     original.close()
 
-    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 13)
+    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 14)
     migrated = Store(path)
     assert migrated.db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_messages'"
     ).fetchone() is not None
     assert migrated.db.execute(
         "SELECT schema_version FROM task_state_schema ORDER BY schema_version DESC LIMIT 1"
-    ).fetchone()["schema_version"] == 13
+    ).fetchone()["schema_version"] == 14
+    migrated.close()
+
+
+def test_schema_13_conversation_layout_migrates_to_14_without_losing_messages(tmp_path: Path) -> None:
+    path = tmp_path / "schema-13-conversation.sqlite3"
+    store = Store(path)
+    created = store.create_queued_task(
+        "legacy conversation task",
+        initial_message="existing initial message",
+    )
+    task_id = created["task_id"]
+    assert store.task_messages(task_id)[0]["content"] == "existing initial message"
+
+    # Model the other open branch's schema-13 layout: conversations exist,
+    # but the schema-13 knowledge-attestation table has not been installed.
+    store.db.execute("DELETE FROM task_state_schema WHERE schema_version = 14")
+    store.db.execute("DROP TABLE knowledge_attestations")
+    store.db.commit()
+    store.close()
+
+    migrated = Store(path)
+    assert migrated.task_messages(task_id)[0]["content"] == "existing initial message"
+    assert migrated.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_attestations'"
+    ).fetchone()
+    assert migrated.db.execute(
+        "SELECT schema_version FROM task_state_schema ORDER BY schema_version DESC LIMIT 1"
+    ).fetchone()["schema_version"] == 14
     migrated.close()
 
 

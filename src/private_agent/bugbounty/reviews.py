@@ -104,6 +104,14 @@ class FindingReviewRepository:
             created_at=str(row["created_at"]),
         )
 
+    def get_by_id(self, review_id: str) -> FindingReview | None:
+        with self.store._db_lock:
+            row = self.store.db.execute(
+                "SELECT * FROM bugbounty_finding_reviews WHERE review_id = ?",
+                (str(review_id),),
+            ).fetchone()
+        return self._row(row) if row is not None else None
+
     def save(self, review: FindingReview, *, is_owner: bool = False) -> FindingReview:
         owner = self._owner(review.owner_user_id)
         with self.store._db_lock, self.store.db:
