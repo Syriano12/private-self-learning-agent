@@ -27,9 +27,9 @@ class BindingTool:
     risk_level = "low"
     planned_effect = "bounded local binding test"
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, calls: list[dict[str, Any]] | None = None) -> None:
         self.name = name
-        self.calls: list[dict[str, Any]] = []
+        self.calls = calls if calls is not None else []
 
     def description(self) -> str:
         return f"Benign input-binding fixture: {self.name}"

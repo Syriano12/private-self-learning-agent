@@ -2597,53 +2597,71 @@ class Store:
         task through Orchestrator resume and current SecurityController checks.
         """
         stamp = now()
-        self._db_lock.acquire()
+        gate = self._approval_gate
+        policy_lock = getattr(gate, "policy_version_lock", None)
+        current_policy_version = getattr(gate, "current_policy_version", None)
+        if (
+            policy_lock is None
+            or not callable(getattr(policy_lock, "acquire", None))
+            or not callable(getattr(policy_lock, "release", None))
+            or not callable(current_policy_version)
+        ):
+            raise ValueError("approval_policy_unavailable")
+        policy_lock.acquire()
         try:
-            self.db.execute("BEGIN IMMEDIATE")
-            queue = self.db.execute(
-                "SELECT queue_status FROM task_queue WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            state = self.db.execute(
-                "SELECT state_json FROM task_states WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            if queue is None or state is None:
-                raise ValueError(f"task_not_found:{task_id}")
-            from private_agent.core.task_state import TaskState
+            with self._db_lock:
+                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    queue = self.db.execute(
+                        "SELECT queue_status FROM task_queue WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    state = self.db.execute(
+                        "SELECT state_json FROM task_states WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    if queue is None or state is None:
+                        raise ValueError(f"task_not_found:{task_id}")
+                    from private_agent.core.task_state import TaskState
 
-            payload = json.loads(state["state_json"])
-            task_state = TaskState.from_dict(payload)
-            if queue["queue_status"] != "WAITING_APPROVAL" or task_state.status != "WAITING_APPROVAL":
-                raise ValueError("task_not_waiting_approval")
-            if not task_state.approval_ids:
-                raise ValueError("approval_not_approved")
-            for action_id, approval_id in task_state.approval_ids.items():
-                approval = self.get_approval_request(str(approval_id))
-                if (
-                    not approval
-                    or approval.get("status") != "APPROVED"
-                    or str(approval.get("task_id", "")) != str(task_id)
-                    or str(approval.get("action_id", "")) != str(action_id)
-                ):
-                    raise ValueError("approval_not_approved")
-            updated = self.db.execute(
-                """UPDATE task_queue
-                   SET queue_status = 'QUEUED', available_at = ?,
-                       last_error_code = '', last_error_message = '', updated_at = ?
-                 WHERE task_id = ? AND queue_status = 'WAITING_APPROVAL'""",
-                (stamp, stamp, task_id),
-            )
-            if updated.rowcount != 1:
-                raise QueueLeaseLost(f"queue_requeue_lost:{task_id}")
-            self.db.commit()
-            return {"task_id": str(task_id), "queue_status": "QUEUED"}
-        except Exception:
-            self.db.rollback()
-            raise
-
+                    payload = json.loads(state["state_json"])
+                    task_state = TaskState.from_dict(payload)
+                    if queue["queue_status"] != "WAITING_APPROVAL" or task_state.status != "WAITING_APPROVAL":
+                        raise ValueError("task_not_waiting_approval")
+                    if not task_state.approval_ids:
+                        raise ValueError("approval_not_approved")
+                    current_version = current_policy_version()
+                    for action_id, approval_id in task_state.approval_ids.items():
+                        approval = self.get_approval_request(str(approval_id))
+                        if (
+                            not approval
+                            or approval.get("status") != "APPROVED"
+                            or str(approval.get("task_id", "")) != str(task_id)
+                            or str(approval.get("action_id", "")) != str(action_id)
+                        ):
+                            raise ValueError("approval_not_approved")
+                        try:
+                            approval_version = int(approval.get("policy_version", -1))
+                        except (TypeError, ValueError):
+                            raise ValueError("approval_not_approved") from None
+                        if approval_version != current_version:
+                            raise ValueError("approval_policy_stale")
+                    updated = self.db.execute(
+                        """UPDATE task_queue
+                           SET queue_status = 'QUEUED', available_at = ?,
+                               last_error_code = '', last_error_message = '', updated_at = ?
+                         WHERE task_id = ? AND queue_status = 'WAITING_APPROVAL'""",
+                        (stamp, stamp, task_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise QueueLeaseLost(f"queue_requeue_lost:{task_id}")
+                    self.db.commit()
+                    return {"task_id": str(task_id), "queue_status": "QUEUED"}
+                except Exception:
+                    self.db.rollback()
+                    raise
         finally:
-            self._db_lock.release()
+            policy_lock.release()
 
     def waiting_approval_task_ids(self, *, limit: int = 100) -> list[str]:
         """Return a bounded snapshot for worker approval reconciliation."""
@@ -4142,8 +4160,8 @@ class Store:
         """Persist a final approval transition only for the bound gate.
 
         Public storage callers can create pending requests, but cannot write a
-        final decision. The gate-bound transition also rechecks the persisted
-        binding inside the same transaction before replacing the row.
+        final decision. The gate-bound transition rechecks the persisted binding
+        and the current policy version in one SQLite write transaction.
         """
         if self._approval_gate is not gate:
             raise ValueError("approval_transition_requires_gate")
@@ -4152,27 +4170,51 @@ class Store:
         if str(payload.get("status", "")) not in {"APPROVED", "DENIED", "CANCELLED", "EXPIRED"}:
             raise ValueError("approval_transition_invalid_status")
         task_id = str(payload["task_id"])
+        approving = payload["status"] == "APPROVED"
+        policy_lock = getattr(gate, "policy_version_lock", None)
+        current_policy_version = getattr(gate, "current_policy_version", None)
+        if approving and (
+            policy_lock is None
+            or not callable(getattr(policy_lock, "acquire", None))
+            or not callable(getattr(policy_lock, "release", None))
+            or not callable(current_policy_version)
+        ):
+            raise ValueError("approval_policy_unavailable")
+        if approving:
+            policy_lock.acquire()
         binding_fields = (
             "approval_id", "task_id", "action_id", "tool_or_skill",
             "requested_capabilities", "risk_level", "reason", "planned_effect",
             "input_fingerprint", "policy_version", "requested_at", "expires_at", "goal",
         )
-        with self._lease_write(task_id if enforce_lease else None):
-            row = self.db.execute(
-                "SELECT approval_json FROM approval_requests WHERE approval_id = ?",
-                (payload["approval_id"],),
-            ).fetchone()
-            if row is None:
-                raise ValueError("approval_not_found")
-            try:
-                current = json.loads(row["approval_json"])
-            except (TypeError, ValueError) as exc:
-                raise ValueError("approval_payload_corrupt") from exc
-            if not isinstance(current, dict) or current.get("status") != "PENDING":
-                raise ValueError("approval_transition_requires_pending")
-            if any(current.get(field) != payload.get(field) for field in binding_fields):
-                raise ValueError("approval_binding_mismatch")
-            self._write_approval_payload(payload, task_id)
+        try:
+            with self._lease_write(task_id if enforce_lease else None):
+                row = self.db.execute(
+                    "SELECT approval_json FROM approval_requests WHERE approval_id = ?",
+                    (payload["approval_id"],),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("approval_not_found")
+                try:
+                    current = json.loads(row["approval_json"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("approval_payload_corrupt") from exc
+                if not isinstance(current, dict) or current.get("status") != "PENDING":
+                    raise ValueError("approval_transition_requires_pending")
+                if any(current.get(field) != payload.get(field) for field in binding_fields):
+                    raise ValueError("approval_binding_mismatch")
+                if approving:
+                    try:
+                        current_version = current_policy_version()
+                        approved_version = int(payload.get("policy_version", -1))
+                    except Exception as exc:
+                        raise ValueError("approval_policy_unavailable") from exc
+                    if approved_version != current_version:
+                        raise ValueError("approval_policy_stale")
+                self._write_approval_payload(payload, task_id)
+        finally:
+            if approving:
+                policy_lock.release()
 
     def get_approval_request(self, approval_id: str) -> dict[str, Any] | None:
         with self._db_lock:

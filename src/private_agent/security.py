@@ -579,9 +579,10 @@ class PolicyEngine:
 
     store = _WriteOnceReference("policy_store_immutable")
     _policy = _WriteOnceReference("policy_authority_immutable")
-    __slots__ = ("__weakref__",)
+    __slots__ = ("_policy_lock", "__weakref__")
 
     def __init__(self, policy: SecurityPolicy | None = None, *, store: Any | None = None) -> None:
+        self._policy_lock = threading.RLock()
         self.store = store
         if policy is None and store is not None and hasattr(store, "get_latest_security_policy"):
             row = store.get_latest_security_policy()
@@ -603,7 +604,8 @@ class PolicyEngine:
 
     @property
     def policy(self) -> SecurityPolicy:
-        return SecurityPolicy.from_dict(self._policy.to_dict())
+        with self._policy_lock:
+            return SecurityPolicy.from_dict(self._policy.to_dict())
 
     def _owner_rules(self) -> list[dict[str, Any]]:
         if self.store is None or not hasattr(self.store, "owner_permission_rules"):
@@ -672,9 +674,10 @@ class PolicyEngine:
         return str(chosen.get("effect")), [f"owner_rule:{chosen.get('rule_id')}", str(chosen.get("reason", ""))], version
 
     def _current_policy_version(self) -> int:
-        if self.store is not None and hasattr(self.store, "latest_owner_policy_version"):
-            return max(self._policy.policy_version, int(self.store.latest_owner_policy_version()))
-        return self._policy.policy_version
+        with self._policy_lock:
+            if self.store is not None and hasattr(self.store, "latest_owner_policy_version"):
+                return max(self._policy.policy_version, int(self.store.latest_owner_policy_version()))
+            return self._policy.policy_version
 
     def evaluate(self, action: ActionRequest) -> PolicyDecision:
         requested = set(action.requested_capabilities)
@@ -732,17 +735,18 @@ class PolicyEngine:
         return self._decision(action, "ALLOW", risk, reasons)
 
     def update_policy(self, policy: SecurityPolicy) -> SecurityPolicy:
-        if policy.policy_version <= self._policy.policy_version:
-            raise ValueError("policy_version_must_increase")
-        descriptor = type(self).__dict__["_policy"]
-        _replace_write_once_reference(
-            descriptor,
-            self,
-            _ImmutableSecurityPolicy(SecurityPolicy.from_dict(policy.to_dict())),
-            token=_WRITE_ONCE_UPDATE_TOKEN,
-        )
-        self._persist_policy()
-        return self.policy
+        with self._policy_lock:
+            if policy.policy_version <= self._policy.policy_version:
+                raise ValueError("policy_version_must_increase")
+            descriptor = type(self).__dict__["_policy"]
+            _replace_write_once_reference(
+                descriptor,
+                self,
+                _ImmutableSecurityPolicy(SecurityPolicy.from_dict(policy.to_dict())),
+                token=_WRITE_ONCE_UPDATE_TOKEN,
+            )
+            self._persist_policy()
+            return self.policy
 
     def _risk_for(self, action: ActionRequest, capabilities: set[str]) -> str:
         if capabilities.intersection({"SENSITIVE_DATA_ACCESS", "SYSTEM_COMMAND"}) or action.sensitive_data:
@@ -833,7 +837,7 @@ def _approval_records(gate: Any) -> dict[str, ApprovalRequest]:
 class ApprovalGate:
     """Explicit human approval state machine with exact action binding and expiration."""
 
-    __slots__ = ("store", "event_logger", "policy_version_provider", "__weakref__")
+    __slots__ = ("store", "event_logger", "policy_version_provider", "policy_version_lock", "__weakref__")
 
     SENSITIVE = {"send_message", "publish", "payment", "delete_data", "account_change", "external_irreversible"}
 
@@ -843,10 +847,12 @@ class ApprovalGate:
         store: Any | None = None,
         event_logger: Callable[[str, ApprovalRequest], None] | None = None,
         policy_version_provider: Callable[[], int] | None = None,
+        policy_version_lock: Any | None = None,
     ) -> None:
         self.store = store
         self.event_logger = event_logger
         self.policy_version_provider = policy_version_provider
+        self.policy_version_lock = policy_version_lock
 
     @property
     def _requests(self) -> MappingProxyType:
@@ -860,8 +866,20 @@ class ApprovalGate:
         with _APPROVAL_STATE_LOCK:
             _approval_records(self)[request.approval_id] = ApprovalRequest(**request.to_dict())
 
-    def set_policy_version_provider(self, provider: Callable[[], int]) -> None:
+    def set_policy_version_provider(self, provider: Callable[[], int] | None) -> None:
         self.policy_version_provider = provider
+
+    def set_policy_version_lock(self, lock: Any | None) -> None:
+        self.policy_version_lock = lock
+
+    def current_policy_version(self) -> int:
+        provider = self.policy_version_provider
+        if not callable(provider):
+            raise ValueError("approval_policy_unavailable")
+        try:
+            return int(provider())
+        except Exception as exc:
+            raise ValueError("approval_policy_unavailable") from exc
 
     @staticmethod
     def _public_view(request: ApprovalRequest) -> ApprovalRequest:
@@ -892,17 +910,24 @@ class ApprovalGate:
         return self._public_view(request)
 
     def approve(self, approval_id: str, *, actor: str = "human") -> ApprovalRequest:
-        request = self._get(approval_id)
-        self._expire_if_needed(request)
-        if request.status != "PENDING":
-            raise ValueError(f"approval_not_pending:{request.status}")
-        request.status = "APPROVED"
-        request.decided_at = _now()
-        request.actor = actor
-        self._persist(request)
-        self._publish(request)
-        self._emit("APPROVAL_GRANTED", self._public_view(request))
-        return self._public_view(request)
+        lock = self.policy_version_lock
+        if lock is None or not callable(getattr(lock, "acquire", None)) or not callable(getattr(lock, "release", None)):
+            raise ValueError("approval_policy_unavailable")
+        with lock:
+            request = self._get(approval_id)
+            current_policy_version = self.current_policy_version()
+            self._expire_if_needed(request)
+            if request.status != "PENDING":
+                raise ValueError(f"approval_not_pending:{request.status}")
+            if current_policy_version != request.policy_version:
+                raise ValueError("approval_policy_stale")
+            request.status = "APPROVED"
+            request.decided_at = _now()
+            request.actor = actor
+            self._persist(request)
+            self._publish(request)
+            self._emit("APPROVAL_GRANTED", self._public_view(request))
+            return self._public_view(request)
 
     def deny(self, approval_id: str, *, actor: str = "human") -> ApprovalRequest:
         request = self._get(approval_id)
@@ -1800,9 +1825,12 @@ class SecurityController:
             store=store,
             event_logger=self._approval_event,
             policy_version_provider=self.policy_engine._current_policy_version,
+            policy_version_lock=self.policy_engine._policy_lock,
         )
         if hasattr(self.approval_gate, "set_policy_version_provider"):
             self.approval_gate.set_policy_version_provider(self.policy_engine._current_policy_version)
+        if hasattr(self.approval_gate, "set_policy_version_lock"):
+            self.approval_gate.set_policy_version_lock(self.policy_engine._policy_lock)
         bind_gate = getattr(store, "_bind_approval_gate", None)
         if callable(bind_gate):
             bind_gate(self.approval_gate, owner=self)
@@ -2687,33 +2715,34 @@ class SecurityController:
         return self.authorize(action, approval_id=approval_id, boundary=True)
 
     def update_policy(self, policy: SecurityPolicy, *, actor: str = "system") -> SecurityPolicy:
-        previous = self.policy_engine.policy
-        updated = self.policy_engine.update_policy(policy)
-        action = ActionRequest(
-            task_id="policy",
-            action_id=f"policy:{updated.policy_version}",
-            tool_or_skill="SecurityPolicy",
-            requested_capabilities=[],
-            declared_capabilities=[],
-            reason="Security policy version changed",
-            planned_effect="Replace deterministic policy configuration",
-            action_type="policy_update",
-            actor=actor,
-        )
-        self.audit._write_security_claim(
-            self.audit._issue_security_claim(
-                self.audit._claim_issuer,
-                "POLICY_CHANGED",
-                action,
-                decision="ALLOW",
-                reason=f"policy_version:{previous.policy_version}->{updated.policy_version}",
-                risk_level="LOW",
-                policy_version=updated.policy_version,
+        with self.policy_engine._policy_lock:
+            previous = self.policy_engine.policy
+            updated = self.policy_engine.update_policy(policy)
+            action = ActionRequest(
+                task_id="policy",
+                action_id=f"policy:{updated.policy_version}",
+                tool_or_skill="SecurityPolicy",
+                requested_capabilities=[],
+                declared_capabilities=[],
+                reason="Security policy version changed",
+                planned_effect="Replace deterministic policy configuration",
+                action_type="policy_update",
                 actor=actor,
-                provenance=self.policy_engine._policy,
             )
-        )
-        return updated
+            self.audit._write_security_claim(
+                self.audit._issue_security_claim(
+                    self.audit._claim_issuer,
+                    "POLICY_CHANGED",
+                    action,
+                    decision="ALLOW",
+                    reason=f"policy_version:{previous.policy_version}->{updated.policy_version}",
+                    risk_level="LOW",
+                    policy_version=updated.policy_version,
+                    actor=actor,
+                    provenance=self.policy_engine._policy,
+                )
+            )
+            return updated
 
     def _approval_event(self, event_type: str, request: ApprovalRequest) -> None:
         action = ActionRequest(
