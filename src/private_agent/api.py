@@ -33,7 +33,14 @@ from private_agent.core.knowledge import (
     sha256_hex,
 )
 from private_agent.core.orchestrator import Orchestrator
-from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH, TASK_STATUSES, StateIntegrityError, TaskState
+from private_agent.core.task_state import (
+    MAX_TASK_GOAL_LENGTH,
+    TASK_STATUSES,
+    StateIntegrityError,
+    TaskState,
+    TaskStopReason,
+    TaskStopReasonCode,
+)
 from private_agent.auth import (
     ACTIVE,
     CSRF_COOKIE_NAME,
@@ -58,7 +65,7 @@ from private_agent.security import ApprovalRequest, SecurityController
 from private_agent.skills.lifecycle import CapabilityCandidateAssessor, CapabilityCandidateAssessmentError, SkillCandidate
 from private_agent.skills.registry import SkillRegistry
 from private_agent.skills.runtime_preflight import run_host_preflight
-from private_agent.storage import QueueLeaseLost, Store
+from private_agent.storage import MAX_TASK_MESSAGE_LENGTH, QueueLeaseLost, Store
 from private_agent.bugbounty.trusted_tools import load_tool_spec_from_environment
 from private_agent.tools.research import ToolRegistry
 from private_agent.tools.scanners import HttpxReconTool, NucleiScanTool, build_scanner_limits
@@ -195,6 +202,18 @@ class CapabilityCandidateAssessmentResponse(APIModel):
     permissions_granted: bool
     created_at: str
     request_id: str = ""
+
+
+class TaskMessageRequest(APIModel):
+    content: str = Field(min_length=1, max_length=MAX_TASK_MESSAGE_LENGTH)
+
+    @field_validator("content")
+    @classmethod
+    def non_blank_content(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("task_message_required")
+        return value
 
 
 class BugBountyCreateRequest(APIModel):
@@ -410,6 +429,7 @@ class ErrorResponse(APIModel):
 
 class TaskCreateResponse(APIModel):
     task_id: str
+    conversation_id: str
     status: str
     created_at: str
     current_phase: str
@@ -417,6 +437,33 @@ class TaskCreateResponse(APIModel):
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
     idempotent_replay: bool = False
+
+
+class TaskMessageResponse(APIModel):
+    message_id: str
+    conversation_id: str
+    task_id: str
+    sequence: int
+    role: str
+    message_kind: str
+    content: str
+    status: str
+    created_at: str
+    consumed_at: str = ""
+    consumed_checkpoint: str = ""
+    idempotent_replay: bool = False
+    request_id: str = ""
+
+
+class TaskConversationResponse(APIModel):
+    conversation_id: str
+    task_id: str
+    task_status: str
+    queue_status: str
+    messages: list[TaskMessageResponse]
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
 
 
 class TaskStatusFilter(str, Enum):
@@ -432,6 +479,14 @@ class TaskStatusFilter(str, Enum):
     BLOCKED = "BLOCKED"
     FAILED = "FAILED"
     COMPLETED = "COMPLETED"
+
+
+class TaskStopReasonResponse(APIModel):
+    """Closed public reason code and safe identifiers; no free-form detail."""
+
+    code: TaskStopReasonCode
+    step_id: str | None = None
+    action_id: str | None = None
 
 
 class TaskSummaryResponse(APIModel):
@@ -452,6 +507,7 @@ class TaskSummaryResponse(APIModel):
     last_error_code: str = ""
     waiting_for_approval: bool = False
     execution_unknown: bool = False
+    stop_reason: TaskStopReasonResponse | None = None
 
 
 class TaskListResponse(APIModel):
@@ -540,6 +596,7 @@ class TaskStateResponse(APIModel):
     created_at: str
     updated_at: str
     queue_status: str = ""
+    stop_reason: TaskStopReasonResponse | None = None
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
@@ -824,6 +881,16 @@ def _verification_status(state: TaskState) -> str:
         if result_status:
             verification_status = str(result_status)
     return verification_status
+
+
+def _task_stop_reason_response(reason: TaskStopReason | None) -> TaskStopReasonResponse | None:
+    if reason is None:
+        return None
+    return TaskStopReasonResponse(
+        code=reason.code,
+        step_id=reason.step_id,
+        action_id=reason.action_id,
+    )
 
 
 def _request_id(request: Request) -> str:
@@ -1446,6 +1513,7 @@ class AgentAPIService:
     def _task_response(self, state: TaskState, *, request_id: str = "", replay: bool = False) -> TaskCreateResponse:
         return TaskCreateResponse(
             task_id=state.task_id,
+            conversation_id=state.task_id,
             status=state.status,
             created_at=state.created_at,
             current_phase=state.current_phase,
@@ -1498,6 +1566,7 @@ class AgentAPIService:
             created_at=state.created_at,
             updated_at=state.updated_at,
             queue_status=str(queue.get("queue_status", "")),
+            stop_reason=_task_stop_reason_response(state.stop_reason),
             request_id=request_id,
         )
 
@@ -1524,6 +1593,7 @@ class AgentAPIService:
             try:
                 created = self.store.create_queued_task(
                     goal,
+                    initial_message=goal,
                     idempotency_key=key,
                     request_fingerprint=fingerprint if key else None,
                     context=context,
@@ -1588,6 +1658,7 @@ class AgentAPIService:
                     last_error_code=str(row["last_error_code"]),
                     waiting_for_approval=state.status == "WAITING_APPROVAL",
                     execution_unknown=state.status == "EXECUTION_UNKNOWN",
+                    stop_reason=_task_stop_reason_response(state.stop_reason),
                 )
             )
         next_cursor = None
@@ -1598,6 +1669,106 @@ class AgentAPIService:
     def get_task(self, task_id: str, *, request_id: str = "", principal: AuthenticatedPrincipal | None = None) -> TaskStateResponse:
         self._assert_task_access(task_id, principal)
         return self.task_state_response(self._state(task_id), request_id=request_id)
+
+    def get_task_conversation(
+        self,
+        task_id: str,
+        *,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> TaskConversationResponse:
+        task_id = _safe_id(task_id, "task_id")
+        self._assert_task_access(task_id, principal)
+        state = self._state(task_id)
+        queue = self.store.task_queue_record(task_id) or {}
+        owner_user_id = (
+            principal.user_id
+            if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
+            else None
+        )
+        messages = self.store.task_messages(task_id, owner_user_id=owner_user_id)
+        return TaskConversationResponse(
+            conversation_id=task_id,
+            task_id=task_id,
+            task_status=state.status,
+            queue_status=str(queue.get("queue_status", "")),
+            messages=[
+                TaskMessageResponse(
+                    message_id=str(item["message_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    sequence=int(item["sequence"]),
+                    role=str(item["role"]),
+                    message_kind=str(item["message_kind"]),
+                    content=str(item["content"]),
+                    status=str(item["status"]),
+                    created_at=str(item["created_at"]),
+                    consumed_at=str(item.get("consumed_at", "")),
+                    consumed_checkpoint=str(item.get("consumed_checkpoint", "")),
+                )
+                for item in messages
+            ],
+            request_id=request_id,
+        )
+
+    def append_task_message(
+        self,
+        task_id: str,
+        content: str,
+        *,
+        idempotency_key: str | None = None,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> TaskMessageResponse:
+        task_id = _safe_id(task_id, "task_id")
+        if principal is not None and not principal.is_legacy and principal.role not in {ROLE_OWNER, ROLE_OPERATOR}:
+            raise APIError(403, "role_forbidden", "This role cannot add task messages", task_id=task_id)
+        self._assert_task_access(task_id, principal)
+        key = None
+        if idempotency_key is not None:
+            if not _IDEMPOTENCY_PATTERN.fullmatch(idempotency_key):
+                raise APIError(400, "invalid_idempotency_key", "Invalid Idempotency-Key", task_id=task_id)
+            key = idempotency_key
+        fingerprint = hashlib.sha256(
+            json.dumps({"task_id": task_id, "content": content.strip()}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        try:
+            stored = self.store.append_task_message(
+                task_id,
+                content,
+                owner_user_id=(
+                    principal.user_id
+                    if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
+                    else None
+                ),
+                idempotency_key=key,
+                request_fingerprint=fingerprint if key else None,
+            )
+        except KeyError as exc:
+            raise APIError(404, "task_not_found", "Task was not found", task_id=task_id) from exc
+        except ValueError as exc:
+            code = str(exc)
+            if code in {"message_idempotency_conflict"}:
+                raise APIError(409, code, "Idempotency-Key was already used for another message", task_id=task_id) from exc
+            if code in {"conversation_execution_unknown", "conversation_terminal", "conversation_not_accepting_messages", "conversation_message_limit", "conversation_size_limit"}:
+                raise APIError(409, code, "Task cannot accept a follow-up message in its current state", task_id=task_id) from exc
+            status_code = 413 if code == "task_message_too_long" else 422
+            raise APIError(status_code, code, "Task message could not be stored", task_id=task_id) from exc
+        return TaskMessageResponse(
+            message_id=str(stored["message_id"]),
+            conversation_id=task_id,
+            task_id=task_id,
+            sequence=int(stored["sequence"]),
+            role=str(stored["role"]),
+            message_kind=str(stored["message_kind"]),
+            content=str(stored["content"]),
+            status=str(stored["status"]),
+            created_at=str(stored["created_at"]),
+            consumed_at=str(stored.get("consumed_at", "")),
+            consumed_checkpoint=str(stored.get("consumed_checkpoint", "")),
+            idempotent_replay=bool(stored.get("replayed", False)),
+            request_id=request_id,
+        )
 
     @staticmethod
     def _candidate_lifecycle_state(record: dict[str, Any]) -> dict[str, Any]:
@@ -2869,6 +3040,39 @@ def create_app(
     ) -> TaskStateResponse:
         request.state.task_id = task_id
         return service.get_task(task_id, request_id=_request_id(request), principal=principal)
+
+    @router.get("/tasks/{task_id}/messages", response_model=TaskConversationResponse)
+    def get_task_conversation(
+        request: Request,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> TaskConversationResponse:
+        request.state.task_id = task_id
+        return service.get_task_conversation(task_id, request_id=_request_id(request), principal=principal)
+
+    @router.post(
+        "/tasks/{task_id}/messages",
+        response_model=TaskMessageResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(_require_roles(ROLE_OWNER, ROLE_OPERATOR)), Depends(_csrf_protect)],
+    )
+    def append_task_message(
+        request: Request,
+        payload: TaskMessageRequest,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> TaskMessageResponse:
+        request.state.task_id = task_id
+        return service.append_task_message(
+            task_id,
+            payload.content,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(request),
+            principal=principal,
+        )
 
     @router.post(
         "/tasks/{task_id}/capability-candidates/assess",

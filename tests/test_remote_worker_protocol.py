@@ -147,6 +147,88 @@ def test_expired_remote_lease_becomes_execution_unknown_without_retry(tmp_path: 
     store.close()
 
 
+@pytest.mark.parametrize("expired_operation", ["heartbeat", "submit_result"])
+def test_expired_remote_operation_durably_marks_execution_unknown(
+    tmp_path: Path, expired_operation: str
+) -> None:
+    clock = Clock()
+    store = Store(tmp_path / f"remote-worker-expired-{expired_operation}.sqlite3")
+    protocol = RemoteWorkerProtocol(store, clock=clock, lease_seconds=5)
+    credential = protocol.register_worker(
+        f"worker-expired-{expired_operation}",
+        runtime_identity="podman@5.0.0",
+        image_digest=_digest("fixture-image"),
+        manifest_digest=_digest("fixture-manifest"),
+    )
+    job = protocol.enqueue_fixture_job(
+        worker_id=f"worker-expired-{expired_operation}",
+        idempotency_key=f"fixture-expired-{expired_operation}",
+        fixture_name="safe",
+    )
+    worker_id = f"worker-expired-{expired_operation}"
+    claimed = protocol.claim(
+        _signed(protocol, worker_id, credential, "POST", "/worker/jobs/claim", {}, f"claim-{expired_operation}")
+    )
+    assert claimed is not None
+    clock.advance(6)
+
+    heartbeat_body = {"job_id": job["job_id"], "lease_id": claimed["lease_id"]}
+    result_body = {
+        **heartbeat_body,
+        "result": {"status": "COMPLETED", "observations": []},
+    }
+    if expired_operation == "heartbeat":
+        auth = _signed(
+            protocol,
+            worker_id,
+            credential,
+            "POST",
+            f"/worker/jobs/{job['job_id']}/heartbeat",
+            heartbeat_body,
+            "expired-heartbeat",
+        )
+        with pytest.raises(WorkerProtocolError, match="execution_unknown") as error:
+            protocol.heartbeat(auth, **heartbeat_body)
+        later_auth = _signed(
+            protocol,
+            worker_id,
+            credential,
+            "POST",
+            f"/worker/jobs/{job['job_id']}/result",
+            result_body,
+            "late-result-after-heartbeat",
+        )
+        with pytest.raises(WorkerProtocolError, match="execution_unknown"):
+            protocol.submit_result(later_auth, **result_body)
+    else:
+        auth = _signed(
+            protocol,
+            worker_id,
+            credential,
+            "POST",
+            f"/worker/jobs/{job['job_id']}/result",
+            result_body,
+            "expired-result",
+        )
+        with pytest.raises(WorkerProtocolError, match="execution_unknown") as error:
+            protocol.submit_result(auth, **result_body)
+        later_auth = _signed(
+            protocol,
+            worker_id,
+            credential,
+            "POST",
+            f"/worker/jobs/{job['job_id']}/heartbeat",
+            heartbeat_body,
+            "late-heartbeat-after-result",
+        )
+        with pytest.raises(WorkerProtocolError, match="worker_lease_fenced"):
+            protocol.heartbeat(later_auth, **heartbeat_body)
+
+    assert error.value.code == "execution_unknown"
+    assert protocol.get_job(job["job_id"])["status"] == "EXECUTION_UNKNOWN"
+    store.close()
+
+
 def test_active_job_is_blocked_until_runtime_acceptance_and_approval_are_verified(tmp_path: Path) -> None:
     store = Store(tmp_path / "remote-worker-active.sqlite3")
     protocol = RemoteWorkerProtocol(store)
@@ -201,18 +283,30 @@ def test_credential_rotation_accepts_new_secret_and_never_persists_raw_secret(tm
     store.close()
 
 
-def test_schema_11_database_upgrades_through_schema_13_with_worker_protocol_tables(tmp_path: Path) -> None:
+def test_schema_11_database_upgrades_through_schema_14_with_all_new_tables(tmp_path: Path) -> None:
     path = tmp_path / "schema-11.sqlite3"
     store = Store(path)
-    store.db.execute("DELETE FROM task_state_schema WHERE schema_version = 12")
-    for table in ("remote_worker_nonces", "remote_worker_jobs", "remote_workers"):
+    store.db.execute("DELETE FROM task_state_schema WHERE schema_version >= 12")
+    for table in (
+        "knowledge_attestations",
+        "task_messages",
+        "remote_worker_nonces",
+        "remote_worker_jobs",
+        "remote_workers",
+    ):
         store.db.execute(f"DROP TABLE {table}")
     store.db.commit()
     store.close()
 
     upgraded = Store(path)
     versions = [row["schema_version"] for row in upgraded.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions[-1] == 13
-    for table in ("remote_workers", "remote_worker_jobs", "remote_worker_nonces"):
+    assert versions[-3:] == [12, 13, 14]
+    for table in (
+        "remote_workers",
+        "remote_worker_jobs",
+        "remote_worker_nonces",
+        "knowledge_attestations",
+        "task_messages",
+    ):
         assert upgraded.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table,)).fetchone()
     upgraded.close()

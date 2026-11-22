@@ -52,7 +52,7 @@ class RecordingPlanner(Planner):
         )
 
 
-def test_SELF_LEARNING_BEHAVIOR_TEST(tmp_path: Path) -> None:
+def test_unreviewed_legacy_knowledge_is_not_reused_by_future_tasks(tmp_path: Path) -> None:
     store = Store(tmp_path / "agent.sqlite3")
     registry = ToolRegistry()
     registry.register(FakeResearch())
@@ -61,7 +61,10 @@ def test_SELF_LEARNING_BEHAVIOR_TEST(tmp_path: Path) -> None:
 
     first = agent.run("ابحث عن بنية وكيل بحث محلي قابل للنقل")
     assert first["verification"]["verified"] is True
-    assert store.search_knowledge("وكيل بحث محلي")
+    assert store.search_knowledge("وكيل بحث محلي") == []
+    assert store.db.execute(
+        "SELECT COUNT(*) AS count FROM knowledge_items WHERE verification_status = 'needs_review'"
+    ).fetchone()["count"] > 0
 
     second = agent.run("قارن خيارات بناء وكيل بحث محلي قابل للنقل")
     assert second["prior_knowledge_used"] == [], "legacy knowledge must not enter planning context"

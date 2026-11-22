@@ -187,6 +187,31 @@ def test_schema_v12_migrates_to_attestation_schema_v13(
     migrated.close()
 
 
+def test_schema_v13_attestation_layout_migrates_to_14_and_preserves_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "schema-v13-attestation.sqlite3"
+    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 13)
+    v13 = Store(path, knowledge_attestation_key=KEY)
+    _, claim, _, _ = save_attested(v13)
+    assert v13.search_knowledge_claims("planning trust")[0]["is_active"] is True
+    v13.close()
+
+    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 14)
+    migrated = Store(path, knowledge_attestation_key=KEY)
+    assert migrated.search_knowledge_claims("planning trust")[0]["claim_id"] == claim.claim_id
+    assert migrated.search_knowledge_claims("planning trust")[0]["is_active"] is True
+    assert migrated.db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_messages'"
+    ).fetchone()
+    versions = [
+        int(row["schema_version"])
+        for row in migrated.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")
+    ]
+    assert versions[-2:] == [13, 14]
+    migrated.close()
+
+
 def test_schema_v13_missing_attestation_index_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "schema-v13-missing-index.sqlite3"
     store = Store(path)
