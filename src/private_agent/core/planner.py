@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from private_agent.core.learning import SQLiteLearningMemory
 from private_agent.core.llm import LLMProvider
 from private_agent.tools.github_access import RepositoryAccessError, parse_repository
 from private_agent.tools.research import ToolRegistry
@@ -106,10 +108,17 @@ class Planner:
         *,
         max_steps: int = 12,
         learned_strategy_threshold: float = 0.70,
+        learning_memory: SQLiteLearningMemory | None = None,
     ) -> None:
         self.provider = provider
         self.max_steps = max_steps
         self.learned_strategy_threshold = max(0.0, min(1.0, float(learned_strategy_threshold)))
+        self.learning_memory: SQLiteLearningMemory | None = None
+        self.set_learning_memory(learning_memory)
+
+    def set_learning_memory(self, memory: Any | None) -> None:
+        """Bind only the server's SQLite trust boundary; no memory means no learned steering."""
+        self.learning_memory = memory if isinstance(memory, SQLiteLearningMemory) else None
 
     def create(
         self,
@@ -125,6 +134,21 @@ class Planner:
     ) -> TaskPlan:
         if not goal.strip():
             raise PlanValidationError(["goal_required"])
+        planning_advisories = _planning_advisory_context(
+            learned_strategies or [],
+            goal=goal,
+            tools=tools,
+            threshold=self.learned_strategy_threshold,
+            learning_memory=self.learning_memory,
+        )
+        planning_strategies = _planning_eligible_learned_strategies(
+            planning_advisories,
+            goal=goal,
+            tools=tools,
+            permissions=permissions,
+            threshold=self.learned_strategy_threshold,
+            learning_memory=self.learning_memory,
+        )
         if self.provider is not None:
             # An explicit repository bug report has a specialized, conservative
             # report contract. Route it through the registered tool proposal
@@ -168,7 +192,7 @@ class Planner:
                 permissions=permissions,
             )
         if self.provider is None:
-            fallback = self._unavailable_fallback(goal, tools, prior_knowledge, learned_strategies or [])
+            fallback = self._unavailable_fallback(goal, tools, prior_knowledge, planning_strategies, permissions)
             return self.validate(
                 {
                     "goal": fallback.goal,
@@ -198,7 +222,7 @@ class Planner:
             "relevant_memory": prior_knowledge,
             "relevant_experiences": retrieved_experiences or [],
             "reflection_insights": reflection_insights or [],
-            "learned_strategies": learned_strategies or [],
+            "learned_strategies": planning_advisories,
             "constraints": constraints or {"max_steps": self.max_steps},
             "permissions": permissions or {},
         }
@@ -577,6 +601,7 @@ class Planner:
         tools: ToolRegistry,
         prior_knowledge: list[dict[str, Any]],
         learned_strategies: list[dict[str, Any]],
+        permissions: dict[str, str] | None,
     ) -> TaskPlan:
         available = tools.available()
         if not available:
@@ -586,6 +611,8 @@ class Planner:
         # and Orchestrator/GenericExecutor apply the unchanged authorization.
         for metadata in available:
             candidate = tools.get(metadata["name"])
+            if permissions is not None and permissions.get(metadata["name"]) != getattr(candidate, "permission_level", None):
+                continue
             propose = getattr(candidate, "planning_inputs", None)
             values = propose(goal) if callable(propose) else None
             if isinstance(values, dict):
@@ -600,11 +627,16 @@ class Planner:
                     "LLM planner unavailable; bounded registered-tool proposal subject to normal policy checks",
                 )
         available_names = [metadata["name"] for metadata in available]
-        selected_name = _learned_preferred_tool(learned_strategies, available_names, self.learned_strategy_threshold)
+        permitted_names = [
+            name for name in available_names
+            if permissions is None or permissions.get(name) == getattr(tools.get(name), "permission_level", None)
+        ]
+        selection_names = permitted_names or available_names
+        selected_name = _learned_preferred_tool(learned_strategies, selection_names, self.learned_strategy_threshold)
         avoided_names = _learned_avoided_tools(learned_strategies, self.learned_strategy_threshold)
-        if not selected_name and available_names and available_names[0] in avoided_names:
-            selected_name = next((name for name in available_names if name not in avoided_names), available_names[0])
-        selected_name = selected_name or available_names[0]
+        if not selected_name and selection_names and selection_names[0] in avoided_names:
+            selected_name = next((name for name in selection_names if name not in avoided_names), selection_names[0])
+        selected_name = selected_name or selection_names[0]
         first_tool = tools.get(selected_name)
         input_values: dict[str, Any] = {}
         schema = getattr(first_tool, "input_schema", lambda: {})()
@@ -618,14 +650,14 @@ class Planner:
         if isinstance(output_schema, dict) and output_schema.get("required"):
             success_criteria = {"required_fields": list(output_schema["required"])}
         learned_note = ""
-        if selected_name != available_names[0] or learned_strategies:
+        if selected_name != selection_names[0] or learned_strategies:
             learned_note = f" Learned guidance considered: selected {selected_name}."
         return TaskPlan(
             goal=goal,
             steps=[
                 PlanStep(
                     id=str(uuid.uuid4()),
-                    objective="Execute the first registered safe tool as a compatibility fallback",
+                    objective="Execute the first registered permitted tool as a compatibility fallback",
                     tool=selected_name,
                     input=input_values,
                     reason=(
@@ -642,6 +674,138 @@ class Planner:
                 + learned_note
             ),
         )
+
+
+def _planning_advisory_context(
+    strategies: list[dict[str, Any]],
+    *,
+    goal: str,
+    tools: ToolRegistry,
+    threshold: float,
+    learning_memory: SQLiteLearningMemory | None,
+) -> list[dict[str, Any]]:
+    """Canonicalize persisted recovery and owner-review guidance for advisory context only."""
+    if learning_memory is None:
+        return []
+    context = {
+        "goal": goal,
+        "task_type": "general",
+        "tools": [metadata["name"] for metadata in tools.available()],
+    }
+    canonical: dict[str, dict[str, Any]] = {}
+    for untrusted_strategy in strategies:
+        if not isinstance(untrusted_strategy, dict):
+            continue
+        stored = learning_memory.get_for_planning(untrusted_strategy.get("strategy_id"), context)
+        if stored is None:
+            continue
+        strategy = stored.to_dict()
+        metadata = strategy.get("metadata")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("source_patterns") not in (
+                ["successful_recovery_alternative"],
+                ["bugbounty_review_feedback"],
+            )
+        ):
+            continue
+        try:
+            confidence = float(strategy.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if (
+            strategy.get("status") != "active"
+            or not math.isfinite(confidence)
+            or confidence < threshold
+        ):
+            continue
+        canonical[strategy["strategy_id"]] = strategy
+    return [canonical[key] for key in sorted(canonical)]
+
+
+def _planning_eligible_learned_strategies(
+    strategies: list[dict[str, Any]],
+    *,
+    goal: str,
+    tools: ToolRegistry,
+    permissions: dict[str, str] | None,
+    threshold: float,
+    learning_memory: SQLiteLearningMemory | None,
+) -> list[dict[str, Any]]:
+    if learning_memory is None:
+        return []
+    available_names = {metadata["name"] for metadata in tools.available()}
+    permitted_names = {
+        name for name in available_names
+        if permissions is None or permissions.get(name) == getattr(tools.get(name), "permission_level", None)
+    }
+    goal_tokens = {token.lower() for token in re.findall(r"\w+", goal) if len(token) > 2}
+    eligible: list[dict[str, Any]] = []
+    for untrusted_strategy in strategies:
+        if not isinstance(untrusted_strategy, dict):
+            continue
+        strategy_id = untrusted_strategy.get("strategy_id")
+        strategy_context = {
+            "goal": goal,
+            "task_type": "general",
+            "tools": sorted(available_names),
+        }
+        canonical = learning_memory.get_for_planning(strategy_id, strategy_context)
+        if canonical is None:
+            continue
+        strategy = canonical.to_dict()
+        try:
+            confidence = float(strategy.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            continue
+        condition = strategy.get("condition")
+        preferred = strategy.get("preferred_action")
+        avoided = strategy.get("avoided_action")
+        metadata = strategy.get("metadata")
+        support_ids = strategy.get("supporting_experience_ids")
+        if not all(isinstance(item, dict) for item in (condition, preferred, avoided, metadata)):
+            continue
+        if (
+            strategy.get("status") != "active"
+            or not math.isfinite(confidence)
+            or confidence < threshold
+            or preferred.get("type") != "prefer_tool"
+            or avoided.get("type") != "avoid_unchanged_retry"
+            or metadata.get("source_patterns") != ["successful_recovery_alternative"]
+            or metadata.get("positive_guidance") is not True
+            or metadata.get("conflicting_experience_ids") != []
+            or not isinstance(support_ids, list)
+            or len(support_ids) < 2
+            or any(not isinstance(item, str) or not item for item in support_ids)
+            or len(set(support_ids)) != len(support_ids)
+            or metadata.get("evidence_count") != len(support_ids)
+        ):
+            continue
+        condition_goal = condition.get("goal")
+        if not isinstance(condition_goal, str):
+            continue
+        condition_tokens = {token.lower() for token in re.findall(r"\w+", condition_goal) if len(token) > 2}
+        if len(goal_tokens.intersection(condition_tokens)) < 2:
+            continue
+        failed_tool = condition.get("failed_tool")
+        alternative_tool = condition.get("alternative_tool")
+        condition_tools = condition.get("tools")
+        preferred_tool = preferred.get("tool")
+        if (
+            not isinstance(failed_tool, str)
+            or not failed_tool
+            or not isinstance(alternative_tool, str)
+            or not alternative_tool
+            or failed_tool == alternative_tool
+            or preferred_tool != alternative_tool
+            or avoided.get("tool") != failed_tool
+            or not isinstance(condition_tools, list)
+            or not {failed_tool, alternative_tool}.issubset(set(condition_tools))
+            or preferred_tool not in permitted_names
+        ):
+            continue
+        eligible.append(strategy)
+    return eligible
 
 
 def _learned_preferred_tool(strategies: list[dict[str, Any]], available_names: list[str], threshold: float) -> str:
