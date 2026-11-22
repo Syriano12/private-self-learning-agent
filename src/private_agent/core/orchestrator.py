@@ -600,6 +600,7 @@ class Orchestrator:
         diagnoses: list[dict[str, Any]] = []
         rounds = 0
         terminal_status = "FAILED"
+        verified_previous_results: dict[str, StepResult] = {}
 
         self.store.save_event(task_id, "plan_created", {"goal": goal, "steps": [step.__dict__ for step in current_plan.steps]})
         max_rounds = 1 + self.recovery.max_recovery_attempts + MAX_CONVERSATION_REPLANS
@@ -622,6 +623,7 @@ class Orchestrator:
                 break
             execution_context = ExecutionContext(
                 task_id=task_id,
+                previous_results=dict(verified_previous_results),
                 approved_permissions=set(self.approved_permissions),
                 metadata={"attempt": rounds, "goal": current_plan.goal},
                 security_controller=self.security,
@@ -715,6 +717,7 @@ class Orchestrator:
 
                 if outcome.verification_status == "VERIFIED" and outcome.execution_status == "success":
                     step.status = "completed"
+                    verified_previous_results[step.id] = step_result
                     state.mark_action(
                         key,
                         status="VERIFIED",
