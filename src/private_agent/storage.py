@@ -10,7 +10,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from private_agent.core.knowledge import (
     KnowledgeAttestation,
@@ -2956,6 +2956,36 @@ class Store:
                 "claim": saved_claim.to_dict(),
                 "evidence": [item.to_dict() for item in saved_evidence],
             }
+
+    def issue_attested_knowledge_bundle(
+        self,
+        source: KnowledgeSource,
+        claim: KnowledgeClaim,
+        evidence: list[KnowledgeEvidence],
+        *,
+        issuer_authorizer: Callable[
+            [KnowledgeSource, KnowledgeClaim, list[KnowledgeEvidence]], str | None
+        ],
+        verified_at: str | None = None,
+        attestation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue and persist a bundle using a server-supplied issuer decision.
+
+        The callback must derive its identity from authenticated server context
+        and validate the associated persisted review; it must not accept a
+        reviewer identity supplied by an API caller.
+        """
+        if self._knowledge_attestor is None:
+            raise KnowledgeValidationError("knowledge_attestation_key_missing")
+        issuer = self._knowledge_attestor.with_issuer_authorizer(issuer_authorizer)
+        attestation = issuer.issue(
+            source,
+            claim,
+            evidence,
+            verified_at=verified_at,
+            attestation_id=attestation_id,
+        )
+        return self.save_attested_knowledge_bundle(source, claim, evidence, attestation)
 
     def save_attested_knowledge_bundle(
         self,
