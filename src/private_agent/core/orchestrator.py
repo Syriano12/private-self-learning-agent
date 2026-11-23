@@ -156,16 +156,20 @@ class Orchestrator:
         diagnoses: list[dict[str, Any]],
         experience: ExperienceRecord,
         approval_ids: dict[str, str] | None = None,
+        always: bool = False,
     ) -> dict[str, Any] | None:
-        if self.security is None or not step.input_bindings:
+        if self.security is None or (not step.input_bindings and not always):
             return None
         try:
             tool = self.tools.get(step.tool)
         except KeyError:
             return None
-        resolved_input, binding_error = self.executor._resolve_input_bindings(step, tool, context)
-        if binding_error is not None:
-            return None
+        if step.input_bindings:
+            resolved_input, binding_error = self.executor._resolve_input_bindings(step, tool, context)
+            if binding_error is not None:
+                return None
+        else:
+            resolved_input = dict(step.input)
         action = self.security.action_for_tool(
             state.task_id,
             step.id,
@@ -518,12 +522,12 @@ class Orchestrator:
         self._save_checkpoint(state, "TASK_PLANNING")
         # Legacy knowledge rows are advisory and have no source-bound trust
         # record. Only signed, fresh typed claims may enter planning context.
-        prior = self.store.search_knowledge_claims(goal)
-        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal))
+        prior = self.store.search_knowledge_claims(goal, task_id=task_id)
+        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal, task_id=task_id))
         retrieved_payload = [item.to_dict() for item in retrieved]
         reflection_context = [
             insight.to_dict()
-            for insight in self.reflection_memory.list_relevant({"goal": goal}, limit=5)
+            for insight in self.reflection_memory.list_relevant({"goal": goal, "task_id": task_id}, limit=5)
         ]
         learned_context = [
             strategy.to_dict()
@@ -532,6 +536,7 @@ class Orchestrator:
                     "goal": goal,
                     "task_type": "bug_bounty" if state.context.get("task_kind") == "bug_bounty" else "general",
                     "tools": [metadata["name"] for metadata in self.tools.available()],
+                    "task_id": task_id,
                 },
                 limit=5,
             )
@@ -594,7 +599,9 @@ class Orchestrator:
                     rationale="Specialized Bug Bounty route; normal plan validation and execution authorization remain authoritative",
                 )
             else:
-                initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
+                initial_plan = self._create_plan(
+                    goal, prior, retrieved_payload, reflection_context, learned_context, task_id=task_id,
+                )
         except CapabilityUnavailableError as exc:
             registered_names = [str(metadata["name"]) for metadata in self.tools.available()]
             registered_set = set(registered_names)
@@ -750,6 +757,7 @@ class Orchestrator:
                     diagnoses=diagnoses,
                     experience=experience,
                     approval_ids=approval_ids,
+                    always=rounds > 1,
                 )
                 if approval_block is not None:
                     return approval_block
@@ -1741,6 +1749,7 @@ class Orchestrator:
                         diagnoses=diagnoses,
                         experience=experience,
                         approval_ids=state.approval_ids,
+                        always=True,
                     )
                     if approval_block is not None:
                         return approval_block
@@ -2240,6 +2249,7 @@ class Orchestrator:
         retrieved: list[dict[str, Any]],
         reflection_insights: list[dict[str, Any]],
         learned_strategies: list[dict[str, Any]],
+        task_id: str = "",
     ) -> TaskPlan:
         parameters = inspect.signature(self.planner.create).parameters
         kwargs: dict[str, Any] = {}
@@ -2251,6 +2261,8 @@ class Orchestrator:
             kwargs["reflection_insights"] = reflection_insights
         if "learned_strategies" in parameters:
             kwargs["learned_strategies"] = learned_strategies
+        if "task_id" in parameters:
+            kwargs["task_id"] = task_id
         return self.planner.create(goal, self.tools, prior, **kwargs)
 
     def _observe_verify_diagnose(
@@ -2446,6 +2458,7 @@ class Orchestrator:
                     tools=[step.tool],
                     failure_type=diagnosis.failure_type,
                     recovery_strategy=decision.strategy,
+                    task_id=experience.task_id,
                 )
             )
         ]
@@ -2458,6 +2471,7 @@ class Orchestrator:
                     "tools": [step.tool],
                     "failure_types": [diagnosis.failure_type],
                     "recovery_strategies": [decision.strategy],
+                    "task_id": experience.task_id,
                 },
                 limit=5,
             )
@@ -2470,6 +2484,7 @@ class Orchestrator:
                     "task_type": "general",
                     "tools": [step.tool],
                     "failure_types": [diagnosis.failure_type],
+                    "task_id": experience.task_id,
                 },
                 limit=5,
             )

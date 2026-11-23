@@ -3593,9 +3593,12 @@ class Store:
         as_of: str | None = None,
         max_age_seconds: int = 30 * 24 * 60 * 60,
         include_unverified: bool = False,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(query, str) or not query.strip():
             raise KnowledgeValidationError("knowledge_query_required")
+        if task_id is not None and (not isinstance(task_id, str) or not task_id.strip()):
+            raise KnowledgeValidationError("knowledge_task_scope_invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
             raise KnowledgeValidationError("knowledge_query_limit_invalid")
         if not isinstance(max_age_seconds, int) or isinstance(max_age_seconds, bool) or max_age_seconds < 1 or max_age_seconds > 10 * 365 * 24 * 60 * 60:
@@ -3611,8 +3614,35 @@ class Store:
             open_conflicts[str(row["claim_id"])] = open_conflicts.get(str(row["claim_id"]), 0) + 1
             open_conflicts[str(row["conflicting_claim_id"])] = open_conflicts.get(str(row["conflicting_claim_id"]), 0) + 1
         results: list[dict[str, Any]] = []
+        current_owner_user_id = self.task_owner_user_id(task_id) if task_id is not None else None
         for row in rows:
             attestation = attested_claims.get(str(row["claim_id"]))
+            if task_id is not None and attestation is not None:
+                source_snapshot = attestation.source_snapshot
+                claim_snapshot = attestation.claim_snapshot
+                source_metadata = source_snapshot.get("metadata")
+                claim_metadata = claim_snapshot.get("metadata")
+                source_metadata = source_metadata if isinstance(source_metadata, dict) else {}
+                claim_metadata = claim_metadata if isinstance(claim_metadata, dict) else {}
+                bound_task_ids: set[str] = set()
+                for metadata in [source_metadata, claim_metadata, *(item.get("metadata", {}) for item in attestation.evidence_snapshots)]:
+                    if not isinstance(metadata, dict):
+                        continue
+                    bound_task_id = metadata.get("task_id")
+                    if isinstance(bound_task_id, str) and bound_task_id:
+                        bound_task_ids.add(bound_task_id)
+                owner_review_bound = bool(
+                    source_metadata.get("review_id")
+                    or claim_metadata.get("review_id")
+                    or str(source_snapshot.get("source_id", "")).startswith("source-review-")
+                    or str(source_snapshot.get("canonical_uri", "")).startswith("local://bug-bounty/reviews/")
+                )
+                if bound_task_ids or owner_review_bound:
+                    if len(bound_task_ids) != 1 or current_owner_user_id is None:
+                        continue
+                    bound_task_id = next(iter(bound_task_ids))
+                    if self.task_owner_user_id(bound_task_id) != current_owner_user_id:
+                        continue
             claim_snapshot = attestation.claim_snapshot if attestation is not None else None
             status = str(claim_snapshot["status"] if claim_snapshot is not None else "PROPOSED")
             verification_status = str(
@@ -3869,10 +3899,33 @@ class Store:
             row = self.db.execute("SELECT * FROM experiences WHERE task_id = ?", (task_id,)).fetchone()
         return dict(row) if row else None
 
-    def all_experiences(self) -> list[dict[str, Any]]:
+    def all_experiences(self, *, owner_user_id: str | None = None) -> list[dict[str, Any]]:
         with self._db_lock:
-            rows = self.db.execute("SELECT * FROM experiences ORDER BY created_at DESC").fetchall()
+            if owner_user_id is None:
+                rows = self.db.execute("SELECT * FROM experiences ORDER BY created_at DESC").fetchall()
+            elif not isinstance(owner_user_id, str) or not owner_user_id.strip():
+                return []
+            else:
+                rows = self.db.execute(
+                    """SELECT e.* FROM experiences AS e
+                       JOIN task_owners AS o ON o.task_id = e.task_id
+                       WHERE o.user_id = ?
+                       ORDER BY e.created_at DESC""",
+                    (owner_user_id,),
+                ).fetchall()
         return [dict(row) for row in rows]
+
+    def experience_task_ids_for_owner(self, owner_user_id: str) -> set[str]:
+        if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+            return set()
+        with self._db_lock:
+            rows = self.db.execute(
+                """SELECT e.task_id FROM experiences AS e
+                   JOIN task_owners AS o ON o.task_id = e.task_id
+                   WHERE o.user_id = ?""",
+                (owner_user_id,),
+            ).fetchall()
+        return {str(row["task_id"]) for row in rows}
 
     def save_reflection(self, insight: Any) -> None:
         payload = insight.to_dict() if hasattr(insight, "to_dict") else insight

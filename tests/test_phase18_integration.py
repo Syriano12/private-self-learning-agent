@@ -187,25 +187,39 @@ def test_vulnora_bug_bounty_task_uses_real_queue_worker_and_report(tmp_path: Pat
 def test_owner_finding_review_requires_evidence_gate_and_is_audited(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "finding-review.sqlite3"
     monkeypatch.setenv("AGENT_DB_PATH", str(db_path))
-    monkeypatch.setenv("AGENT_API_TOKEN", API_TOKEN)
     service = build_api_service(token=API_TOKEN)
+    owner_password = "phase18-finding-review-owner-password-123"
+    service.auth_manager.initialize_owner(service.auth_manager.owner_email, owner_password)
     worker = BackgroundWorker(service.orchestrator, worker_id="phase18-finding-review", poll_interval_seconds=0.01, idle_poll_interval_seconds=0.02)
     application = create_app(service=service, worker=worker)
 
     with TestClient(application, raise_server_exceptions=False) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"email": service.auth_manager.owner_email, "password": owner_password},
+        )
+        assert login.status_code == 200, login.text
+        csrf = str(client.cookies.get("vulnora_csrf"))
+
+        def owner_headers(key: str | None = None) -> dict[str, str]:
+            headers = {"X-CSRF-Token": csrf}
+            if key:
+                headers["Idempotency-Key"] = key
+            return headers
+
         created = client.post(
             "/api/v1/bug-bounty/tasks", json={"scope": _scope(), "fixture": "idor_horizontal"},
-            headers=auth_headers(key="phase18-finding-review"),
+            headers=owner_headers("phase18-finding-review"),
         )
         assert created.status_code == 201, created.text
         task_id = created.json()["task_id"]
-        assert _wait_for(lambda: client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=auth_headers()).json().get("status") in {"COMPLETED", "FAILED"})
-        body = client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=auth_headers()).json()
+        assert _wait_for(lambda: client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=owner_headers()).json().get("status") in {"COMPLETED", "FAILED"})
+        body = client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=owner_headers()).json()
         finding_id = body["run"]["findings"][0]["finding_id"]
         confirmed = client.post(
             f"/api/v1/bug-bounty/tasks/{task_id}/findings/{finding_id}/review",
             json={"decision": "CONFIRM", "note": "owner review of validated local fixture"},
-            headers=auth_headers(key="phase18-finding-review"),
+            headers=owner_headers("phase18-finding-review-review"),
         )
         assert confirmed.status_code == 200, confirmed.text
         assert confirmed.json()["evidence_validated"] is True
@@ -219,18 +233,18 @@ def test_owner_finding_review_requires_evidence_gate_and_is_audited(tmp_path: Pa
         assert learned[0].preferred_action["type"] == "require_evidence_review"
         assert learned[0].avoided_action["type"] == "auto_confirm_finding"
         assert learned[0].metadata["non_authoritative"] is True
-        reviews = client.get(f"/api/v1/bug-bounty/tasks/{task_id}/reviews", headers=auth_headers())
+        reviews = client.get(f"/api/v1/bug-bounty/tasks/{task_id}/reviews", headers=owner_headers())
         assert reviews.status_code == 200 and reviews.json()[0]["decision"] == "CONFIRM"
         assert any(event.get("event_type") == "BUGBOUNTY_FINDING_REVIEW" for event in service.store.all_audit_events(task_id=task_id))
 
         second = client.post(
             "/api/v1/bug-bounty/tasks", json={"scope": _scope(), "fixture": "idor_horizontal"},
-            headers=auth_headers(key="phase18-finding-review-second"),
+            headers=owner_headers("phase18-finding-review-second"),
         )
         assert second.status_code == 201, second.text
         second_task_id = second.json()["task_id"]
         assert _wait_for(
-            lambda: client.get(f"/api/v1/bug-bounty/tasks/{second_task_id}", headers=auth_headers()).json().get("status") in {"COMPLETED", "FAILED"}
+            lambda: client.get(f"/api/v1/bug-bounty/tasks/{second_task_id}", headers=owner_headers()).json().get("status") in {"COMPLETED", "FAILED"}
         )
         second_state = service.store.get_task_state(second_task_id)
         assert second_state is not None

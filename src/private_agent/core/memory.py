@@ -17,6 +17,7 @@ class ExperienceQuery:
     constraints: dict[str, Any] = field(default_factory=dict)
     failure_type: str = ""
     recovery_strategy: str = ""
+    task_id: str = ""
 
 
 @dataclass
@@ -32,6 +33,8 @@ class RetrievedExperience:
     why_relevant: list[str]
     identity: dict[str, Any]
     created_at: str = ""
+    failure_actions: list[dict[str, Any]] = field(default_factory=list)
+    recovery_transitions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return sanitize_value({
@@ -46,6 +49,8 @@ class RetrievedExperience:
             "why_relevant": self.why_relevant,
             "identity": self.identity,
             "created_at": self.created_at,
+            "failure_actions": self.failure_actions,
+            "recovery_transitions": self.recovery_transitions,
         })
 
 
@@ -82,7 +87,13 @@ class SQLiteExperienceMemory(ExperienceMemory):
         self.store_backend.save_experience(experience)
 
     def retrieve(self, query: ExperienceQuery) -> list[RetrievedExperience]:
-        rows = self.store_backend.all_experiences()
+        if query.task_id:
+            owner_user_id = self.store_backend.task_owner_user_id(query.task_id)
+            if not owner_user_id:
+                return []
+            rows = self.store_backend.all_experiences(owner_user_id=owner_user_id)
+        else:
+            rows = self.store_backend.all_experiences()
         scored: list[tuple[float, RetrievedExperience]] = []
         for row in rows:
             payload = self._decode_row(row)
@@ -161,6 +172,67 @@ class SQLiteExperienceMemory(ExperienceMemory):
         strategy_used = [str(action.get("tool_name")) for action in actions if action.get("tool_name")]
         recovery = [str(action.get("recovery", {}).get("strategy")) for action in actions if isinstance(action.get("recovery"), dict) and action.get("recovery", {}).get("strategy")]
         failures = [str(action.get("diagnosis", {}).get("failure_type")) for action in actions if isinstance(action.get("diagnosis"), dict) and action.get("diagnosis", {}).get("failure_type")]
+        failure_actions: list[dict[str, Any]] = []
+        recovery_transitions: list[dict[str, Any]] = []
+        for index, action in enumerate(actions):
+            tool_name = action.get("tool_name")
+            step_id = action.get("step_id")
+            diagnosis = action.get("diagnosis")
+            if not isinstance(tool_name, str) or not tool_name or not isinstance(step_id, str) or not step_id:
+                continue
+            failure_type = diagnosis.get("failure_type") if isinstance(diagnosis, dict) else None
+            if isinstance(failure_type, str) and failure_type:
+                failure_actions.append({
+                    "tool_name": tool_name,
+                    "step_id": step_id,
+                    "failure_type": failure_type,
+                })
+            recovery_decision = action.get("recovery")
+            if not isinstance(recovery_decision, dict) or recovery_decision.get("strategy") != "CHANGE_TOOL":
+                continue
+            alternative_tool = recovery_decision.get("replacement_tool")
+            if (
+                recovery_decision.get("original_tool") != tool_name
+                or recovery_decision.get("step_id") != step_id
+                or not isinstance(alternative_tool, str)
+                or not alternative_tool
+                or not isinstance(failure_type, str)
+                or not failure_type
+            ):
+                continue
+            alternative_action = next(
+                (
+                    later for later in actions[index + 1:]
+                    if later.get("step_id") == step_id and later.get("tool_name") == alternative_tool
+                ),
+                None,
+            )
+            alternative_verification = (
+                alternative_action.get("verification")
+                if isinstance(alternative_action, dict)
+                else None
+            )
+            alternative_evidence = (
+                alternative_verification.get("evidence")
+                if isinstance(alternative_verification, dict)
+                else None
+            )
+            recovery_transitions.append({
+                "failed_tool": tool_name,
+                "alternative_tool": alternative_tool,
+                "failure_type": failure_type,
+                "recovery_strategy": "CHANGE_TOOL",
+                "step_id": step_id,
+                "alternative_verified": bool(
+                    isinstance(alternative_action, dict)
+                    and alternative_action.get("execution_status") == "success"
+                    and isinstance(alternative_verification, dict)
+                    and alternative_verification.get("status") == "VERIFIED"
+                    and alternative_verification.get("verified") is True
+                    and isinstance(alternative_evidence, list)
+                    and any(isinstance(item, dict) for item in alternative_evidence)
+                ),
+            })
         evidence: list[dict[str, Any]] = []
         verified_action_tools: list[str] = []
         verified_final_action_tool = ""
@@ -206,6 +278,8 @@ class SQLiteExperienceMemory(ExperienceMemory):
             why_relevant=[],
             identity=identity,
             created_at=str(payload.get("created_at", "")),
+            failure_actions=failure_actions,
+            recovery_transitions=recovery_transitions,
         )
 
     @staticmethod

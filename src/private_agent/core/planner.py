@@ -131,6 +131,7 @@ class Planner:
         retrieved_experiences: list[dict[str, Any]] | None = None,
         reflection_insights: list[dict[str, Any]] | None = None,
         learned_strategies: list[dict[str, Any]] | None = None,
+        task_id: str = "",
     ) -> TaskPlan:
         if not goal.strip():
             raise PlanValidationError(["goal_required"])
@@ -140,6 +141,7 @@ class Planner:
             tools=tools,
             threshold=self.learned_strategy_threshold,
             learning_memory=self.learning_memory,
+            task_id=task_id,
         )
         planning_strategies = _planning_eligible_learned_strategies(
             planning_advisories,
@@ -148,6 +150,7 @@ class Planner:
             permissions=permissions,
             threshold=self.learned_strategy_threshold,
             learning_memory=self.learning_memory,
+            task_id=task_id,
         )
         if self.provider is not None:
             # An explicit repository bug report has a specialized, conservative
@@ -683,6 +686,7 @@ def _planning_advisory_context(
     tools: ToolRegistry,
     threshold: float,
     learning_memory: SQLiteLearningMemory | None,
+    task_id: str = "",
 ) -> list[dict[str, Any]]:
     """Canonicalize persisted recovery and owner-review guidance for advisory context only."""
     if learning_memory is None:
@@ -692,6 +696,8 @@ def _planning_advisory_context(
         "task_type": "general",
         "tools": [metadata["name"] for metadata in tools.available()],
     }
+    if task_id:
+        context["task_id"] = task_id
     canonical: dict[str, dict[str, Any]] = {}
     for untrusted_strategy in strategies:
         if not isinstance(untrusted_strategy, dict):
@@ -731,6 +737,7 @@ def _planning_eligible_learned_strategies(
     permissions: dict[str, str] | None,
     threshold: float,
     learning_memory: SQLiteLearningMemory | None,
+    task_id: str = "",
 ) -> list[dict[str, Any]]:
     if learning_memory is None:
         return []
@@ -750,6 +757,8 @@ def _planning_eligible_learned_strategies(
             "task_type": "general",
             "tools": sorted(available_names),
         }
+        if task_id:
+            strategy_context["task_id"] = task_id
         canonical = learning_memory.get_for_planning(strategy_id, strategy_context)
         if canonical is None:
             continue
