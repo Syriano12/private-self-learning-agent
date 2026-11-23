@@ -315,7 +315,7 @@ def test_planner_passes_canonical_persisted_strategy_to_provider_as_advisory_con
 
     provider = Provider()
     path = tmp_path / "provider-context.sqlite3"
-    store, tools, _, _, training_ids, learned = _train_two_verified_recovery_experiences(path)
+    store, tools, _, _, training_ids, learned = _train_verified_recovery_experiences(path)
     try:
         strategy = learned.to_dict()
         Planner(provider, learning_memory=SQLiteLearningMemory(store)).create(
@@ -514,22 +514,20 @@ def test_reflection_conflict_detection_covers_successful_original_and_failed_alt
     assert recovery.confidence < 0.70
 
 
-def _train_two_verified_recovery_experiences(path: Path):
+def _train_verified_recovery_experiences(path: Path, *, count: int = 2):
+    assert count >= 1
     tool_a = ControlledTool(
         "tool_a",
         [
-            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
-            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
-            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
-            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
+            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True)
+            for _ in range(count * 2)
         ],
     )
     tool_b = ControlledTool(
         "tool_b",
         [
-            ToolResult.success({"result": "verified alternative evidence"}),
-            ToolResult.success({"result": "verified independent alternative evidence"}),
-            ToolResult.success({"result": "verified future evidence"}),
+            ToolResult.success({"result": "verified alternative evidence"})
+            for _ in range(count + 1)
         ],
     )
     tools = registry(tool_a, tool_b)
@@ -546,7 +544,7 @@ def _train_two_verified_recovery_experiences(path: Path):
         )
         assert login.status_code == 200, login.text
         csrf = str(client.cookies.get("vulnora_csrf"))
-        for index in range(2):
+        for index in range(count):
             created = client.post(
                 "/api/v1/tasks",
                 json={"goal": "research topic alpha"},
@@ -569,6 +567,9 @@ def _train_two_verified_recovery_experiences(path: Path):
     retrieved = learning.retrieve_relevant(
         {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": task_ids[0]}
     )
+    if len(task_ids) < 2:
+        assert retrieved == []
+        return store, tools, tool_a, tool_b, task_ids, None
     assert len(retrieved) == 1
     assert set(retrieved[0].supporting_experience_ids) == set(task_ids)
     assert retrieved[0].status == "active"
@@ -584,11 +585,48 @@ def _first_planned_tool(store: Store, task_id: str) -> str:
     return plan_event["steps"][0]["tool"]
 
 
+def test_single_verified_experience_below_default_support_threshold_does_not_steer(tmp_path: Path) -> None:
+    store, tools, _, _, task_ids, learned = _train_verified_recovery_experiences(
+        tmp_path / "one-support.sqlite3", count=1
+    )
+    goal = "research topic alpha follow-up"
+    permissions = {"tool_a": "public_read", "tool_b": "public_read"}
+    try:
+        assert learned is None
+        assert store.all_learned_strategies() == []
+        saved = json.loads(store.get_experience(task_ids[0])["experience_json"])
+        assert saved["final_outcome"] == "COMPLETED"
+        assert saved["verification_status"] == "VERIFIED"
+        assert saved["identity"]["verification_status"] == "VERIFIED"
+        assert ReflectionEngine(SQLiteExperienceMemory(store)).min_supporting_experiences == 2
+
+        baseline = Planner().create(goal, tools, [], permissions=permissions)
+        with_memory = Planner(learning_memory=SQLiteLearningMemory(store)).create(
+            goal,
+            tools,
+            [],
+            permissions=permissions,
+            learned_strategies=[],
+            task_id=task_ids[0],
+        )
+        assert baseline.steps[0].tool == "tool_a"
+        assert with_memory.steps[0].tool == baseline.steps[0].tool
+    finally:
+        store.close()
+
+
 def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(tmp_path: Path) -> None:
     path = tmp_path / "agent.sqlite3"
-    store, tools, tool_a, tool_b, training_ids, learned = _train_two_verified_recovery_experiences(path)
+    store, tools, tool_a, tool_b, training_ids, learned = _train_verified_recovery_experiences(path)
     assert _first_planned_tool(store, training_ids[0]) == "tool_a"
     assert _first_planned_tool(store, training_ids[1]) == "tool_a"
+    goal = "research topic alpha follow-up"
+    permissions = {"tool_a": "public_read", "tool_b": "public_read"}
+    baseline = Planner().create(goal, tools, [], permissions=permissions)
+    assert baseline.steps[0].tool == "tool_a"
+    assert learned.confidence == 0.81
+    assert learned.confidence >= Planner().learned_strategy_threshold == 0.70
+    assert len(learned.supporting_experience_ids) == 2
     strategy_id = learned.strategy_id
     store.close()
 
@@ -598,10 +636,19 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
         restored = memory.get(strategy_id)
         assert restored is not None
         assert restored.to_dict() == learned.to_dict()
+        assert ReflectionEngine(SQLiteExperienceMemory(reopened)).min_supporting_experiences == 2
         retrieved = memory.retrieve_relevant(
-            {"goal": "research topic alpha follow-up", "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": training_ids[0]}
+            {"goal": goal, "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": training_ids[0]}
         )
         assert [item.strategy_id for item in retrieved] == [strategy_id]
+        assert set(restored.supporting_experience_ids) == set(training_ids)
+        for support_id in training_ids:
+            payload = json.loads(reopened.get_experience(support_id)["experience_json"])
+            assert payload["final_outcome"] == "COMPLETED"
+            assert payload["verification_status"] == "VERIFIED"
+            assert payload["identity"]["verification_status"] == "VERIFIED"
+            assert payload["actions"][-1]["verification"]["status"] == "VERIFIED"
+            assert payload["actions"][-1]["verification"]["verified"] is True
 
         future_agent = Orchestrator(reopened, tools, planner=Planner(), max_attempts=2)
         future_service = AgentAPIService(future_agent, token=None)
@@ -614,7 +661,7 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
             csrf = str(client.cookies.get("vulnora_csrf"))
             created = client.post(
                 "/api/v1/tasks",
-                json={"goal": "research topic alpha follow-up"},
+                json={"goal": goal},
                 headers={"X-CSRF-Token": csrf, "Idempotency-Key": "phase7-learning-future"},
             )
             assert created.status_code == 201, created.text
@@ -626,7 +673,17 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
             future = future_state["result"]
         assert future["learned_strategies_used"]
         assert future["learned_strategies_used"][0]["strategy_id"] == strategy_id
-        assert future["step_results"][0]["tool_name"] == "tool_b"
+        assert len(future["step_results"]) == 1
+        executed_step = future["step_results"][0]
+        assert executed_step["tool_name"] == "tool_b"
+        assert executed_step["status"] == "success"
+        assert tools.get("tool_b") is tool_b
+        assert tool_b.permission_level == "public_read"
+        authorization = future_state["security_decisions"][executed_step["step_id"]]
+        assert authorization["action_id"] == executed_step["step_id"]
+        assert authorization["task_id"] == future_task_id
+        assert authorization["tool_or_skill"] == executed_step["tool_name"]
+        assert authorization["decision"] == "ALLOW"
         assert future["verification"]["status"] == "VERIFIED"
         assert future["verification"]["verified"] is True
         assert future["final_status"] == "COMPLETED"
@@ -638,7 +695,7 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
 
 
 def test_trusted_retrieved_strategy_only_guides_compatible_permitted_fallback(tmp_path: Path) -> None:
-    store, _, _, _, training_ids, learned = _train_two_verified_recovery_experiences(
+    store, _, _, _, training_ids, learned = _train_verified_recovery_experiences(
         tmp_path / "trusted-fallback.sqlite3"
     )
     try:
@@ -702,10 +759,10 @@ def test_trusted_retrieved_strategy_only_guides_compatible_permitted_fallback(tm
 
 @pytest.mark.parametrize(
     "invalid_support",
-    ["missing", "unverified", "stale", "conflicted", "malformed_failure_types", "malformed_tools"],
+    ["missing", "unverified", "mismatched", "stale", "conflicted", "malformed_failure_types", "malformed_tools"],
 )
 def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invalid_support: str) -> None:
-    store, tools, _, _, training_ids, strategy = _train_two_verified_recovery_experiences(
+    store, tools, _, _, training_ids, strategy = _train_verified_recovery_experiences(
         tmp_path / f"{invalid_support}.sqlite3"
     )
     memory = SQLiteLearningMemory(store)
@@ -716,13 +773,15 @@ def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invali
         support_id = strategy.supporting_experience_ids[0]
         with store.db:
             store.db.execute("DELETE FROM experiences WHERE task_id = ?", (support_id,))
-    elif invalid_support in {"unverified", "stale"}:
+    elif invalid_support in {"unverified", "mismatched", "stale"}:
         support_id = strategy.supporting_experience_ids[0]
         row = store.get_experience(support_id)
         payload = json.loads(row["experience_json"])
         if invalid_support == "unverified":
             payload["actions"][-1]["verification"]["status"] = "FAILED"
             payload["actions"][-1]["verification"]["verified"] = False
+        elif invalid_support == "mismatched":
+            payload["identity"]["verification_status"] = "FAILED"
         else:
             payload["created_at"] = "2000-01-01T00:00:00+00:00"
         with store.db:
@@ -766,7 +825,7 @@ def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invali
 
 
 def test_inadequate_similarity_unavailable_or_forbidden_tool_cannot_change_plan(tmp_path: Path) -> None:
-    store, tools, tool_a, tool_b, training_ids, strategy = _train_two_verified_recovery_experiences(
+    store, tools, tool_a, tool_b, training_ids, strategy = _train_verified_recovery_experiences(
         tmp_path / "eligibility.sqlite3"
     )
     memory = SQLiteLearningMemory(store)
