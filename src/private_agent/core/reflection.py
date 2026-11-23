@@ -206,10 +206,19 @@ class ReflectionEngine:
 
     def _analyze(self, candidates: list[RetrievedExperience], query: ExperienceQuery) -> list[ReflectionInsight]:
         insights: list[ReflectionInsight] = []
-        insights.extend(self._recovery_patterns(candidates, query))
-        insights.extend(self._repeated_failure_patterns(candidates, query))
-        insights.extend(self._verification_patterns(candidates, query))
-        insights.extend(self._input_patterns(candidates, query))
+        evidence_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.outcome).upper() != "EXECUTION_UNKNOWN"
+            and (
+                not isinstance(candidate.identity, dict)
+                or str(candidate.identity.get("verification_status", "")).upper() != "EXECUTION_UNKNOWN"
+            )
+        ]
+        insights.extend(self._recovery_patterns(evidence_candidates, query))
+        insights.extend(self._repeated_failure_patterns(evidence_candidates, query))
+        insights.extend(self._verification_patterns(evidence_candidates, query))
+        insights.extend(self._input_patterns(evidence_candidates, query))
         unique = {insight.insight_id: insight for insight in insights}
         return sorted(unique.values(), key=lambda item: (-item.confidence, item.pattern, item.insight_id))
 

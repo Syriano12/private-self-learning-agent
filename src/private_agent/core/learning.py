@@ -146,7 +146,7 @@ class SQLiteLearningMemory(LearningMemory):
 
     def _owner_scope(self, context: dict[str, Any]) -> tuple[bool, str | None]:
         if "task_id" not in context:
-            return False, None
+            return True, None
         task_id = context.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             return True, None

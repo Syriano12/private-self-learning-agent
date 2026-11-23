@@ -18,7 +18,6 @@ from private_agent.core.learning import (
 from private_agent.core.memory import SQLiteExperienceMemory
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import PlanValidationError, Planner
-from private_agent.core.task_state import TaskState
 from private_agent.core.reflection import (
     ReflectionEngine,
     ReflectionInsight,
@@ -316,11 +315,11 @@ def test_planner_passes_canonical_persisted_strategy_to_provider_as_advisory_con
 
     provider = Provider()
     path = tmp_path / "provider-context.sqlite3"
-    store, tools, _, _, _, learned = _train_two_verified_recovery_experiences(path)
+    store, tools, _, _, training_ids, learned = _train_two_verified_recovery_experiences(path)
     try:
         strategy = learned.to_dict()
         Planner(provider, learning_memory=SQLiteLearningMemory(store)).create(
-            "research topic Y", tools, [], learned_strategies=[strategy]
+            "research topic Y", tools, [], learned_strategies=[strategy], task_id=training_ids[0]
         )
         assert provider.context["learned_strategies"] == [strategy]
     finally:
@@ -352,11 +351,15 @@ def test_owner_review_strategy_is_canonical_provider_context_but_not_fallback_to
 
     store = Store(tmp_path / "owner-review-learning.sqlite3")
     memory = SQLiteLearningMemory(store)
-    store.save_task_state(TaskState.create("task-owner-review", "Bug Bounty finding review IDOR"), "TEST_OWNER_REVIEW")
+    auth = AuthManager(store)
+    owner = auth.initialize_owner(auth.owner_email, OWNER_PASSWORD)
+    store.create_queued_task(
+        "Bug Bounty finding review IDOR", task_id="task-owner-review", owner_user_id=owner.user_id
+    )
     review = FindingReview.create(
         "task-owner-review",
         "finding-id",
-        "owner-id",
+        owner.user_id,
         "CONFIRM",
         evidence_sha256="a" * 64,
         evidence_validated=True,
@@ -427,11 +430,11 @@ def test_owner_review_strategy_is_canonical_provider_context_but_not_fallback_to
     try:
         provider = Provider()
         Planner(provider, learning_memory=memory).create(
-            goal, tools, [], permissions=permissions, learned_strategies=[strategy]
+            goal, tools, [], permissions=permissions, learned_strategies=[strategy], task_id="task-owner-review"
         )
         assert provider.context["learned_strategies"] == [strategy]
         fallback = Planner(learning_memory=memory).create(
-            goal, tools, [], permissions=permissions, learned_strategies=[strategy]
+            goal, tools, [], permissions=permissions, learned_strategies=[strategy], task_id="task-owner-review"
         )
         assert fallback.steps[0].tool == "tool_a"
     finally:
@@ -564,7 +567,7 @@ def _train_two_verified_recovery_experiences(path: Path):
             task_ids.append(task_id)
     learning = SQLiteLearningMemory(store)
     retrieved = learning.retrieve_relevant(
-        {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"]}
+        {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": task_ids[0]}
     )
     assert len(retrieved) == 1
     assert set(retrieved[0].supporting_experience_ids) == set(task_ids)
@@ -596,7 +599,7 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
         assert restored is not None
         assert restored.to_dict() == learned.to_dict()
         retrieved = memory.retrieve_relevant(
-            {"goal": "research topic alpha follow-up", "task_type": "general", "tools": ["tool_a", "tool_b"]}
+            {"goal": "research topic alpha follow-up", "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": training_ids[0]}
         )
         assert [item.strategy_id for item in retrieved] == [strategy_id]
 
@@ -639,11 +642,11 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
     ["missing", "unverified", "stale", "conflicted", "malformed_failure_types", "malformed_tools"],
 )
 def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invalid_support: str) -> None:
-    store, tools, _, _, _, strategy = _train_two_verified_recovery_experiences(
+    store, tools, _, _, training_ids, strategy = _train_two_verified_recovery_experiences(
         tmp_path / f"{invalid_support}.sqlite3"
     )
     memory = SQLiteLearningMemory(store)
-    query = {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"]}
+    query = {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": training_ids[0]}
     assert memory.retrieve_relevant(query)
 
     if invalid_support == "missing":
@@ -700,7 +703,7 @@ def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invali
 
 
 def test_inadequate_similarity_unavailable_or_forbidden_tool_cannot_change_plan(tmp_path: Path) -> None:
-    store, tools, tool_a, tool_b, _, strategy = _train_two_verified_recovery_experiences(
+    store, tools, tool_a, tool_b, training_ids, strategy = _train_two_verified_recovery_experiences(
         tmp_path / "eligibility.sqlite3"
     )
     memory = SQLiteLearningMemory(store)
@@ -708,6 +711,7 @@ def test_inadequate_similarity_unavailable_or_forbidden_tool_cannot_change_plan(
         "goal": "research topic alpha follow-up",
         "task_type": "general",
         "tools": ["tool_a", "tool_b"],
+        "task_id": training_ids[0],
     }
     valid_strategy = [item.to_dict() for item in memory.retrieve_relevant(similar_query)]
     assert valid_strategy
@@ -725,6 +729,7 @@ def test_inadequate_similarity_unavailable_or_forbidden_tool_cannot_change_plan(
         [],
         permissions={"tool_a": "public_read"},
         learned_strategies=valid_strategy,
+        task_id=training_ids[0],
     )
     assert unavailable_plan.steps[0].tool == "tool_a"
 
@@ -735,6 +740,7 @@ def test_inadequate_similarity_unavailable_or_forbidden_tool_cannot_change_plan(
         [],
         permissions={"tool_a": "public_read"},
         learned_strategies=valid_strategy,
+        task_id=training_ids[0],
     )
     assert forbidden_plan.steps[0].tool == "tool_a"
     assert tool_b.calls == 2, "planning must not execute a tool"
