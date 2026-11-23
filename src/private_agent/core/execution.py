@@ -12,6 +12,69 @@ from private_agent.tools.contracts import ToolError, ToolResult, contract_errors
 from private_agent.tools.research import ToolRegistry
 
 
+_SUPPORTED_SCHEMA_TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
+_SUPPORTED_SCHEMA_KEYWORDS = frozenset({
+    "type", "required", "properties", "items", "additionalProperties", "minimum", "maximum",
+    "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly",
+    "$comment", "$schema", "$id",
+})
+
+
+def _is_supported_schema_shape(schema: Any, *, depth: int = 0) -> bool:
+    """Reject malformed or unsupported schema structures before validating bound data."""
+    if depth > 32 or not isinstance(schema, dict):
+        return False
+    try:
+        if any(not isinstance(keyword, str) or keyword not in _SUPPORTED_SCHEMA_KEYWORDS for keyword in schema):
+            return False
+        if "type" in schema:
+            schema_type = schema["type"]
+            if not isinstance(schema_type, str) or schema_type not in _SUPPORTED_SCHEMA_TYPES:
+                return False
+        else:
+            schema_type = None
+        if any(keyword in schema for keyword in ("required", "properties", "additionalProperties")) and schema_type not in {None, "object"}:
+            return False
+        if "items" in schema and schema_type not in {None, "array"}:
+            return False
+        if any(keyword in schema for keyword in ("minimum", "maximum")) and schema_type not in {None, "integer", "number"}:
+            return False
+        required = schema.get("required", [])
+        if not isinstance(required, list) or any(not isinstance(name, str) or not name for name in required):
+            return False
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return False
+        if any(
+            not isinstance(name, str)
+            or not name
+            or not _is_supported_schema_shape(property_schema, depth=depth + 1)
+            for name, property_schema in properties.items()
+        ):
+            return False
+        if "items" in schema and not _is_supported_schema_shape(schema["items"], depth=depth + 1):
+            return False
+        if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
+            return False
+        for bound in ("minimum", "maximum"):
+            if bound in schema:
+                value = schema[bound]
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return False
+        if "minimum" in schema and "maximum" in schema and schema["minimum"] > schema["maximum"]:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+_SCHEMA_UNSET = object()
+
+
+class _ExecutionOutcomeUnknown(RuntimeError):
+    """Signal that a tool operation began but its returned value could not be validated."""
+
+
 @dataclass
 class ExecutionContext:
     task_id: str = ""
@@ -238,6 +301,15 @@ class GenericExecutor:
                 f"Tool is not registered: {step.tool}",
                 metadata=self._timed(base_metadata, started),
             ))
+        except Exception:
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "tool_registry_unavailable",
+                "Tool registry could not resolve the requested tool",
+                details={"step_id": step.id},
+                metadata=self._timed(base_metadata, started),
+            ))
 
         contract_problems = contract_errors(tool)
         if contract_problems:
@@ -261,7 +333,53 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
-        resolved_input, binding_error = self._resolve_input_bindings(step, tool, execution_context)
+        try:
+            tool_input_schema = tool.input_schema()
+        except Exception:
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "tool_input_schema_invalid",
+                "Tool input schema could not be read before execution",
+                details={"step_id": step.id},
+                metadata=self._timed(base_metadata, started),
+            ))
+        if not _is_supported_schema_shape(tool_input_schema):
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "tool_input_schema_invalid",
+                "Tool input schema is malformed or unsupported",
+                details={"step_id": step.id},
+                metadata=self._timed(base_metadata, started),
+            ))
+        try:
+            tool_output_schema = tool.output_schema()
+        except Exception:
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "tool_output_schema_invalid",
+                "Tool output schema could not be read before execution",
+                details={"step_id": step.id},
+                metadata=self._timed(base_metadata, started),
+            ))
+        if not _is_supported_schema_shape(tool_output_schema):
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "tool_output_schema_invalid",
+                "Tool output schema is malformed or unsupported",
+                details={"step_id": step.id},
+                metadata=self._timed(base_metadata, started),
+            ))
+
+        resolved_input, binding_error = self._resolve_input_bindings(
+            step,
+            tool,
+            execution_context,
+            target_input_schema=tool_input_schema,
+        )
         if binding_error is not None:
             return finish(StepResult.blocked(
                 step.id,
@@ -318,7 +436,17 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
-        input_errors = validate_schema_value(resolved_input, tool.input_schema(), path="input")
+        try:
+            input_errors = validate_schema_value(resolved_input, tool_input_schema, path="input")
+        except Exception:
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "tool_input_schema_invalid",
+                "Tool input could not be validated before execution",
+                details={"step_id": step.id},
+                metadata=self._timed(base_metadata, started),
+            ))
         if input_errors:
             return finish(StepResult.failed(
                 step.id,
@@ -329,14 +457,25 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
+        output_validation_errors: list[str] | None = None
+        output_validation_exception: str | None = None
+
         def validate_tool_result(value: Any) -> tuple[bool, dict[str, Any]]:
+            nonlocal output_validation_errors, output_validation_exception
             if not isinstance(value, ToolResult) or value.status not in {"success", "failed", "blocked"}:
                 return False, {"error": "malformed_tool_result"}
             if value.status == "success":
-                output_errors = validate_schema_value(value.output, tool.output_schema(), path="output")
-                if output_errors:
-                    return False, {"error": "malformed_tool_result", "details": output_errors}
-            return value.status == "success", {"tool_status": value.status}
+                try:
+                    output_validation_errors = validate_schema_value(value.output, tool_output_schema, path="output")
+                except Exception as exc:
+                    output_validation_exception = type(exc).__name__
+                    return False, {"error": "result_validation_exception", "exception_type": output_validation_exception}
+                if output_validation_errors:
+                    return False, {"error": "malformed_tool_result", "details": output_validation_errors}
+            return value.status == "success", {
+                "tool_status": value.status,
+                "no_side_effects": value.no_side_effects,
+            }
 
         operation_binding = None
         trusted_execute = getattr(tool, "_execute_trusted", None)
@@ -379,36 +518,24 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
         if execution.exception is not None:
-            return finish(StepResult.failed(
-                step.id,
-                step.tool,
-                "tool_exception",
-                f"Tool execution failed: {type(execution.exception).__name__}",
-                details={"exception_type": type(execution.exception).__name__},
-                metadata=self._timed(base_metadata, started),
-            ))
+            # The operation callback may have produced an external effect before raising.
+            # Without trusted evidence that it did not, the worker must not retry it.
+            raise _ExecutionOutcomeUnknown("Tool operation raised after execution may have started")
+        if output_validation_exception is not None:
+            # The operation already returned through the authorization boundary.
+            # Let the worker persist EXECUTION_UNKNOWN rather than retrying as a normal failure.
+            raise _ExecutionOutcomeUnknown("Tool result validation failed after execution may have started")
 
         tool_result = execution.result
         if not isinstance(tool_result, ToolResult) or tool_result.status not in {"success", "failed", "blocked"}:
-            return finish(StepResult.failed(
-                step.id,
-                step.tool,
-                "malformed_tool_result",
-                "Tool did not return a valid ToolResult",
-                metadata=self._timed(base_metadata, started),
-            ))
+            raise _ExecutionOutcomeUnknown("Tool returned an unvalidated result after execution may have started")
 
         if tool_result.status == "success":
-            output_errors = validate_schema_value(tool_result.output, tool.output_schema(), path="output")
+            if output_validation_errors is None:
+                raise _ExecutionOutcomeUnknown("Tool result was not validated after execution may have started")
+            output_errors = output_validation_errors
             if output_errors:
-                return finish(StepResult.failed(
-                    step.id,
-                    step.tool,
-                    "malformed_tool_result",
-                    "Successful tool output failed its output schema",
-                    details={"errors": output_errors},
-                    metadata=self._timed(base_metadata, started),
-                ))
+                raise _ExecutionOutcomeUnknown("Tool output did not satisfy its declared schema after execution may have started")
             return finish(StepResult.success(
                 step.id,
                 step.tool,
@@ -416,6 +543,10 @@ class GenericExecutor:
                 metadata={**tool_result.metadata, **self._timed(base_metadata, started)},
             ))
 
+        if tool_result.no_side_effects is not True:
+            # A failed/blocked return without the explicit no-effect assertion does
+            # not prove that no partial side effect occurred.
+            raise _ExecutionOutcomeUnknown("Tool reported an unsuccessful result after execution may have started")
         return finish(StepResult(
             step_id=step.id,
             tool_name=step.tool,
@@ -431,6 +562,8 @@ class GenericExecutor:
         step: PlanStep,
         tool: Any,
         context: ExecutionContext,
+        *,
+        target_input_schema: Any = _SCHEMA_UNSET,
     ) -> tuple[dict[str, Any], tuple[str, dict[str, Any]] | None]:
         if not isinstance(step.input, dict):
             return {}, ("input_binding_input_invalid", {"step_id": step.id})
@@ -440,10 +573,17 @@ class GenericExecutor:
             return resolved, ("input_bindings_invalid", {"step_id": step.id})
         if not bindings:
             return resolved, None
-        target_input_schema = tool.input_schema()
-        if not isinstance(target_input_schema, dict):
+        if target_input_schema is _SCHEMA_UNSET:
+            try:
+                target_input_schema = tool.input_schema()
+            except Exception:
+                return resolved, ("input_binding_target_schema_invalid", {"step_id": step.id})
+        try:
+            if not _is_supported_schema_shape(target_input_schema):
+                return resolved, ("input_binding_target_schema_invalid", {"step_id": step.id})
+            target_properties = target_input_schema.get("properties", {})
+        except Exception:
             return resolved, ("input_binding_target_schema_invalid", {"step_id": step.id})
-        target_properties = target_input_schema.get("properties", {})
         if not isinstance(target_properties, dict):
             return resolved, ("input_binding_target_schema_invalid", {"step_id": step.id})
         for target, binding in bindings.items():
@@ -471,15 +611,23 @@ class GenericExecutor:
                 return resolved, ("input_binding_source_untrusted", {"step_id": step.id, "source_step_id": source_id})
             try:
                 source_tool = self.tools.get(source_result.tool_name)
-                source_schema = source_tool.output_schema()
-            except (KeyError, AttributeError, TypeError):
+            except Exception:
                 return resolved, ("input_binding_source_tool_unavailable", {"step_id": step.id, "source_step_id": source_id})
-            source_properties = source_schema.get("properties", {}) if isinstance(source_schema, dict) else {}
-            source_required = source_schema.get("required", []) if isinstance(source_schema, dict) else []
+            try:
+                source_schema = source_tool.output_schema()
+                if not _is_supported_schema_shape(source_schema):
+                    return resolved, ("input_binding_source_schema_invalid", {"step_id": step.id, "source_step_id": source_id})
+                source_properties = source_schema.get("properties", {})
+                source_required = source_schema.get("required", [])
+            except Exception:
+                return resolved, ("input_binding_source_schema_invalid", {"step_id": step.id, "source_step_id": source_id})
             if not isinstance(output_key, str) or not output_key or not isinstance(source_properties, dict) or not isinstance(source_required, list):
                 return resolved, ("input_binding_output_unavailable", {"step_id": step.id, "source_step_id": source_id})
-            target_schema = target_properties.get(target)
-            source_field_schema = source_properties.get(output_key)
+            try:
+                target_schema = target_properties.get(target)
+                source_field_schema = source_properties.get(output_key)
+            except Exception:
+                return resolved, ("input_binding_source_schema_invalid", {"step_id": step.id, "source_step_id": source_id})
             if (
                 output_key not in source_result.output
                 or output_key not in source_required
@@ -487,10 +635,18 @@ class GenericExecutor:
                 or not isinstance(target_schema, dict)
             ):
                 return resolved, ("input_binding_output_unavailable", {"step_id": step.id, "source_step_id": source_id, "output_key": output_key})
-            if validate_schema_value(source_result.output, source_schema, path=f"output.{source_id}"):
+            try:
+                source_output_errors = validate_schema_value(source_result.output, source_schema, path=f"output.{source_id}")
+            except Exception:
+                return resolved, ("input_binding_source_schema_invalid", {"step_id": step.id, "source_step_id": source_id})
+            if source_output_errors:
                 return resolved, ("input_binding_source_output_invalid", {"step_id": step.id, "source_step_id": source_id})
             value = source_result.output[output_key]
-            if validate_schema_value(value, target_schema, path=f"input.{target}"):
+            try:
+                target_value_errors = validate_schema_value(value, target_schema, path=f"input.{target}")
+            except Exception:
+                return resolved, ("input_binding_target_schema_invalid", {"step_id": step.id})
+            if target_value_errors:
                 return resolved, ("input_binding_value_invalid", {"step_id": step.id, "source_step_id": source_id, "target": target})
             resolved[target] = value
         return resolved, None

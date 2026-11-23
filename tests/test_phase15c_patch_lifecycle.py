@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from private_agent.core.execution import ExecutionContext, GenericExecutor
+from private_agent.core.execution import ExecutionContext, GenericExecutor, _ExecutionOutcomeUnknown
 from private_agent.core.planner import PlanStep, TaskPlan
 from private_agent.core.task_state import TaskState
 from private_agent.security import SecurityController
@@ -92,6 +92,33 @@ def test_prepare_validates_patch_and_preserves_source(patch_repository: Path, tm
     assert result.output["changed_files"] == ["src/demo/service.py"]
     assert hashlib.sha256((patch_repository / "src/demo/service.py").read_bytes()).hexdigest() == before
     assert not (patch_repository / "EXECUTED_BY_PATCH_TOOL").exists()
+
+
+def test_prepare_cleanup_failure_is_execution_unknown(patch_repository: Path, tmp_path: Path, monkeypatch):
+    workspace_root = tmp_path / "agent-workspaces"
+    registry, _ = make_registry(patch_repository, workspace_root)
+    manager = registry.get("prepare_repository_patch").manager
+
+    def fail_after_partial_metadata_write(path, payload):
+        path.write_text("{", encoding="utf-8")
+        raise OSError("injected metadata write failure")
+
+    def fail_cleanup(path):
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(patching, "_safe_json_write", fail_after_partial_metadata_write)
+    monkeypatch.setattr(manager, "_remove_tree", fail_cleanup)
+    with pytest.raises(_ExecutionOutcomeUnknown):
+        run_tool(
+            GenericExecutor(registry, SecurityController()),
+            "prepare",
+            "prepare_repository_patch",
+            prepare_inputs(patch_repository),
+        )
+
+    sessions = list(workspace_root.iterdir())
+    assert len(sessions) == 1
+    assert (sessions[0] / "metadata.json").read_text(encoding="utf-8") == "{"
 
 
 def test_prepare_links_patch_to_current_phase15b_evidence(patch_repository: Path, tmp_path: Path):
@@ -421,6 +448,172 @@ def test_rollback_refuses_concurrent_workspace_change_and_never_touches_source(p
     assert rollback.error.code == "rollback_conflict"
     assert "token=request.token" in (patch_repository / "src/demo/service.py").read_text(encoding="utf-8")
     store.close()
+
+
+def test_partial_rollback_failure_is_execution_unknown(patch_repository: Path, tmp_path: Path, monkeypatch):
+    first_source = patch_repository / "alpha.py"
+    second_source = patch_repository / "beta.py"
+    first_source.write_text("def first():\n    return 1\n", encoding="utf-8")
+    second_source.write_text("def second():\n    return 2\n", encoding="utf-8")
+    diff = (
+        "--- a/alpha.py\n"
+        "+++ b/alpha.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def first():\n"
+        "-    return 1\n"
+        "+    return 10\n"
+        "--- a/beta.py\n"
+        "+++ b/beta.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def second():\n"
+        "-    return 2\n"
+        "+    return 20\n"
+    )
+    registry, _ = make_registry(patch_repository, tmp_path / "agent-workspaces")
+    store = Store(str(tmp_path / "partial-rollback.sqlite3"))
+    controller = SecurityController(store=store)
+    executor = GenericExecutor(registry, controller)
+    prepared = run_tool(
+        executor,
+        "prepare",
+        "prepare_repository_patch",
+        prepare_inputs(patch_repository, permitted_files=["alpha.py", "beta.py"], patch=diff),
+    )
+    patch_id = prepared.output["patch_id"]
+    first_apply = run_tool(
+        executor,
+        "apply",
+        "apply_repository_patch",
+        {"patch_id": patch_id},
+        approved_permissions={"public_read", "isolated_write"},
+        task_id="partial-rollback-task",
+        metadata={"goal": "Apply patch"},
+    )
+    apply_approval = store.all_approval_requests()[0]["approval_id"]
+    controller.approval_gate.approve(apply_approval, actor="owner")
+    applied = run_tool(
+        executor,
+        "apply",
+        "apply_repository_patch",
+        {"patch_id": patch_id},
+        approved_permissions={"public_read", "isolated_write"},
+        task_id="partial-rollback-task",
+        metadata={"goal": "Apply patch"},
+        approval_ids={"apply": apply_approval},
+    )
+    assert first_apply.status == "blocked"
+    assert applied.status == "success"
+
+    first_rollback = run_tool(
+        executor,
+        "rollback",
+        "rollback_repository_patch",
+        {"patch_id": patch_id},
+        approved_permissions={"public_read", "isolated_write"},
+        task_id="partial-rollback-task",
+        metadata={"goal": "Rollback patch"},
+    )
+    rollback_approval = store.all_approval_requests()[-1]["approval_id"]
+    controller.approval_gate.approve(rollback_approval, actor="owner")
+    workspace = tmp_path / "agent-workspaces" / patch_id / "workspace"
+
+    original_safe_write = patching._safe_write
+    write_count = 0
+
+    def fail_on_second_rollback_write(*args, **kwargs):
+        nonlocal write_count
+        write_count += 1
+        if write_count == 2:
+            raise OSError("injected failure after one rollback write")
+        return original_safe_write(*args, **kwargs)
+
+    monkeypatch.setattr(patching, "_safe_write", fail_on_second_rollback_write)
+    try:
+        with pytest.raises(_ExecutionOutcomeUnknown):
+            run_tool(
+                executor,
+                "rollback",
+                "rollback_repository_patch",
+                {"patch_id": patch_id},
+                approved_permissions={"public_read", "isolated_write"},
+                task_id="partial-rollback-task",
+                metadata={"goal": "Rollback patch"},
+                approval_ids={"rollback": rollback_approval},
+            )
+    finally:
+        store.close()
+
+    assert first_rollback.status == "blocked"
+    assert {workspace.joinpath("alpha.py").read_text(), workspace.joinpath("beta.py").read_text()} == {
+        "def first():\n    return 1\n",
+        "def second():\n    return 20\n",
+    }
+    assert first_source.read_text(encoding="utf-8") == "def first():\n    return 1\n"
+    assert second_source.read_text(encoding="utf-8") == "def second():\n    return 2\n"
+
+
+def test_partial_apply_cleanup_failure_is_execution_unknown(patch_repository: Path, tmp_path: Path, monkeypatch):
+    registry, _ = make_registry(patch_repository, tmp_path / "agent-workspaces")
+    store = Store(str(tmp_path / "partial-apply.sqlite3"))
+    controller = SecurityController(store=store)
+    executor = GenericExecutor(registry, controller)
+    prepared = run_tool(executor, "prepare", "prepare_repository_patch", prepare_inputs(patch_repository))
+    patch_id = prepared.output["patch_id"]
+    first_apply = run_tool(
+        executor,
+        "apply",
+        "apply_repository_patch",
+        {"patch_id": patch_id},
+        approved_permissions={"public_read", "isolated_write"},
+        task_id="partial-apply-task",
+        metadata={"goal": "Apply patch"},
+    )
+    apply_approval = store.all_approval_requests()[0]["approval_id"]
+    controller.approval_gate.approve(apply_approval, actor="owner")
+    manager = registry.get("apply_repository_patch").manager
+    original_safe_write = patching._safe_write
+    write_count = 0
+
+    def fail_on_second_apply_write(*args, **kwargs):
+        nonlocal write_count
+        write_count += 1
+        if write_count == 2:
+            raise OSError("injected failure after partial workspace write")
+        return original_safe_write(*args, **kwargs)
+
+    def fail_cleanup(path):
+        raise OSError("injected workspace cleanup failure")
+
+    monkeypatch.setattr(patching, "_safe_write", fail_on_second_apply_write)
+    monkeypatch.setattr(manager, "_remove_tree", fail_cleanup)
+    workspace = tmp_path / "agent-workspaces" / patch_id / "workspace"
+    try:
+        with pytest.raises(_ExecutionOutcomeUnknown):
+            run_tool(
+                executor,
+                "apply",
+                "apply_repository_patch",
+                {"patch_id": patch_id},
+                approved_permissions={"public_read", "isolated_write"},
+                task_id="partial-apply-task",
+                metadata={"goal": "Apply patch"},
+                approval_ids={"apply": apply_approval},
+            )
+    finally:
+        store.close()
+
+    assert first_apply.status == "blocked"
+    assert workspace.is_dir()
+    assert (workspace / "src/demo/service.py").read_text(encoding="utf-8") == (
+        "from pathlib import Path\n"
+        "\n"
+        "def validate_token(access_token):\n"
+        "    return bool(access_token)\n"
+        "\n"
+        "def login(request):\n"
+        "    Path('EXECUTED_BY_PATCH_TOOL').write_text('must never appear')\n"
+        "    return validate_token(token=request.token)\n"
+    )
 
 
 def test_rollback_restores_an_existing_empty_file(patch_repository: Path, tmp_path: Path):

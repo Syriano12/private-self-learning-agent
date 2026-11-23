@@ -70,6 +70,7 @@ class _ScannerToolBase:
             "scanner_sandbox_unavailable",
             "External sandbox execution is unavailable; scanner execution is quarantined",
             details={"status": ScanStatus.UNAVAILABLE.value},
+            no_side_effects=True,
         )
 
     @staticmethod
@@ -78,6 +79,7 @@ class _ScannerToolBase:
             "scanner_sandbox_executor_unavailable",
             "A runtime proof without a bound external executor cannot authorize host subprocess execution",
             details={"status": ScanStatus.UNAVAILABLE.value},
+            no_side_effects=True,
         )
 
 

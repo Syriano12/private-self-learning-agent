@@ -53,7 +53,7 @@ class SecurityTool:
     def execute(self, inputs: dict, context: ExecutionContext) -> ToolResult:
         self.calls += 1
         if self.failure:
-            return ToolResult.failed(self.failure, "controlled failure")
+            return ToolResult.failed(self.failure, "controlled failure", no_side_effects=True)
         return ToolResult.success({"result": self.name})
 
 

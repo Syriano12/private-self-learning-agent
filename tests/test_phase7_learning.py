@@ -134,7 +134,7 @@ class ControlledTool:
         self.calls += 1
         if self.outcomes:
             return self.outcomes.pop(0)
-        return ToolResult.failed("tool_failed", "no configured outcome")
+        return ToolResult.failed("tool_failed", "no configured outcome", no_side_effects=True)
 
 
 def registry(*tools: ControlledTool) -> ToolRegistry:
@@ -518,10 +518,10 @@ def _train_two_verified_recovery_experiences(path: Path):
     tool_a = ControlledTool(
         "tool_a",
         [
-            ToolResult.failed("network_error", "temporary network failure"),
-            ToolResult.failed("network_error", "temporary network failure"),
-            ToolResult.failed("network_error", "temporary network failure"),
-            ToolResult.failed("network_error", "temporary network failure"),
+            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
+            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
+            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
+            ToolResult.failed("network_error", "temporary network failure", no_side_effects=True),
         ],
     )
     tool_b = ControlledTool(

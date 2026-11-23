@@ -341,3 +341,258 @@ def test_planner_rejects_input_bindings_that_do_not_match_tool_contracts() -> No
 
     with pytest.raises(PlanValidationError, match="input_binding_source_output_unavailable"):
         Planner().validate(invalid_plan, goal=invalid_plan["goal"], tools=tools)
+
+
+def _direct_binding_case(source: BindingTool, consumer: BindingTool | None = None):
+    consumer = consumer or BindingTool("consumer")
+    tools = make_registry(source, consumer)
+    security = SecurityController()
+    step = PlanStep(
+        id="consumer-step",
+        objective="consume only a verified declared output",
+        tool="consumer",
+        input={},
+        reason="direct schema failure regression",
+        depends_on=["source-step"],
+        input_bindings={"derived_value": {"source_step_id": "source-step", "output_key": "derived_value"}},
+    )
+    context = ExecutionContext(
+        previous_results={
+            "source-step": StepResult.success("source-step", "source", {"derived_value": "VERIFIED"})
+        },
+        security_controller=security,
+        verified_result_ids={"source-step"},
+    )
+    return GenericExecutor(tools, security), step, context, tools, consumer
+
+
+def test_source_registry_lookup_exception_blocks_binding_without_calling_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, step, context, tools, consumer = _direct_binding_case(BindingTool("source"))
+    original_get = tools.get
+
+    def raising_get(name: str) -> Any:
+        if name == "source":
+            raise RuntimeError("private registry diagnostic")
+        return original_get(name)
+
+    monkeypatch.setattr(tools, "get", raising_get)
+
+    result = executor.execute_step(step, context)
+
+    assert result.status == "blocked"
+    assert result.output is None
+    assert result.error is not None and result.error.code == "input_binding_source_tool_unavailable"
+    assert result.error.details == {"step_id": "consumer-step", "source_step_id": "source-step"}
+    assert "private registry diagnostic" not in result.error.message
+    assert consumer.calls == []
+
+
+def test_consumer_registry_lookup_exception_blocks_step_without_calling_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, step, context, tools, consumer = _direct_binding_case(BindingTool("source"))
+    original_get = tools.get
+
+    def raising_get(name: str) -> Any:
+        if name == "consumer":
+            raise RuntimeError("private consumer registry diagnostic")
+        return original_get(name)
+
+    monkeypatch.setattr(tools, "get", raising_get)
+
+    result = executor.execute_step(step, context)
+
+    assert result.status == "blocked"
+    assert result.output is None
+    assert result.error is not None and result.error.code == "tool_registry_unavailable"
+    assert result.error.details == {"step_id": "consumer-step"}
+    assert "private consumer registry diagnostic" not in result.error.message
+    assert consumer.calls == []
+
+
+def test_source_output_schema_exception_blocks_binding_without_calling_consumer() -> None:
+    class RaisingOutputSchemaTool(BindingTool):
+        def output_schema(self) -> dict[str, Any]:
+            raise RuntimeError("private schema diagnostic")
+
+    executor, step, context, _, consumer = _direct_binding_case(RaisingOutputSchemaTool("source"))
+
+    result = executor.execute_step(step, context)
+
+    assert result.status == "blocked"
+    assert result.output is None
+    assert result.error is not None and result.error.code == "input_binding_source_schema_invalid"
+    assert result.error.details == {"step_id": "consumer-step", "source_step_id": "source-step"}
+    assert "private schema diagnostic" not in result.error.message
+    assert consumer.calls == []
+
+
+def test_consumer_input_schema_exception_blocks_unbound_step_before_calling_tool() -> None:
+    class RaisingInputSchemaTool(BindingTool):
+        def input_schema(self) -> dict[str, Any]:
+            raise RuntimeError("private input schema diagnostic")
+
+    executor, step, context, _, consumer = _direct_binding_case(
+        BindingTool("source"), RaisingInputSchemaTool("consumer")
+    )
+    step.input = {"derived_value": "explicit"}
+    step.input_bindings = {}
+    step.depends_on = []
+    context.previous_results = {}
+    context.verified_result_ids = set()
+
+    result = executor.execute_step(step, context)
+
+    assert result.status == "blocked"
+    assert result.error is not None and result.error.code == "tool_input_schema_invalid"
+    assert result.output is None
+    assert "private input schema diagnostic" not in result.error.message
+    assert consumer.calls == []
+
+
+def test_consumer_output_schema_exception_blocks_before_calling_tool() -> None:
+    class RaisingOutputSchemaTool(BindingTool):
+        def output_schema(self) -> dict[str, Any]:
+            raise RuntimeError("private consumer output schema diagnostic")
+
+    executor, step, context, _, consumer = _direct_binding_case(
+        BindingTool("source"), RaisingOutputSchemaTool("consumer")
+    )
+
+    result = executor.execute_step(step, context)
+
+    assert result.status == "blocked"
+    assert result.error is not None and result.error.code == "tool_output_schema_invalid"
+    assert result.output is None
+    assert "private consumer output schema diagnostic" not in result.error.message
+    assert consumer.calls == []
+
+
+def test_consumer_output_schema_is_cached_before_execution() -> None:
+    class OutputSchemaChangesAfterFirstReadTool(BindingTool):
+        def __init__(self) -> None:
+            super().__init__("consumer")
+            self.schema_reads = 0
+
+        def output_schema(self) -> dict[str, Any]:
+            self.schema_reads += 1
+            if self.schema_reads > 1:
+                raise RuntimeError("schema changed after operation")
+            return super().output_schema()
+
+    consumer = OutputSchemaChangesAfterFirstReadTool()
+    executor, step, context, _, _ = _direct_binding_case(BindingTool("source"), consumer)
+
+    result = executor.execute_step(step, context)
+
+    assert result.status == "success"
+    assert result.output == {"result": "consumed:VERIFIED"}
+    assert consumer.schema_reads == 1
+    assert consumer.calls == [{"derived_value": "VERIFIED"}]
+
+
+@pytest.mark.parametrize(
+    "result_mode",
+    [
+        "validation_exception",
+        "schema_mismatch",
+        "malformed_tool_result",
+        "operation_exception",
+        "tool_failed",
+        "tool_blocked",
+    ],
+)
+def test_unverifiable_tool_result_after_call_remains_execution_unknown(tmp_path: Path, result_mode: str) -> None:
+    class ExplodingMembershipDict(dict[str, Any]):
+        def __contains__(self, key: object) -> bool:
+            raise RuntimeError("synthetic result schema validation diagnostic")
+
+    class UnverifiableResultTool(BindingTool):
+        def execute(self, inputs: dict[str, Any], context: ExecutionContext) -> Any:
+            self.calls.append(dict(inputs))
+            if result_mode == "operation_exception":
+                raise RuntimeError("synthetic tool exception after operation start")
+            if result_mode == "tool_failed":
+                return ToolResult.failed("synthetic_tool_failure", "synthetic unsuccessful result")
+            if result_mode == "tool_blocked":
+                return ToolResult.blocked("synthetic_tool_block", "synthetic blocked result")
+            if result_mode == "validation_exception":
+                return ToolResult.success(ExplodingMembershipDict({"derived_value": "synthetic"}))
+            if result_mode == "schema_mismatch":
+                return ToolResult.success({"unexpected": "synthetic"})
+            return {"derived_value": "synthetic"}
+
+    client, orchestrator, store, tools, _ = make_api_task(tmp_path)
+    created = client.post(
+        "/api/v1/tasks",
+        json={"goal": "produce and consume a verified local derived_value"},
+        headers={"Authorization": f"Bearer {API_TOKEN}", "Idempotency-Key": f"binding-unknown-{result_mode}"},
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["task_id"]
+    source = UnverifiableResultTool("source")
+    tools._tools["source"] = source
+    worker = BackgroundWorker(orchestrator, worker_id="binding-unknown-worker")
+
+    result = worker.run_once()
+
+    assert result["status"] == "EXECUTION_UNKNOWN", result
+    assert result["error_code"] == "execution_unknown"
+    assert source.calls == [{"seed": "fixture"}]
+    assert tools.get("consumer").calls == []
+    state = store.get_task_state(task_id)
+    assert state is not None and state["status"] == "EXECUTION_UNKNOWN"
+    assert state["stop_reason"]["code"] == "EXECUTION_UNKNOWN"
+    assert store.task_queue_record(task_id)["queue_status"] == "EXECUTION_UNKNOWN"
+    assert worker.run_once()["status"] == "NO_TASK"
+    assert source.calls == [{"seed": "fixture"}]
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "malformed_schema",
+    [
+        None,
+        {
+            "type": "object",
+            "properties": {"derived_value": {"type": "unsupported-schema-type"}},
+            "required": ["derived_value"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {"derived_value": {"type": "string"}},
+            "required": ["derived_value"],
+            "additionalProperties": False,
+            "items": {"type": "string"},
+        },
+        {
+            "type": "object",
+            "properties": {"derived_value": {"type": "string", "minimum": 1}},
+            "required": ["derived_value"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {"derived_value": {"type": "string", "pattern": "^VERIFIED$"}},
+            "required": ["derived_value"],
+            "additionalProperties": False,
+        },
+    ],
+)
+def test_malformed_source_output_schema_blocks_binding_without_calling_consumer(malformed_schema: Any) -> None:
+    class MalformedOutputSchemaTool(BindingTool):
+        def output_schema(self) -> Any:
+            return malformed_schema
+
+    executor, step, context, _, consumer = _direct_binding_case(MalformedOutputSchemaTool("source"))
+
+    result = executor.execute_step(step, context)
+
+    assert result.status == "blocked"
+    assert result.output is None
+    assert result.error is not None and result.error.code == "input_binding_source_schema_invalid"
+    assert result.error.details == {"step_id": "consumer-step", "source_step_id": "source-step"}
+    assert consumer.calls == []
