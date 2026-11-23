@@ -287,13 +287,125 @@ def _check_rootless_helpers(which: Callable[[str], str | None]) -> HostPreflight
     return HostPreflightCheck("rootless_helpers", HostPreflightStatus.PASS, "rootless_helpers_present", {"network_helpers": network})
 
 
-def _check_cgroups(read: Callable[[str], str]) -> HostPreflightCheck:
-    controllers = set(read("/sys/fs/cgroup/cgroup.controllers").split())
+def _check_cgroups(
+    read: Callable[[str], str],
+    access: Callable[..., bool] | None = None,
+) -> HostPreflightCheck:
     required = {"cpu", "memory", "pids"}
+    membership = read("/proc/self/cgroup")
+    memberships = [line[3:] for line in membership.splitlines() if line.startswith("0::")]
+    if len(memberships) != 1:
+        return HostPreflightCheck(
+            "cgroups",
+            HostPreflightStatus.INCONCLUSIVE,
+            "cgroup_membership_unverified",
+        )
+    cgroup_path = memberships[0]
+    path_parts = cgroup_path[1:].split("/") if cgroup_path.startswith("/") and cgroup_path != "/" else []
+    if (
+        not cgroup_path
+        or not cgroup_path.startswith("/")
+        or cgroup_path.startswith("//")
+        or any(part in {"", ".", ".."} for part in path_parts)
+        or len(cgroup_path) > 2048
+    ):
+        return HostPreflightCheck(
+            "cgroups",
+            HostPreflightStatus.INCONCLUSIVE,
+            "cgroup_membership_unverified",
+        )
+
+    cgroup2_mount_roots: list[str] = []
+    for line in read("/proc/self/mountinfo").splitlines():
+        before, separator, after = line.partition(" - ")
+        if not separator:
+            continue
+        mount_fields = before.split()
+        filesystem_fields = after.split()
+        if (
+            len(mount_fields) >= 5
+            and len(filesystem_fields) >= 3
+            and filesystem_fields[0] == "cgroup2"
+            and mount_fields[4] == "/sys/fs/cgroup"
+        ):
+            cgroup2_mount_roots.append(mount_fields[3])
+    if cgroup2_mount_roots != ["/"]:
+        return HostPreflightCheck(
+            "cgroups",
+            HostPreflightStatus.INCONCLUSIVE,
+            "cgroup_v2_mount_mapping_unverified",
+            {"matching_mount_count": len(cgroup2_mount_roots)},
+        )
+
+    scope = Path("/sys/fs/cgroup").joinpath(*path_parts)
+    controllers = set(read(str(scope / "cgroup.controllers")).split())
+    if not controllers:
+        return HostPreflightCheck(
+            "cgroups",
+            HostPreflightStatus.INCONCLUSIVE,
+            "cgroup_controllers_unreadable",
+            {"membership_detected": True},
+        )
+
     missing = sorted(required - controllers)
+    enabled_text = read(str(scope / "cgroup.subtree_control"))
+    enabled = {item.lstrip("+") for item in enabled_text.split() if not item.startswith("-")}
+    missing_enabled = sorted(required - enabled)
+    check_access = access or os.access
+    try:
+        scope_writable = check_access(str(scope), os.W_OK, effective_ids=True)
+        subtree_control_writable = check_access(
+            str(scope / "cgroup.subtree_control"), os.W_OK, effective_ids=True
+        )
+    except (OSError, TypeError, ValueError, NotImplementedError):
+        return HostPreflightCheck(
+            "cgroups",
+            HostPreflightStatus.INCONCLUSIVE,
+            "cgroup_delegation_unverified",
+            {"available_controllers": sorted(controllers), "missing_enabled_controllers": missing_enabled},
+        )
+
     if missing:
-        return HostPreflightCheck("cgroups", HostPreflightStatus.FAIL, "resource_controllers_missing", {"missing": missing})
-    return HostPreflightCheck("cgroups", HostPreflightStatus.PASS, "resource_controllers_available", {"controllers": sorted(controllers)})
+        return HostPreflightCheck(
+            "cgroups",
+            HostPreflightStatus.INCONCLUSIVE,
+            "resource_controllers_unverified_in_current_cgroup",
+            {
+                "available_controllers": sorted(controllers),
+                "missing_controllers": missing,
+                "missing_enabled_controllers": missing_enabled,
+                "scope_writable": bool(scope_writable),
+                "subtree_control_writable": bool(subtree_control_writable),
+            },
+        )
+
+    if not scope_writable or (missing_enabled and not subtree_control_writable):
+        return HostPreflightCheck(
+            "cgroups",
+            HostPreflightStatus.INCONCLUSIVE,
+            "cgroup_delegation_unverified",
+            {
+                "available_controllers": sorted(controllers),
+                "missing_enabled_controllers": missing_enabled,
+            "scope_writable": bool(scope_writable),
+            "subtree_control_writable": bool(subtree_control_writable),
+        },
+    )
+
+    # Read-only controller/permission checks do not prove that a runtime can
+    # create and manage delegated child cgroups or enforce resource limits.
+    return HostPreflightCheck(
+        "cgroups",
+        HostPreflightStatus.INCONCLUSIVE,
+        "cgroup_runtime_enforcement_unverified",
+        {
+            "available_controllers": sorted(controllers),
+            "missing_enabled_controllers": missing_enabled,
+            "scope_writable": bool(scope_writable),
+            "subtree_control_writable": bool(subtree_control_writable),
+            "runtime_enforcement_verified": False,
+        },
+    )
 
 
 def _check_seccomp(read: Callable[[str], str]) -> HostPreflightCheck:

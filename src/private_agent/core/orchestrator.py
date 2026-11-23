@@ -87,6 +87,8 @@ class Orchestrator:
         self.reflection_memory = reflection_memory or SQLiteReflectionMemory(store)
         self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
         self.learning_memory = learning_memory or SQLiteLearningMemory(store)
+        if isinstance(self.planner, Planner):
+            self.planner.set_learning_memory(self.learning_memory)
         self.learning_engine = learning_engine or LearningEngine(self.learning_memory)
         self.checkpoint_hook = checkpoint_hook
         self.observability = observability or ObservabilityMonitor(store)
@@ -137,6 +139,101 @@ class Orchestrator:
             TaskStopReasonCode.APPROVAL_REQUIRED if pending else TaskStopReasonCode.POLICY_BLOCKED,
             step_id=step_id,
             action_id=selected.action_id,
+        )
+
+    def _preflight_bound_step(
+        self,
+        state: TaskState,
+        step: PlanStep,
+        context: ExecutionContext,
+        *,
+        plan: TaskPlan,
+        prior: list[dict[str, Any]],
+        learned_context: list[dict[str, Any]],
+        attempts: int,
+        step_results: list[StepResult],
+        outcomes: list[StepOutcome],
+        diagnoses: list[dict[str, Any]],
+        experience: ExperienceRecord,
+        approval_ids: dict[str, str] | None = None,
+        always: bool = False,
+    ) -> dict[str, Any] | None:
+        if self.security is None or (not step.input_bindings and not always):
+            return None
+        try:
+            tool = self.tools.get(step.tool)
+        except KeyError:
+            return None
+        if step.input_bindings:
+            resolved_input, binding_error = self.executor._resolve_input_bindings(step, tool, context)
+            if binding_error is not None:
+                return None
+        else:
+            resolved_input = dict(step.input)
+        action = self.security.action_for_tool(
+            state.task_id,
+            step.id,
+            tool,
+            resolved_input,
+            goal=str(plan.goal),
+        )
+        supplied_approval_ids = approval_ids or {}
+        approval_id = (
+            supplied_approval_ids.get(step.id)
+            or state.approval_ids.get(step.id)
+            or supplied_approval_ids.get(step.tool)
+            or state.approval_ids.get(step.tool, "")
+        )
+        decision = self.security.preflight(action, approval_id=approval_id)
+        state.security_decisions[decision.action_id] = decision.to_dict()
+        if decision.approval_id:
+            state.approval_ids[decision.action_id] = decision.approval_id
+        self.store.save_event(
+            state.task_id,
+            "security_bound_action_preflight",
+            {"decision": decision.to_dict()},
+            step_id=step.id,
+        )
+        if decision.allowed:
+            return None
+
+        waiting = decision.decision == "REQUIRE_APPROVAL"
+        state.recovery_state = {
+            "reason": "approval_required" if waiting else "policy_blocked",
+            "decisions": [decision.to_dict()],
+        }
+        state.result = {"final_status": "BLOCKED"}
+        key = state.action_key_for_step(step)
+        # Authorization is pending, but no execution has started. Preserve the
+        # durable action as NOT_STARTED so resume validation cannot mistake a
+        # policy stop for a malformed execution record.
+        record = state.action_record(key)
+        record["step_id"] = step.id
+        record["approval_id"] = decision.approval_id
+        state.touch()
+        checkpoint = "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED"
+        state.checkpoint(
+            checkpoint,
+            status="WAITING_APPROVAL" if waiting else "BLOCKED",
+            phase="WAITING_APPROVAL" if waiting else "SECURITY_BLOCKED",
+            step_id=step.id,
+            successful=False,
+        )
+        self._set_policy_stop_reason(state, [decision])
+        self._save_checkpoint(state, checkpoint)
+        return self._security_blocked_result(
+            state.task_id,
+            state.goal,
+            plan,
+            prior,
+            learned_context,
+            [decision],
+            state=state,
+            attempts=attempts,
+            step_results=step_results,
+            outcomes=outcomes,
+            diagnoses=diagnoses,
+            experience=experience,
         )
 
     def _verified_outcomes_for_plan(self, state: TaskState, plan: TaskPlan) -> dict[str, StepOutcome]:
@@ -272,7 +369,7 @@ class Orchestrator:
             def equivalent(left: PlanStep, right: PlanStep) -> bool:
                 return all(
                     getattr(left, name) == getattr(right, name)
-                    for name in ("id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria")
+                    for name in ("id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "input_bindings")
                 )
 
             for index, step in enumerate(proposed.steps, start=1):
@@ -301,6 +398,13 @@ class Orchestrator:
                         success_criteria=dict(step.success_criteria),
                         status="pending",
                         output={},
+                        input_bindings={
+                            target: {
+                                **binding,
+                                "source_step_id": candidate_to_id.get(binding["source_step_id"], binding["source_step_id"]),
+                            }
+                            for target, binding in step.input_bindings.items()
+                        },
                     )
                 )
             merged_steps = [step for step, _, _ in previous_completed] + new_steps
@@ -418,12 +522,12 @@ class Orchestrator:
         self._save_checkpoint(state, "TASK_PLANNING")
         # Legacy knowledge rows are advisory and have no source-bound trust
         # record. Only signed, fresh typed claims may enter planning context.
-        prior = self.store.search_knowledge_claims(goal)
-        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal))
+        prior = self.store.search_knowledge_claims(goal, task_id=task_id)
+        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal, task_id=task_id))
         retrieved_payload = [item.to_dict() for item in retrieved]
         reflection_context = [
             insight.to_dict()
-            for insight in self.reflection_memory.list_relevant({"goal": goal}, limit=5)
+            for insight in self.reflection_memory.list_relevant({"goal": goal, "task_id": task_id}, limit=5)
         ]
         learned_context = [
             strategy.to_dict()
@@ -432,6 +536,7 @@ class Orchestrator:
                     "goal": goal,
                     "task_type": "bug_bounty" if state.context.get("task_kind") == "bug_bounty" else "general",
                     "tools": [metadata["name"] for metadata in self.tools.available()],
+                    "task_id": task_id,
                 },
                 limit=5,
             )
@@ -494,7 +599,9 @@ class Orchestrator:
                     rationale="Specialized Bug Bounty route; normal plan validation and execution authorization remain authoritative",
                 )
             else:
-                initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
+                initial_plan = self._create_plan(
+                    goal, prior, retrieved_payload, reflection_context, learned_context, task_id=task_id,
+                )
         except CapabilityUnavailableError as exc:
             registered_names = [str(metadata["name"]) for metadata in self.tools.available()]
             registered_set = set(registered_names)
@@ -636,6 +743,24 @@ class Orchestrator:
                 observability=self.observability,
             )
             for step in pending_steps:
+                step_context = self._isolated_execution_context(execution_context, verified_previous_results)
+                approval_block = self._preflight_bound_step(
+                    state,
+                    step,
+                    step_context,
+                    plan=current_plan,
+                    prior=prior,
+                    learned_context=learned_context,
+                    attempts=rounds,
+                    step_results=all_step_results,
+                    outcomes=all_outcomes,
+                    diagnoses=diagnoses,
+                    experience=experience,
+                    approval_ids=approval_ids,
+                    always=rounds > 1,
+                )
+                if approval_block is not None:
+                    return approval_block
                 self.store.save_event(task_id, "step_started", {"tool_name": step.tool, "round": rounds}, step_id=step.id)
                 key = state.action_key_for_step(step)
                 self._emit_observability(
@@ -667,7 +792,6 @@ class Orchestrator:
                     step_id=step.id,
                     metadata={"tool_name": step.tool, "round": rounds},
                 )
-                step_context = self._isolated_execution_context(execution_context, verified_previous_results)
                 step_result = self._execute_one(step, step_context)
                 all_step_results.append(step_result)
                 state.mark_action(
@@ -1067,6 +1191,11 @@ class Orchestrator:
         decisions: list[PolicyDecision],
         *,
         state: TaskState | None = None,
+        attempts: int = 0,
+        step_results: list[StepResult] | None = None,
+        outcomes: list[StepOutcome] | None = None,
+        diagnoses: list[dict[str, Any]] | None = None,
+        experience: ExperienceRecord | None = None,
     ) -> dict[str, Any]:
         approval_requests = []
         if self.security is not None:
@@ -1075,17 +1204,25 @@ class Orchestrator:
                     request = self.security.approval_gate.get(decision.approval_id)
                     if request is not None:
                         approval_requests.append(request.to_dict())
-        experience = ExperienceRecord(
-            task_id=task_id,
-            goal=goal,
-            context={
-                "prior_knowledge_used": prior,
-                "learned_strategies_used": learned_context,
-                "security_decisions": [decision.to_dict() for decision in decisions],
-            },
-            initial_plan=self._plan_payload(plan),
-            final_outcome="BLOCKED",
-        )
+        if experience is None:
+            experience = ExperienceRecord(
+                task_id=task_id,
+                goal=goal,
+                context={
+                    "prior_knowledge_used": prior,
+                    "learned_strategies_used": learned_context,
+                    "security_decisions": [decision.to_dict() for decision in decisions],
+                },
+                initial_plan=self._plan_payload(plan),
+                final_outcome="BLOCKED",
+            )
+        else:
+            experience.final_outcome = "BLOCKED"
+            experience.context["security_decisions"] = [decision.to_dict() for decision in decisions]
+        step_results = step_results or []
+        outcomes = outcomes or []
+        diagnoses = diagnoses or []
+        outcome_payloads = [item.to_dict() for item in outcomes]
         self.experience_memory.store(experience)
         result = {
             "task_id": task_id,
@@ -1093,13 +1230,15 @@ class Orchestrator:
             "sources": [],
             "errors": ["security_policy_blocked"],
             "prior_knowledge_used": prior,
-            "attempts": 0,
-            "step_results": [],
-            "observations": [],
-            "step_outcomes": [],
-            "final_step_outcomes": [],
-            "verification": self._task_verification([]),
-            "diagnoses": [],
+            "attempts": attempts,
+            "step_results": [item.to_dict() for item in step_results],
+            "observations": [item.observation.to_dict() for item in outcomes],
+            "step_outcomes": outcome_payloads,
+            "final_step_outcomes": [
+                item.to_dict() for item in outcomes if item.verification_status == "VERIFIED"
+            ],
+            "verification": self._task_verification(outcomes),
+            "diagnoses": diagnoses,
             "recovery_attempts": [],
             "learned_strategies_used": learned_context,
             "security_decisions": [decision.to_dict() for decision in decisions],
@@ -1123,7 +1262,7 @@ class Orchestrator:
         )
         if state is not None:
             state.result = result
-            state.context["attempts"] = 0
+            state.context["attempts"] = attempts
             state.checkpoint(
                 "SECURITY_BLOCKED",
                 status=state.status,
@@ -1131,7 +1270,7 @@ class Orchestrator:
                 successful=False,
             )
             self._save_checkpoint(state, "SECURITY_BLOCKED")
-        self.store.save_task(task_id, goal, "blocked", self._plan_payload(plan), result, 0)
+        self.store.save_task(task_id, goal, "blocked", self._plan_payload(plan), result, attempts)
         return result
 
     def resume_task(
@@ -1596,6 +1735,24 @@ class Orchestrator:
                     if step_result is None:
                         return self._resume_blocked(state, "persisted_execution_result_corrupted")
                 else:
+                    step_context = self._isolated_execution_context(context, verified_previous_results)
+                    approval_block = self._preflight_bound_step(
+                        state,
+                        step,
+                        step_context,
+                        plan=current_plan,
+                        prior=prior,
+                        learned_context=learned_context,
+                        attempts=rounds,
+                        step_results=all_step_results,
+                        outcomes=all_outcomes,
+                        diagnoses=diagnoses,
+                        experience=experience,
+                        approval_ids=state.approval_ids,
+                        always=True,
+                    )
+                    if approval_block is not None:
+                        return approval_block
                     state.observations.pop(key, None)
                     state.verification_results.pop(key, None)
                     state.mark_action(
@@ -1624,7 +1781,6 @@ class Orchestrator:
                         step_id=step.id,
                         metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
                     )
-                    step_context = self._isolated_execution_context(context, verified_previous_results)
                     step_result = self._execute_one(step, step_context)
                     state.mark_action(
                         key,
@@ -1955,7 +2111,7 @@ class Orchestrator:
     def _plan_from_payload(self, payload: dict[str, Any]) -> TaskPlan:
         if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
             raise StateIntegrityError("persisted_plan_missing")
-        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output"}
+        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output", "input_bindings"}
         steps = []
         for raw in payload["steps"]:
             if not isinstance(raw, dict) or not set(raw).issubset(allowed):
@@ -1965,6 +2121,7 @@ class Orchestrator:
                     id=raw["id"], objective=raw["objective"], tool=raw["tool"], input=dict(raw.get("input", {})),
                     reason=raw.get("reason", ""), depends_on=list(raw.get("depends_on", [])), verifier=raw.get("verifier", ""),
                     success_criteria=dict(raw.get("success_criteria", {})), status=raw.get("status", "pending"), output=dict(raw.get("output", {})),
+                    input_bindings={key: dict(value) for key, value in raw.get("input_bindings", {}).items()},
                 )
             )
         if not steps:
@@ -2092,6 +2249,7 @@ class Orchestrator:
         retrieved: list[dict[str, Any]],
         reflection_insights: list[dict[str, Any]],
         learned_strategies: list[dict[str, Any]],
+        task_id: str = "",
     ) -> TaskPlan:
         parameters = inspect.signature(self.planner.create).parameters
         kwargs: dict[str, Any] = {}
@@ -2103,6 +2261,8 @@ class Orchestrator:
             kwargs["reflection_insights"] = reflection_insights
         if "learned_strategies" in parameters:
             kwargs["learned_strategies"] = learned_strategies
+        if "task_id" in parameters:
+            kwargs["task_id"] = task_id
         return self.planner.create(goal, self.tools, prior, **kwargs)
 
     def _observe_verify_diagnose(
@@ -2273,6 +2433,7 @@ class Orchestrator:
             security_controller=self.security,
             approval_ids=dict(base.approval_ids),
             observability=base.observability,
+            verified_result_ids=set(previous_results),
         )
 
     def _execute_one(self, step: PlanStep, context: ExecutionContext) -> StepResult:
@@ -2297,6 +2458,7 @@ class Orchestrator:
                     tools=[step.tool],
                     failure_type=diagnosis.failure_type,
                     recovery_strategy=decision.strategy,
+                    task_id=experience.task_id,
                 )
             )
         ]
@@ -2309,6 +2471,7 @@ class Orchestrator:
                     "tools": [step.tool],
                     "failure_types": [diagnosis.failure_type],
                     "recovery_strategies": [decision.strategy],
+                    "task_id": experience.task_id,
                 },
                 limit=5,
             )
@@ -2321,6 +2484,7 @@ class Orchestrator:
                     "task_type": "general",
                     "tools": [step.tool],
                     "failure_types": [diagnosis.failure_type],
+                    "task_id": experience.task_id,
                 },
                 limit=5,
             )

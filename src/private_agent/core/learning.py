@@ -75,9 +75,18 @@ class LearningMemory(ABC):
 class SQLiteLearningMemory(LearningMemory):
     """SQLite adapter; LearningEngine depends only on LearningMemory."""
 
-    def __init__(self, store: Any, *, min_confidence: float = 0.70) -> None:
+    def __init__(
+        self,
+        store: Any,
+        *,
+        min_confidence: float = 0.70,
+        min_relevance: float = 0.45,
+        max_support_age_seconds: int = 180 * 24 * 60 * 60,
+    ) -> None:
         self.store_backend = store
         self.min_confidence = max(0.0, min(1.0, float(min_confidence)))
+        self.min_relevance = max(0.0, min(1.0, float(min_relevance)))
+        self.max_support_age_seconds = max(1, int(max_support_age_seconds))
 
     def save(self, strategy: LearnedStrategy) -> None:
         self.store_backend.save_learned_strategy(strategy)
@@ -93,15 +102,304 @@ class SQLiteLearningMemory(LearningMemory):
         return LearnedStrategy.from_dict(payload) if isinstance(payload, dict) else None
 
     def retrieve_relevant(self, context: dict[str, Any], *, limit: int = 5) -> list[LearnedStrategy]:
+        scoped, owner_user_id = self._owner_scope(context)
+        if scoped and not owner_user_id:
+            return []
         candidates: list[tuple[float, LearnedStrategy]] = []
         for strategy in self.list():
             if strategy.status != "active" or strategy.confidence < self.min_confidence:
                 continue
+            if not (
+                self._has_revalidated_recovery_support(strategy, owner_user_id=owner_user_id)
+                or self._has_revalidated_owner_review_support(strategy, owner_user_id=owner_user_id)
+            ):
+                continue
             score = self._score(context, strategy)
-            if score > 0:
+            if score >= self.min_relevance:
                 candidates.append((score, strategy))
         candidates.sort(key=lambda item: (-item[0], -item[1].confidence, item[1].strategy_id))
         return [strategy for _, strategy in candidates[: max(0, limit)]]
+
+    def get_for_planning(self, strategy_id: str, context: dict[str, Any]) -> LearnedStrategy | None:
+        """Return canonical stored advisory guidance only after current support checks."""
+        if not isinstance(strategy_id, str) or not strategy_id:
+            return None
+        scoped, owner_user_id = self._owner_scope(context)
+        if scoped and not owner_user_id:
+            return None
+        try:
+            strategy = self.get(strategy_id)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            strategy is None
+            or strategy.status != "active"
+            or strategy.confidence < self.min_confidence
+            or not (
+                self._has_revalidated_recovery_support(strategy, owner_user_id=owner_user_id)
+                or self._has_revalidated_owner_review_support(strategy, owner_user_id=owner_user_id)
+            )
+            or self._score(context, strategy) < self.min_relevance
+        ):
+            return None
+        return strategy
+
+    def _owner_scope(self, context: dict[str, Any]) -> tuple[bool, str | None]:
+        if "task_id" not in context:
+            return True, None
+        task_id = context.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return True, None
+        try:
+            owner_user_id = self.store_backend.task_owner_user_id(task_id)
+        except (AttributeError, TypeError, ValueError):
+            return True, None
+        return True, owner_user_id if isinstance(owner_user_id, str) and owner_user_id else None
+
+    def _has_revalidated_recovery_support(
+        self, strategy: LearnedStrategy, *, owner_user_id: str | None = None,
+    ) -> bool:
+        """Re-read each claimed support record before allowing a plan-time hint."""
+        metadata = strategy.metadata if isinstance(strategy.metadata, dict) else {}
+        condition = strategy.condition if isinstance(strategy.condition, dict) else {}
+        preferred = strategy.preferred_action if isinstance(strategy.preferred_action, dict) else {}
+        avoided = strategy.avoided_action if isinstance(strategy.avoided_action, dict) else {}
+        support_ids = strategy.supporting_experience_ids
+        if (
+            not isinstance(support_ids, list)
+            or len(support_ids) < 2
+            or any(not isinstance(item, str) or not item for item in support_ids)
+            or len(set(support_ids)) != len(support_ids)
+            or metadata.get("evidence_count") != len(support_ids)
+            or metadata.get("source_patterns") != ["successful_recovery_alternative"]
+            or metadata.get("conflicting_experience_ids") != []
+            or preferred.get("type") != "prefer_tool"
+            or avoided.get("type") != "avoid_unchanged_retry"
+        ):
+            return False
+
+        failed_tool = str(condition.get("failed_tool", ""))
+        alternative_tool = str(condition.get("alternative_tool", ""))
+        raw_failure_types = condition.get("failure_types")
+        raw_condition_tools = condition.get("tools")
+        if (
+            not isinstance(raw_failure_types, list)
+            or any(not isinstance(item, str) or not item for item in raw_failure_types)
+            or not isinstance(raw_condition_tools, list)
+            or any(not isinstance(item, str) or not item for item in raw_condition_tools)
+        ):
+            return False
+        failure_types = set(raw_failure_types)
+        condition_tools = set(raw_condition_tools)
+        if (
+            not failed_tool
+            or not alternative_tool
+            or failed_tool == alternative_tool
+            or preferred.get("tool") != alternative_tool
+            or avoided.get("tool") != failed_tool
+            or not failure_types
+            or not {failed_tool, alternative_tool}.issubset(condition_tools)
+        ):
+            return False
+
+        now = datetime.now(timezone.utc)
+        for experience_id in support_ids:
+            if owner_user_id is not None:
+                try:
+                    if self.store_backend.task_owner_user_id(experience_id) != owner_user_id:
+                        return False
+                except (AttributeError, TypeError, ValueError):
+                    return False
+            row = self.store_backend.get_experience(experience_id)
+            if not isinstance(row, dict):
+                return False
+            try:
+                payload = json.loads(row["experience_json"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if not isinstance(payload, dict) or payload.get("task_id") != experience_id:
+                return False
+            created_at = payload.get("created_at")
+            if not isinstance(created_at, str) or row.get("created_at") != created_at:
+                return False
+            try:
+                timestamp = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+            if timestamp.tzinfo is None:
+                return False
+            age = (now - timestamp.astimezone(timezone.utc)).total_seconds()
+            if age < -300 or age > self.max_support_age_seconds:
+                return False
+
+            identity = payload.get("identity")
+            if not isinstance(identity, dict):
+                return False
+            outcome = payload.get("final_outcome")
+            verification_status = payload.get("verification_status")
+            verification_scope = payload.get("verification_scope")
+            impact_verified = payload.get("security_impact_verified")
+            if (
+                outcome != "COMPLETED"
+                or verification_status != "VERIFIED"
+                or not isinstance(verification_scope, str)
+                or not verification_scope
+                or (impact_verified is not None and impact_verified is not True)
+                or identity.get("outcome") != outcome
+                or identity.get("verification_status") != verification_status
+                or identity.get("verification_scope") != verification_scope
+                or identity.get("security_impact_verified") != impact_verified
+            ):
+                return False
+
+            actions = payload.get("actions")
+            if not isinstance(actions, list):
+                return False
+            named_actions = [
+                action for action in actions
+                if isinstance(action, dict) and isinstance(action.get("tool_name"), str) and action["tool_name"]
+            ]
+            if (
+                len(named_actions) < 2
+                or named_actions[-1].get("tool_name") != alternative_tool
+            ):
+                return False
+            final_action = named_actions[-1]
+            if not self._has_verified_change_tool_transition(
+                named_actions,
+                failed_tool=failed_tool,
+                alternative_tool=alternative_tool,
+                failure_types=failure_types,
+                final_action=final_action,
+            ):
+                return False
+            verification = final_action.get("verification")
+            evidence = verification.get("evidence") if isinstance(verification, dict) else None
+            if (
+                final_action.get("execution_status") != "success"
+                or not isinstance(verification, dict)
+                or verification.get("status") != "VERIFIED"
+                or verification.get("verified") is not True
+                or not isinstance(evidence, list)
+                or not any(isinstance(item, dict) for item in evidence)
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _has_verified_change_tool_transition(
+        actions: list[dict[str, Any]],
+        *,
+        failed_tool: str,
+        alternative_tool: str,
+        failure_types: set[Any],
+        final_action: dict[str, Any],
+    ) -> bool:
+        for index, action in enumerate(actions):
+            diagnosis = action.get("diagnosis")
+            recovery = action.get("recovery")
+            step_id = action.get("step_id")
+            if (
+                action.get("tool_name") != failed_tool
+                or not isinstance(step_id, str)
+                or not step_id
+                or not isinstance(diagnosis, dict)
+                or diagnosis.get("failure_type") not in failure_types
+                or not isinstance(recovery, dict)
+                or recovery.get("strategy") != "CHANGE_TOOL"
+                or recovery.get("original_tool") != failed_tool
+                or recovery.get("replacement_tool") != alternative_tool
+                or recovery.get("step_id") != step_id
+            ):
+                continue
+            subsequent = next(
+                (
+                    later for later in actions[index + 1:]
+                    if later.get("step_id") == step_id
+                    and later.get("tool_name") == alternative_tool
+                ),
+                None,
+            )
+            if subsequent is not final_action:
+                continue
+            verification = final_action.get("verification")
+            evidence = verification.get("evidence") if isinstance(verification, dict) else None
+            if (
+                final_action.get("execution_status") == "success"
+                and isinstance(verification, dict)
+                and verification.get("status") == "VERIFIED"
+                and verification.get("verified") is True
+                and isinstance(evidence, list)
+                and any(isinstance(item, dict) for item in evidence)
+            ):
+                return True
+        return False
+
+    def _has_revalidated_owner_review_support(
+        self, strategy: LearnedStrategy, *, owner_user_id: str | None = None,
+    ) -> bool:
+        """Retain owner-reviewed context without making it tool-selection guidance."""
+        metadata = strategy.metadata if isinstance(strategy.metadata, dict) else {}
+        condition = strategy.condition if isinstance(strategy.condition, dict) else {}
+        preferred = strategy.preferred_action if isinstance(strategy.preferred_action, dict) else {}
+        avoided = strategy.avoided_action if isinstance(strategy.avoided_action, dict) else {}
+        support_ids = strategy.supporting_experience_ids
+        review_id = metadata.get("review_id")
+        evidence_sha256 = metadata.get("evidence_sha256")
+        finding_id = metadata.get("finding_id")
+        if (
+            metadata.get("source_patterns") != ["bugbounty_review_feedback"]
+            or metadata.get("evidence_count") != 1
+            or metadata.get("positive_guidance") is not True
+            or metadata.get("conflicting_experience_ids") != []
+            or metadata.get("verified_outcome") is not True
+            or metadata.get("non_authoritative") is not True
+            or condition.get("task_type") != "bug_bounty"
+            or condition.get("review_decision") != "CONFIRM"
+            or preferred.get("type") != "require_evidence_review"
+            or preferred.get("vulnerability_class") != condition.get("vulnerability_class")
+            or avoided.get("type") != "auto_confirm_finding"
+            or not isinstance(review_id, str)
+            or not review_id
+            or not isinstance(finding_id, str)
+            or not finding_id
+            or not isinstance(evidence_sha256, str)
+            or not evidence_sha256
+            or support_ids != [f"finding-review:{review_id}"]
+        ):
+            return False
+        try:
+            from private_agent.bugbounty.reviews import FindingReviewRepository
+
+            review = FindingReviewRepository(self.store_backend).get_by_id(review_id)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if (
+            review is None
+            or review.decision != "CONFIRM"
+            or review.finding_id != finding_id
+            or not review.evidence_validated
+            or review.evidence_sha256 != evidence_sha256
+        ):
+            return False
+        if owner_user_id is not None:
+            try:
+                if (
+                    review.owner_user_id != owner_user_id
+                    or review.actor_user_id != owner_user_id
+                    or self.store_backend.task_owner_user_id(review.task_id) != owner_user_id
+                ):
+                    return False
+            except (AttributeError, TypeError, ValueError):
+                return False
+        try:
+            timestamp = datetime.fromisoformat(review.created_at.replace("Z", "+00:00"))
+        except (AttributeError, ValueError):
+            return False
+        if timestamp.tzinfo is None:
+            return False
+        age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+        return -300 <= age <= self.max_support_age_seconds
 
     def list(self) -> list[LearnedStrategy]:
         strategies: list[LearnedStrategy] = []
@@ -148,7 +446,9 @@ class SQLiteLearningMemory(LearningMemory):
             semantic_match = True
         if context_tools.intersection(condition_tools):
             score += 0.20
-        if not semantic_match:
+        # General task labels and shared tool names are not enough: require
+        # at least two concrete goal tokens before experience can steer a plan.
+        if not semantic_match or goal_overlap < 2:
             return 0.0
         return min(1.0, score)
 
