@@ -207,6 +207,7 @@ def test_replanner_replaces_tool_and_revalidates_permissions() -> None:
     replanned = Replanner().replan(request, tools, replacement_tool="b")
     assert replanned.steps[0].tool == "b"
     assert replanned.steps[0].id == "step"
+    assert replanned.planning_mode == "DETERMINISTIC_REPLAN"
 
     private = ControlledTool("private", [ToolResult.success({"result": "no"})])
     private.permission_level = "private_write"
@@ -260,6 +261,7 @@ def test_llm_replanner_only_proposes_and_validation_still_runs() -> None:
     )
     assert provider.calls == 1
     assert replanned.steps[0].tool == "b"
+    assert replanned.planning_mode == "PROVIDER_VALIDATED"
     assert a.calls == 0 and b.calls == 0
 
 

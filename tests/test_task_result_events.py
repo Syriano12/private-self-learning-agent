@@ -12,7 +12,9 @@ import pytest
 from private_agent import security as security_module
 from private_agent import storage as storage_module
 from private_agent.auth import AuthManager, AuthPrincipal, ROLE_OPERATOR
+from private_agent.core.llm import LLMResponse
 from private_agent.core.orchestrator import TaskInterrupted
+from private_agent.core.planner import Planner
 from private_agent.storage import Store, UnsupportedSchemaVersion
 from private_agent.tools.contracts import ToolResult
 from private_agent.worker import BackgroundWorker
@@ -69,6 +71,155 @@ def test_schema_14_migrates_to_15_and_installs_immutable_result_event_table(
         "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'task_result_events_no_delete'"
     ).fetchone()
     upgraded.close()
+
+
+def test_schema_17_migrates_existing_result_events_to_unknown_source_and_version_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "schema-17.sqlite3"
+    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 17)
+    legacy = Store(path)
+    auth = AuthManager(legacy, owner_email="legacy-owner@example.test")
+    owner_id = auth.initialize_owner("legacy-owner@example.test", "strong-owner-password").user_id
+    task_id = str(legacy.create_queued_task("legacy result", owner_user_id=None)["task_id"])
+    stamp = datetime.now(timezone.utc).isoformat()
+    legacy.db.execute("BEGIN IMMEDIATE")
+    legacy.db.execute(
+        "INSERT INTO task_owners (task_id, user_id, created_at) VALUES (?, ?, ?)",
+        (task_id, owner_id, stamp),
+    )
+    sequence = legacy._allocate_task_conversation_sequence_in_transaction(task_id)
+    legacy.db.execute(
+        """INSERT INTO task_result_events
+        (event_id, task_id, owner_user_id, sequence, role, message_kind, task_status,
+         verification_status, result_available, verified_action_count, failed_action_count,
+         blocked_action_count, pending_action_count, approval_pending_count, approval_approved_count,
+         approval_denied_count, approval_expired_count, approval_cancelled_count, result_digest,
+         transition_fingerprint, created_at)
+        VALUES (?, ?, ?, ?, 'SYSTEM', 'RESULT', 'QUEUED', 'IN_PROGRESS', 0, 0, 0, 0, 0,
+         0, 0, 0, 0, 0, ?, ?, ?)""",
+        ("legacy-result-event", task_id, owner_id, sequence, "a" * 64, "b" * 64, stamp),
+    )
+    legacy.db.commit()
+    legacy.close()
+
+    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 18)
+    migrated = Store(path)
+    event = migrated.task_result_events(task_id, owner_user_id=owner_id)[0]
+    assert event["planning_mode"] == "UNKNOWN"
+    assert event["plan_version"] == 0
+    migrated.close()
+
+
+def test_worker_persists_provider_validated_plan_mode_in_state_result_and_conversation_event(
+    tmp_path: Path,
+) -> None:
+    goal = "complete a verified safe task"
+
+    class SyntheticProvider:
+        def generate_json(self, *, system_prompt: str, user_prompt: str, response_schema: dict):
+            del system_prompt, user_prompt, response_schema
+            return LLMResponse(
+                {
+                    "goal": goal,
+                    "rationale": "Synthetic provider proposal for provenance coverage",
+                    "steps": [{
+                        "id": "api-step-1",
+                        "objective": "complete the controlled task",
+                        "tool": "safe",
+                        "input": {"value": "safe"},
+                        "reason": "Synthetic test plan",
+                        "depends_on": [],
+                        "success_criteria": {"required_fields": ["result"]},
+                    }],
+                },
+                "{}",
+                "synthetic",
+            )
+
+    service, store, _ = make_service(
+        tmp_path,
+        APITestTool("safe"),
+        planner=Planner(SyntheticProvider()),
+    )
+    owner_user_id, principal = _owner_and_principal(store, suffix="provider-plan")
+    task_id = _make_owned_task(store, owner_user_id, goal)
+
+    result = BackgroundWorker(service.orchestrator, worker_id="provider-plan-worker").run_once()
+
+    assert result["status"] == "COMPLETED", result
+    state = store.get_task_state(task_id)
+    assert state["plan"]["planning_mode"] == "PROVIDER_VALIDATED"
+    assert state["plan_version"] == 1
+    assert state["result"]["planning_mode"] == "PROVIDER_VALIDATED"
+    assert state["result"]["plan_version"] == 1
+    assert state["result"]["step_results"][0]["planning_mode"] == "PROVIDER_VALIDATED"
+    assert state["result"]["step_results"][0]["plan_version"] == 1
+    assert state["result"]["step_outcomes"][0]["observation"]["planning_mode"] == "PROVIDER_VALIDATED"
+    assert state["result"]["step_outcomes"][0]["observation"]["plan_version"] == 1
+    event = service.get_task_conversation(task_id, principal=principal).result_events[-1]
+    assert event.planning_mode == "PROVIDER_VALIDATED"
+    assert event.plan_version == 1
+    task = service.get_task(task_id, principal=principal)
+    assert task.planning_mode == "PROVIDER_VALIDATED"
+    assert task.plan_version == 1
+    assert len(task.actions) == 1
+    assert task.actions[0].planning_mode == "PROVIDER_VALIDATED"
+    assert task.actions[0].plan_version == 1
+    store.close()
+
+
+def test_worker_persists_deterministic_fallback_mode_on_step_result_and_action(tmp_path: Path) -> None:
+    class PlanningInputTool(APITestTool):
+        def planning_inputs(self, goal: str) -> dict[str, str]:
+            del goal
+            return {"value": "safe"}
+
+    goal = "complete a harmless action without a planning provider"
+    service, store, _ = make_service(tmp_path, PlanningInputTool("safe"), planner=Planner())
+    owner_user_id, principal = _owner_and_principal(store, suffix="fallback-plan")
+    task_id = _make_owned_task(store, owner_user_id, goal)
+
+    result = BackgroundWorker(service.orchestrator, worker_id="fallback-plan-worker").run_once()
+
+    assert result["status"] == "COMPLETED", result
+    state = store.get_task_state(task_id)
+    assert state["plan"]["planning_mode"] == "DETERMINISTIC_FALLBACK"
+    assert state["result"]["step_results"][0]["planning_mode"] == "DETERMINISTIC_FALLBACK"
+    assert state["result"]["step_results"][0]["plan_version"] == 1
+    task = service.get_task(task_id, principal=principal)
+    assert task.planning_mode == "DETERMINISTIC_FALLBACK"
+    assert task.actions[0].planning_mode == "DETERMINISTIC_FALLBACK"
+    assert task.actions[0].plan_version == 1
+    store.close()
+
+
+def test_provider_error_before_plan_persistence_remains_unknown_not_provider_validated(tmp_path: Path) -> None:
+    class FailingProvider:
+        def generate_json(self, *, system_prompt: str, user_prompt: str, response_schema: dict):
+            del system_prompt, user_prompt, response_schema
+            raise RuntimeError("synthetic provider unavailable")
+
+    service, store, _ = make_service(
+        tmp_path,
+        APITestTool("safe"),
+        planner=Planner(FailingProvider()),
+    )
+    owner_user_id, principal = _owner_and_principal(store, suffix="provider-error")
+    task_id = _make_owned_task(store, owner_user_id, "complete a harmless action")
+
+    result = BackgroundWorker(service.orchestrator, worker_id="provider-error-worker").run_once()
+
+    assert result["status"] == "FAILED", result
+    task = service.get_task(task_id, principal=principal)
+    assert task.status == "FAILED"
+    assert task.planning_mode == "UNKNOWN"
+    assert task.plan_version == 0
+    event = service.get_task_conversation(task_id, principal=principal).result_events[-1]
+    assert event.task_status == "FAILED"
+    assert event.planning_mode == "UNKNOWN"
+    assert event.plan_version == 0
+    store.close()
 
 
 def test_schema_15_rejects_a_misdefined_owner_guard_trigger_on_reopen(tmp_path: Path) -> None:

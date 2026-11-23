@@ -7,6 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+from private_agent.core.planning_provenance import (
+    PLANNING_MODES,
+    UNKNOWN,
+    planning_mode_from_plan,
+    plan_version_from_state,
+)
 
 from private_agent.core.experience import sanitize_value
 
@@ -387,7 +393,12 @@ class TaskState:
             raise StateIntegrityError("plan_not_json_safe") from exc
         # JSON round-tripping detaches nested planner objects without invoking
         # arbitrary __deepcopy__ hooks from an untrusted provider.
-        self.plan = json.loads(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+        detached_plan = json.loads(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+        planning_mode = detached_plan.get("planning_mode", UNKNOWN)
+        if not isinstance(planning_mode, str) or planning_mode not in PLANNING_MODES:
+            raise StateIntegrityError("plan_planning_mode_invalid")
+        detached_plan["planning_mode"] = planning_mode
+        self.plan = detached_plan
         self.plan_version = int(version if version is not None else self.plan_version + 1)
         self.plan_fingerprint = plan_fingerprint(self.plan)
         actions = plan_actions(self.plan, self.plan_version)
@@ -417,12 +428,19 @@ class TaskState:
                 "observation": None,
                 "verification": None,
                 "approval_id": "",
+                "planning_mode": planning_mode_from_plan(self.plan),
+                "plan_version": plan_version_from_state({"plan_version": self.plan_version if self.plan else 0}),
                 "updated_at": utc_now(),
             },
         )
 
     def mark_action(self, key: str, *, status: str, step_id: str, tool_name: str, input_fingerprint: str, **fields: Any) -> None:
         record = self.action_records.setdefault(key, {"action_key": key})
+        fields.setdefault("planning_mode", planning_mode_from_plan(self.plan))
+        fields.setdefault(
+            "plan_version",
+            plan_version_from_state({"plan_version": self.plan_version if self.plan else 0}),
+        )
         record.update(
             {
                 "action_key": key,
@@ -466,6 +484,9 @@ class TaskState:
             raise StateIntegrityError("redacted_execution_input_requires_resolution")
         valid_actions: set[str] = set()
         if self.plan:
+            planning_mode = self.plan.get("planning_mode", UNKNOWN)
+            if not isinstance(planning_mode, str) or planning_mode not in PLANNING_MODES:
+                raise StateIntegrityError("plan_planning_mode_invalid")
             if self.plan_version < 1 or not self.plan_fingerprint:
                 raise StateIntegrityError("plan_version_and_fingerprint_required")
             if plan_fingerprint(self.plan) != self.plan_fingerprint:

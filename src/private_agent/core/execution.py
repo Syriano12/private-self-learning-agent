@@ -7,6 +7,7 @@ from typing import Any
 
 from private_agent.core.experience import sanitize_value
 from private_agent.core.planner import PlanStep, TaskPlan
+from private_agent.core.planning_provenance import UNKNOWN, normalize_plan_version, normalize_planning_mode
 from private_agent.storage import QueueLeaseLost
 from private_agent.tools.contracts import ToolError, ToolResult, contract_errors, validate_schema_value
 from private_agent.tools.research import ToolRegistry
@@ -96,6 +97,8 @@ class StepResult:
     output: Any = None
     error: ToolError | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    planning_mode: str = UNKNOWN
+    plan_version: int = 0
 
     @classmethod
     def success(
@@ -154,6 +157,8 @@ class StepResult:
             "output": self.output,
             "error": self.error.to_dict() if self.error else None,
             "metadata": self.metadata,
+            "planning_mode": normalize_planning_mode(self.planning_mode),
+            "plan_version": normalize_plan_version(self.plan_version),
         })
         try:
             encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))

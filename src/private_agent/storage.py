@@ -26,6 +26,7 @@ from private_agent.core.knowledge import (
 )
 from private_agent.bugbounty.models import safe_json
 from private_agent.core.experience import sanitize_value
+from private_agent.core.planning_provenance import planning_mode_from_plan, plan_version_from_state
 from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH
 
 LOGGER = logging.getLogger(__name__)
@@ -327,7 +328,7 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 MAX_TASK_MESSAGE_LENGTH = MAX_TASK_GOAL_LENGTH
 MAX_TASK_CONVERSATION_MESSAGES = 32
 MAX_TASK_CONVERSATION_CHARS = 16_000
@@ -497,6 +498,11 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
     17: {
         "task_conversation_sequences": {
             "task_id": "TEXT", "last_sequence": "INTEGER",
+        },
+    },
+    18: {
+        "task_result_events": {
+            "planning_mode": "TEXT", "plan_version": "INTEGER",
         },
     },
 }
@@ -873,6 +879,8 @@ class Store:
                 ("trigger", "task_result_events_sequence_counter_guard"),
                 ("trigger", "task_result_events_sequence_cross_type_guard"),
             )
+        if version == 18:
+            return (("table", "task_result_events"),)
         return ()
 
     def _assert_migration_objects(
@@ -982,6 +990,11 @@ class Store:
                         "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
                     ),
                 }.get(name, ())
+                if version >= 18 and name == "task_result_events":
+                    required_fragments += (
+                        "CHECK (PLANNING_MODE IN ('UNKNOWN', 'PROVIDER_VALIDATED', 'DETERMINISTIC_FALLBACK', 'DETERMINISTIC_ROUTE', 'DETERMINISTIC_REPLAN'))",
+                        "CHECK (PLAN_VERSION >= 0)",
+                    )
                 for fragment in required_fragments:
                     if fragment not in table_sql:
                         raise UnsupportedSchemaVersion(
@@ -1277,7 +1290,7 @@ class Store:
                 # 13 has already been validated, and strict combined validation
                 # runs immediately after the additive migration.
                 reconcile_schema13 = version == 14 and 13 in versions
-                if existing_objects is not None and version not in {10, 11} and not reconcile_schema13:
+                if existing_objects is not None and version not in {10, 11, 18} and not reconcile_schema13:
                     self._assert_migration_objects(version)
                 self._apply_migration(version)
                 self._assert_migration_objects(version)
@@ -1961,6 +1974,25 @@ class Store:
               END""")
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (17, now()))
             return
+        if version == 18:
+            columns = {
+                str(item["name"])
+                for item in self.db.execute("PRAGMA table_info(task_result_events)").fetchall()
+            }
+            if "planning_mode" not in columns:
+                self.db.execute(
+                    "ALTER TABLE task_result_events ADD COLUMN planning_mode TEXT NOT NULL "
+                    "DEFAULT 'UNKNOWN' CHECK (planning_mode IN "
+                    "('UNKNOWN', 'PROVIDER_VALIDATED', 'DETERMINISTIC_FALLBACK', "
+                    "'DETERMINISTIC_ROUTE', 'DETERMINISTIC_REPLAN'))"
+                )
+            if "plan_version" not in columns:
+                self.db.execute(
+                    "ALTER TABLE task_result_events ADD COLUMN plan_version INTEGER NOT NULL "
+                    "DEFAULT 0 CHECK (plan_version >= 0)"
+                )
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (18, now()))
+            return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
     def latest_owner_policy_version(self) -> int:
@@ -2252,6 +2284,8 @@ class Store:
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))
         result_digest = hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+        planning_mode = planning_mode_from_plan(payload.get("plan"))
+        plan_version = plan_version_from_state(payload)
         verification = result.get("verification") if isinstance(result.get("verification"), dict) else {}
         if status == "COMPLETED":
             verification_status = "VERIFIED" if verification.get("verified") is True else "UNVERIFIED"
@@ -2300,12 +2334,14 @@ class Store:
             "approval_expired_count": approval_counts["EXPIRED"],
             "approval_cancelled_count": approval_counts["CANCELLED"],
             "result_digest": result_digest,
+            "planning_mode": planning_mode,
+            "plan_version": plan_version,
         }
         latest = self.db.execute(
             "SELECT owner_user_id, task_status, verification_status, result_available, "
             "verified_action_count, failed_action_count, blocked_action_count, pending_action_count, "
             "approval_pending_count, approval_approved_count, approval_denied_count, "
-            "approval_expired_count, approval_cancelled_count, result_digest "
+            "approval_expired_count, approval_cancelled_count, result_digest, planning_mode, plan_version "
             "FROM task_result_events WHERE task_id = ? ORDER BY sequence DESC LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -2334,8 +2370,8 @@ class Store:
              verification_status, result_available, verified_action_count, failed_action_count,
              blocked_action_count, pending_action_count, approval_pending_count, approval_approved_count,
              approval_denied_count, approval_expired_count, approval_cancelled_count, result_digest,
-             transition_fingerprint, created_at)
-            VALUES (?, ?, ?, ?, 'SYSTEM', 'RESULT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             transition_fingerprint, created_at, planning_mode, plan_version)
+            VALUES (?, ?, ?, ?, 'SYSTEM', 'RESULT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 event_id, task_id, owner_user_id, sequence, summary["task_status"],
                 summary["verification_status"], summary["result_available"], summary["verified_action_count"],
@@ -2343,7 +2379,7 @@ class Store:
                 summary["approval_pending_count"], summary["approval_approved_count"],
                 summary["approval_denied_count"], summary["approval_expired_count"],
                 summary["approval_cancelled_count"], summary["result_digest"], transition_fingerprint,
-                str(payload.get("updated_at") or now()),
+                str(payload.get("updated_at") or now()), summary["planning_mode"], summary["plan_version"],
             ),
         )
 
@@ -2629,7 +2665,8 @@ class Store:
             "e.task_status, e.verification_status, e.result_available, e.verified_action_count, "
             "e.failed_action_count, e.blocked_action_count, e.pending_action_count, "
             "e.approval_pending_count, e.approval_approved_count, e.approval_denied_count, "
-            "e.approval_expired_count, e.approval_cancelled_count, e.result_digest, e.created_at "
+            "e.approval_expired_count, e.approval_cancelled_count, e.result_digest, "
+            "e.planning_mode, e.plan_version, e.created_at "
             "FROM task_result_events AS e JOIN task_owners AS o "
             "ON o.task_id = e.task_id AND o.user_id = e.owner_user_id "
             "WHERE e.task_id = ?"
@@ -2680,14 +2717,16 @@ class Store:
             "NULL AS result_available, NULL AS verified_action_count, NULL AS failed_action_count, "
             "NULL AS blocked_action_count, NULL AS pending_action_count, NULL AS approval_pending_count, "
             "NULL AS approval_approved_count, NULL AS approval_denied_count, NULL AS approval_expired_count, "
-            "NULL AS approval_cancelled_count, NULL AS result_digest "
+            "NULL AS approval_cancelled_count, NULL AS result_digest, "
+            "NULL AS planning_mode, NULL AS plan_version "
             "FROM task_messages AS m WHERE m.task_id = ?" + message_owner + " UNION ALL "
             "SELECT 'SYSTEM_RESULT' AS item_type, e.event_id AS item_id, e.sequence, e.task_id, "
             "e.role, e.message_kind, NULL AS content, NULL AS status, e.created_at, NULL AS consumed_at, "
             "NULL AS consumed_checkpoint, e.task_status, e.verification_status, e.result_available, "
             "e.verified_action_count, e.failed_action_count, e.blocked_action_count, e.pending_action_count, "
             "e.approval_pending_count, e.approval_approved_count, e.approval_denied_count, "
-            "e.approval_expired_count, e.approval_cancelled_count, e.result_digest "
+            "e.approval_expired_count, e.approval_cancelled_count, e.result_digest, "
+            "e.planning_mode, e.plan_version "
             "FROM task_result_events AS e JOIN task_owners AS eo "
             "ON eo.task_id = e.task_id AND eo.user_id = e.owner_user_id "
             "WHERE e.task_id = ?" + event_owner + ") AS conversation_items "
@@ -2729,7 +2768,10 @@ class Store:
                     "approval_denied_count": int(row["approval_denied_count"]),
                     "approval_expired_count": int(row["approval_expired_count"]),
                     "approval_cancelled_count": int(row["approval_cancelled_count"]),
-                    "result_digest": str(row["result_digest"]), "created_at": str(row["created_at"]),
+                    "result_digest": str(row["result_digest"]),
+                    "planning_mode": str(row["planning_mode"]),
+                    "plan_version": int(row["plan_version"]),
+                    "created_at": str(row["created_at"]),
                 }
                 items.append({"item_type": "SYSTEM_RESULT", "sequence": sequence, "result_event": result_event})
         return {

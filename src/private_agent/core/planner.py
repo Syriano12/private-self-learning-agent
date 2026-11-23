@@ -9,6 +9,12 @@ from typing import Any
 
 from private_agent.core.learning import SQLiteLearningMemory
 from private_agent.core.llm import LLMProvider
+from private_agent.core.planning_provenance import (
+    DETERMINISTIC_FALLBACK,
+    DETERMINISTIC_ROUTE,
+    PROVIDER_VALIDATED,
+    UNKNOWN,
+)
 from private_agent.tools.contracts import validate_schema_value
 from private_agent.tools.github_access import RepositoryAccessError, parse_repository
 from private_agent.tools.research import ToolRegistry
@@ -56,6 +62,7 @@ class TaskPlan:
     goal: str
     steps: list[PlanStep]
     rationale: str
+    planning_mode: str = UNKNOWN
 
 
 PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -174,7 +181,7 @@ class Planner:
                 if self._safe_inputs_are_compatible(investigator, proposed_inputs, schema=input_schema):
                     required_fields = self._safe_output_required_fields(investigator)
                     if required_fields is not None:
-                        return self.validate(
+                        plan = self.validate(
                             {
                                 "goal": goal,
                                 "rationale": "Deterministic repository bug-investigation route; provider is not consulted",
@@ -192,19 +199,23 @@ class Planner:
                             tools=tools,
                             permissions=permissions,
                         )
+                        plan.planning_mode = DETERMINISTIC_ROUTE
+                        return plan
         learned_route = self._owner_reviewed_idor_route(
             goal, tools, prior_knowledge, permissions
         )
         if learned_route is not None:
-            return self.validate(
+            plan = self.validate(
                 learned_route,
                 goal=goal,
                 tools=tools,
                 permissions=permissions,
             )
+            plan.planning_mode = DETERMINISTIC_ROUTE
+            return plan
         if self.provider is None:
             fallback = self._unavailable_fallback(goal, tools, prior_knowledge, planning_strategies, permissions)
-            return self.validate(
+            plan = self.validate(
                 {
                     "goal": fallback.goal,
                     "rationale": fallback.rationale,
@@ -226,6 +237,8 @@ class Planner:
                 tools=tools,
                 permissions=permissions,
             )
+            plan.planning_mode = DETERMINISTIC_FALLBACK
+            return plan
 
         context = {
             "goal": goal,
@@ -248,7 +261,9 @@ class Planner:
             user_prompt=json.dumps(context, ensure_ascii=False, sort_keys=True),
             response_schema=PLAN_RESPONSE_SCHEMA,
         )
-        return self.validate(response.data, goal=goal, tools=tools, permissions=permissions)
+        plan = self.validate(response.data, goal=goal, tools=tools, permissions=permissions)
+        plan.planning_mode = PROVIDER_VALIDATED
+        return plan
 
     def _owner_reviewed_idor_route(
         self,

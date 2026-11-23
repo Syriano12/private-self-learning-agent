@@ -7,6 +7,7 @@ from typing import Any
 
 from private_agent.core.execution import StepResult
 from private_agent.core.experience import sanitize_value
+from private_agent.core.planning_provenance import UNKNOWN, normalize_plan_version, normalize_planning_mode
 
 
 MAX_OBSERVATION_BYTES = 128 * 1024
@@ -22,6 +23,8 @@ class Observation:
     observed_error: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    planning_mode: str = UNKNOWN
+    plan_version: int = 0
 
     @classmethod
     def from_step_result(cls, task_id: str, result: StepResult) -> "Observation":
@@ -33,10 +36,15 @@ class Observation:
             observed_output=result.output,
             observed_error=result.error.to_dict() if result.error else None,
             metadata=dict(result.metadata),
+            planning_mode=normalize_planning_mode(result.planning_mode),
+            plan_version=normalize_plan_version(result.plan_version),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        payload = sanitize_value(asdict(self))
+        raw = asdict(self)
+        raw["planning_mode"] = normalize_planning_mode(self.planning_mode)
+        raw["plan_version"] = normalize_plan_version(self.plan_version)
+        payload = sanitize_value(raw)
         try:
             encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
@@ -63,6 +71,8 @@ class StepOutcome:
             "tool_name": self.tool_name,
             "execution_status": self.execution_status,
             "verification_status": self.verification_status,
+            "planning_mode": normalize_planning_mode(self.observation.planning_mode),
+            "plan_version": normalize_plan_version(self.observation.plan_version),
             "observation": self.observation.to_dict(),
             "verification": self.verification,
         }

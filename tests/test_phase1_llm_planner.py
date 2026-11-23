@@ -15,6 +15,7 @@ from private_agent.core.llm import (
     LLMStructuredOutputError,
 )
 from private_agent.core.planner import PLAN_RESPONSE_SCHEMA, PlanValidationError, Planner
+from private_agent.tools.bug_investigation import BugInvestigationTool
 from private_agent.tools.research import ToolRegistry, WebResearchTool
 
 
@@ -219,6 +220,7 @@ def test_planner_passes_goal_tools_memory_constraints_and_permissions_to_provide
         permissions={"web_research": "public_read"},
     )
     assert result.steps[0].tool == "web_research"
+    assert result.planning_mode == "PROVIDER_VALIDATED"
     context = fake.calls[0]["user_prompt"]
     assert context["goal"] == "compare local agents"
     assert context["relevant_memory"] == [{"concept": "previous evidence"}]
@@ -276,6 +278,24 @@ def test_plan_validation_rejects_circular_dependency() -> None:
 
 def test_planner_fallback_does_not_use_keyword_routing() -> None:
     plan = Planner().create("an arbitrary goal with no research keyword", registry(), [])
+    assert plan.planning_mode == "DETERMINISTIC_FALLBACK"
     assert plan.steps[0].tool == "web_research"
     assert plan.steps[0].input["query"] == "an arbitrary goal with no research keyword"
     assert "keyword" not in plan.rationale.lower()
+
+
+def test_special_repository_bug_route_is_server_classified_as_deterministic() -> None:
+    tools = ToolRegistry()
+    tools.register(BugInvestigationTool(object()))
+    provider = FakeProvider([])
+
+    plan = Planner(provider).create(
+        "The configuration crashes; bug report for owner/repo",
+        tools,
+        [],
+        permissions={"investigate_repository_bug": "public_read"},
+    )
+
+    assert plan.planning_mode == "DETERMINISTIC_ROUTE"
+    assert plan.steps[0].tool == "investigate_repository_bug"
+    assert provider.calls == []

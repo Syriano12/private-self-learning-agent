@@ -97,6 +97,7 @@ def make_service(
     *,
     token: str | None = API_TOKEN,
     hook=None,
+    planner=None,
 ) -> tuple[AgentAPIService, Store, ObservabilityMonitor]:
     store = Store(tmp_path / "api.sqlite3")
     monitor = ObservabilityMonitor(store)
@@ -104,7 +105,7 @@ def make_service(
     core = Orchestrator(
         store,
         make_registry(tool),
-        planner=APIPlanner(tool.name),
+        planner=planner or APIPlanner(tool.name),
         security_controller=security,
         observability=monitor,
         checkpoint_hook=hook,

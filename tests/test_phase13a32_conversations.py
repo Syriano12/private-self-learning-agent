@@ -100,7 +100,7 @@ def test_schema_12_migrates_to_conversation_schema_14(tmp_path: Path, monkeypatc
     migrated.close()
 
 
-def test_schema_13_conversation_layout_migrates_to_17_without_losing_messages(tmp_path: Path) -> None:
+def test_schema_13_conversation_layout_migrates_to_18_without_losing_messages(tmp_path: Path) -> None:
     path = tmp_path / "schema-13-conversation.sqlite3"
     store = Store(path)
     created = store.create_queued_task(
@@ -124,7 +124,7 @@ def test_schema_13_conversation_layout_migrates_to_17_without_losing_messages(tm
     ).fetchone()
     assert migrated.db.execute(
         "SELECT schema_version FROM task_state_schema ORDER BY schema_version DESC LIMIT 1"
-    ).fetchone()["schema_version"] == 17
+    ).fetchone()["schema_version"] == 18
     migrated.close()
 
 
@@ -354,6 +354,10 @@ def test_followup_is_consumed_after_verified_action_then_replanned_and_reauthori
     )
     assert first_key in persisted.completed_actions
     assert persisted.action_records[first_key]["status"] == "VERIFIED"
+    assert persisted.action_records[first_key]["planning_mode"] == "UNKNOWN"
+    assert persisted.action_records[first_key]["plan_version"] == 1
+    assert persisted.result["planning_mode"] == "UNKNOWN"
+    assert persisted.result["plan_version"] == 2
     assert store.task_messages(created["task_id"])[-1]["status"] == "CONSUMED"
     assert persisted.status == "WAITING_APPROVAL"
     assert persisted.stop_reason is not None and persisted.stop_reason.code.value == "APPROVAL_REQUIRED"
@@ -366,6 +370,17 @@ def test_followup_is_consumed_after_verified_action_then_replanned_and_reauthori
     assert completed["status"] == "COMPLETED"
     assert network.calls == 1
     assert store.task_queue_record(created["task_id"])["queue_status"] == "COMPLETED"
+    final_state = TaskState.from_dict(store.get_task_state(created["task_id"]))
+    step_results = final_state.result["step_results"]
+    assert {(item["tool_name"], item["planning_mode"], item["plan_version"]) for item in step_results} == {
+        ("safe", "UNKNOWN", 1),
+        ("network", "UNKNOWN", 2),
+    }
+    outcome_versions = {
+        item["observation"]["plan_version"]
+        for item in final_state.result["step_outcomes"]
+    }
+    assert outcome_versions == {1, 2}
     store.close()
 
 

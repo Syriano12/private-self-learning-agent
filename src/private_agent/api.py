@@ -33,6 +33,12 @@ from private_agent.core.knowledge import (
     sha256_hex,
 )
 from private_agent.core.orchestrator import Orchestrator
+from private_agent.core.planning_provenance import (
+    UNKNOWN,
+    normalize_plan_version,
+    normalize_planning_mode,
+    planning_mode_from_plan,
+)
 from private_agent.core.task_state import (
     MAX_TASK_GOAL_LENGTH,
     TASK_STATUSES,
@@ -484,6 +490,8 @@ class TaskResultEventResponse(APIModel):
     message_kind: str
     task_status: str
     verification_status: str
+    planning_mode: str
+    plan_version: int
     result_available: bool
     verified_action_count: int
     failed_action_count: int
@@ -658,6 +666,8 @@ class ActionSummary(APIModel):
     step_id: str = ""
     tool_name: str = ""
     execution_status: str = ""
+    planning_mode: str = UNKNOWN
+    plan_version: int = 0
     input_fingerprint: str = ""
     updated_at: str = ""
 
@@ -689,6 +699,7 @@ class TaskStateResponse(APIModel):
     current_phase: str
     current_step: str
     plan_version: int
+    planning_mode: str
     completed_actions: list[str]
     pending_actions: list[str]
     failed_actions: list[str]
@@ -1753,6 +1764,8 @@ class AgentAPIService:
                     step_id=str(raw.get("step_id", "")),
                     tool_name=str(raw.get("tool_name", "")),
                     execution_status=str(raw.get("execution_status", "")),
+                    planning_mode=normalize_planning_mode(raw.get("planning_mode", UNKNOWN)),
+                    plan_version=normalize_plan_version(raw.get("plan_version", 0)),
                     input_fingerprint=str(raw.get("input_fingerprint", "")),
                     updated_at=str(raw.get("updated_at", "")),
                 )
@@ -1770,6 +1783,7 @@ class AgentAPIService:
             current_phase=state.current_phase,
             current_step=state.current_step,
             plan_version=state.plan_version,
+            planning_mode=planning_mode_from_plan(state.plan),
             completed_actions=list(state.completed_actions),
             pending_actions=list(state.pending_actions),
             failed_actions=list(state.failed_actions),
@@ -1953,6 +1967,8 @@ class AgentAPIService:
                     message_kind=str(source["message_kind"]),
                     task_status=str(source["task_status"]),
                     verification_status=str(source["verification_status"]),
+                    planning_mode=str(source.get("planning_mode", "UNKNOWN")),
+                    plan_version=int(source.get("plan_version", 0)),
                     result_available=bool(source["result_available"]),
                     verified_action_count=int(source["verified_action_count"]),
                     failed_action_count=int(source["failed_action_count"]),
