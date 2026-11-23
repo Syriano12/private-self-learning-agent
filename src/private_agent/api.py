@@ -2797,7 +2797,7 @@ def build_orchestrator(*, database_path: str | None = None) -> Orchestrator:
 
     register_repository_tools(registry)
     planner = None
-    if os.getenv("GEMINI_API_KEY"):
+    if os.getenv("GEMINI_API_KEY", "").strip():
         from private_agent.core.planner import Planner
 
         planner = Planner(build_provider())

@@ -142,7 +142,7 @@ class GeminiProvider(LLMProvider):
         user_prompt: str,
         response_schema: dict[str, Any],
     ) -> LLMResponse:
-        if not self.config.api_key:
+        if not self.is_configured:
             raise LLMProviderConfigError("Gemini API key is required")
 
         payload = {
