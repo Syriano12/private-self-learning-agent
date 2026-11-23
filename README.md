@@ -476,7 +476,7 @@ X-CSRF-Token: <matching CSRF cookie for POST/PATCH/DELETE>
   "task_id": "...",
   "approval_id": "",
   "api_version": "v1",
-  "schema_version": 1
+  "schema_version": 2
 }
 ```
 
@@ -498,6 +498,8 @@ Approval endpoints لا تقبل تعديل `task_id` أو `action_id` أو capa
 ### API documentation and limits
 
 FastAPI يوفر OpenAPI/Swagger على `/docs` و`/openapi.json`. هذا API contract منفصل عن internal commit/phase versions، ويعرض `api_version` و`schema_version` في الاستجابات.
+
+يعلن `schema_version: 2` إضافة حقول `result_events` و`assistant_reply_supported` إلى `GET /api/v1/tasks/{task_id}/messages`. أحداث النتائج هي ملخصات `SYSTEM` غير قابلة للتعديل مشتقة من حالة الخادم، تشمل التحقق وحالات الموافقات ولا تكشف مخرجات الأدوات الخام. قيمة `assistant_reply_supported` تظل `false`: لا توجد في هذا المسار ردود طبيعية مولدة من مساعد.
 
 هذه المرحلة لا تضيف async job queue، cancellation، public UI/PWA، WhatsApp، payment/billing، multi-tenancy، commercial licensing، new LLM provider، scanners، exploitation، أو strong sandbox.
 

@@ -100,7 +100,7 @@ def test_schema_12_migrates_to_conversation_schema_14(tmp_path: Path, monkeypatc
     migrated.close()
 
 
-def test_schema_13_conversation_layout_migrates_to_14_without_losing_messages(tmp_path: Path) -> None:
+def test_schema_13_conversation_layout_migrates_to_15_without_losing_messages(tmp_path: Path) -> None:
     path = tmp_path / "schema-13-conversation.sqlite3"
     store = Store(path)
     created = store.create_queued_task(
@@ -124,7 +124,7 @@ def test_schema_13_conversation_layout_migrates_to_14_without_losing_messages(tm
     ).fetchone()
     assert migrated.db.execute(
         "SELECT schema_version FROM task_state_schema ORDER BY schema_version DESC LIMIT 1"
-    ).fetchone()["schema_version"] == 14
+    ).fetchone()["schema_version"] == 15
     migrated.close()
 
 
@@ -226,6 +226,8 @@ def test_http_messages_are_pending_idempotent_owner_checked_and_read_only_to_tas
     conversation = client.get(f"/api/v1/tasks/{task_id}/messages", headers=auth_headers())
     assert conversation.status_code == 200
     body = conversation.json()
+    assert body["api_version"] == "v1"
+    assert body["schema_version"] == 2
     assert body["conversation_id"] == task_id
     assert [message["message_kind"] for message in body["messages"]] == ["INITIAL", "FOLLOW_UP"]
     assert all(message["role"] == "USER" for message in body["messages"])

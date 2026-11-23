@@ -73,7 +73,7 @@ from private_agent.worker import BackgroundWorker
 
 
 API_VERSION = "v1"
-API_SCHEMA_VERSION = 1
+API_SCHEMA_VERSION = 2
 SERVICE_NAME = "private-agent"
 LOGGER = logging.getLogger(__name__)
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -455,12 +455,37 @@ class TaskMessageResponse(APIModel):
     request_id: str = ""
 
 
+class TaskResultEventResponse(APIModel):
+    event_id: str
+    conversation_id: str
+    task_id: str
+    sequence: int
+    role: str
+    message_kind: str
+    task_status: str
+    verification_status: str
+    result_available: bool
+    verified_action_count: int
+    failed_action_count: int
+    blocked_action_count: int
+    pending_action_count: int
+    approval_pending_count: int
+    approval_approved_count: int
+    approval_denied_count: int
+    approval_expired_count: int
+    approval_cancelled_count: int
+    result_digest: str
+    created_at: str
+
+
 class TaskConversationResponse(APIModel):
     conversation_id: str
     task_id: str
     task_status: str
     queue_status: str
     messages: list[TaskMessageResponse]
+    result_events: list[TaskResultEventResponse] = Field(default_factory=list)
+    assistant_reply_supported: bool = False
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
@@ -1687,6 +1712,7 @@ class AgentAPIService:
             else None
         )
         messages = self.store.task_messages(task_id, owner_user_id=owner_user_id)
+        result_events = self.store.task_result_events(task_id, owner_user_id=owner_user_id)
         return TaskConversationResponse(
             conversation_id=task_id,
             task_id=task_id,
@@ -1708,6 +1734,32 @@ class AgentAPIService:
                 )
                 for item in messages
             ],
+            result_events=[
+                TaskResultEventResponse(
+                    event_id=str(item["event_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    sequence=int(item["sequence"]),
+                    role=str(item["role"]),
+                    message_kind=str(item["message_kind"]),
+                    task_status=str(item["task_status"]),
+                    verification_status=str(item["verification_status"]),
+                    result_available=bool(item["result_available"]),
+                    verified_action_count=int(item["verified_action_count"]),
+                    failed_action_count=int(item["failed_action_count"]),
+                    blocked_action_count=int(item["blocked_action_count"]),
+                    pending_action_count=int(item["pending_action_count"]),
+                    approval_pending_count=int(item["approval_pending_count"]),
+                    approval_approved_count=int(item["approval_approved_count"]),
+                    approval_denied_count=int(item["approval_denied_count"]),
+                    approval_expired_count=int(item["approval_expired_count"]),
+                    approval_cancelled_count=int(item["approval_cancelled_count"]),
+                    result_digest=str(item["result_digest"]),
+                    created_at=str(item["created_at"]),
+                )
+                for item in result_events
+            ],
+            assistant_reply_supported=False,
             request_id=request_id,
         )
 
