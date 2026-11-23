@@ -85,7 +85,7 @@ class RecoveryProbeTool(RegisteredProbeTool):
         )
         if self.fail_first:
             self.fail_first = False
-            return ToolResult.failed("tool_failed", "synthetic first-attempt failure")
+            return ToolResult.failed("tool_failed", "synthetic first-attempt failure", no_side_effects=True)
         return ToolResult.success({"result": self.result})
 
 
@@ -411,12 +411,10 @@ def test_malformed_tool_result_cannot_enable_a_dependent_step() -> None:
         "bounded local regression fixture",
     )
 
-    results = GenericExecutor(make_registry(malformed, dependent), security).execute_plan(
-        plan, ExecutionContext(security_controller=security)
-    )
+    with pytest.raises(RuntimeError, match="unvalidated result after execution may have started"):
+        GenericExecutor(make_registry(malformed, dependent), security).execute_plan(
+            plan, ExecutionContext(security_controller=security)
+        )
 
-    assert results[0].status == "failed"
-    assert results[0].error is not None and results[0].error.code == "malformed_tool_result"
-    assert results[1].status == "blocked"
-    assert results[1].error is not None and results[1].error.code == "dependency_failed"
+    assert malformed.calls == [{}]
     assert dependent.calls == []

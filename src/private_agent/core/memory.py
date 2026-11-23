@@ -133,6 +133,11 @@ class SQLiteExperienceMemory(ExperienceMemory):
         identity = dict(payload.get("identity")) if isinstance(payload.get("identity"), dict) else {}
         explicit_verification_status = payload.get("verification_status")
         final_outcome = payload.get("final_outcome")
+        normalized_outcome = (
+            "EXECUTION_UNKNOWN"
+            if explicit_verification_status == "EXECUTION_UNKNOWN"
+            else str(final_outcome or "")
+        )
         valid_statuses = {"VERIFIED", "FAILED", "INSUFFICIENT", "BLOCKED"}
         consistent_verification = (
             isinstance(explicit_verification_status, str)
@@ -154,6 +159,11 @@ class SQLiteExperienceMemory(ExperienceMemory):
             identity["verification_status"] = explicit_verification_status
             identity["verification_scope"] = payload["verification_scope"]
             identity["security_impact_verified"] = payload.get("security_impact_verified")
+        elif explicit_verification_status == "EXECUTION_UNKNOWN":
+            identity["outcome"] = "EXECUTION_UNKNOWN"
+            identity["verification_status"] = "EXECUTION_UNKNOWN"
+            identity["verification_scope"] = "UNKNOWN"
+            identity["security_impact_verified"] = None
         elif isinstance(explicit_verification_status, str) and explicit_verification_status:
             identity["verification_status"] = "UNVERIFIED"
             identity["verification_scope"] = "CONFLICTED"
@@ -271,7 +281,7 @@ class SQLiteExperienceMemory(ExperienceMemory):
             relevance=0.0,
             task_summary=str(payload.get("goal", ""))[:500],
             strategy_used=strategy_used,
-            outcome=str(final_outcome or ""),
+            outcome=normalized_outcome,
             failure_diagnosis=list(dict.fromkeys(failures)),
             recovery_strategy=list(dict.fromkeys(recovery)),
             verification_evidence=evidence[: self.max_evidence_per_experience],

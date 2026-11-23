@@ -100,7 +100,7 @@ def test_schema_12_migrates_to_conversation_schema_14(tmp_path: Path, monkeypatc
     migrated.close()
 
 
-def test_schema_13_conversation_layout_migrates_to_14_without_losing_messages(tmp_path: Path) -> None:
+def test_schema_13_conversation_layout_migrates_to_18_without_losing_messages(tmp_path: Path) -> None:
     path = tmp_path / "schema-13-conversation.sqlite3"
     store = Store(path)
     created = store.create_queued_task(
@@ -124,7 +124,7 @@ def test_schema_13_conversation_layout_migrates_to_14_without_losing_messages(tm
     ).fetchone()
     assert migrated.db.execute(
         "SELECT schema_version FROM task_state_schema ORDER BY schema_version DESC LIMIT 1"
-    ).fetchone()["schema_version"] == 14
+    ).fetchone()["schema_version"] == 18
     migrated.close()
 
 
@@ -226,6 +226,8 @@ def test_http_messages_are_pending_idempotent_owner_checked_and_read_only_to_tas
     conversation = client.get(f"/api/v1/tasks/{task_id}/messages", headers=auth_headers())
     assert conversation.status_code == 200
     body = conversation.json()
+    assert body["api_version"] == "v1"
+    assert body["schema_version"] == 3
     assert body["conversation_id"] == task_id
     assert [message["message_kind"] for message in body["messages"]] == ["INITIAL", "FOLLOW_UP"]
     assert all(message["role"] == "USER" for message in body["messages"])
@@ -352,6 +354,10 @@ def test_followup_is_consumed_after_verified_action_then_replanned_and_reauthori
     )
     assert first_key in persisted.completed_actions
     assert persisted.action_records[first_key]["status"] == "VERIFIED"
+    assert persisted.action_records[first_key]["planning_mode"] == "UNKNOWN"
+    assert persisted.action_records[first_key]["plan_version"] == 1
+    assert persisted.result["planning_mode"] == "UNKNOWN"
+    assert persisted.result["plan_version"] == 2
     assert store.task_messages(created["task_id"])[-1]["status"] == "CONSUMED"
     assert persisted.status == "WAITING_APPROVAL"
     assert persisted.stop_reason is not None and persisted.stop_reason.code.value == "APPROVAL_REQUIRED"
@@ -364,7 +370,139 @@ def test_followup_is_consumed_after_verified_action_then_replanned_and_reauthori
     assert completed["status"] == "COMPLETED"
     assert network.calls == 1
     assert store.task_queue_record(created["task_id"])["queue_status"] == "COMPLETED"
+    final_state = TaskState.from_dict(store.get_task_state(created["task_id"]))
+    step_results = final_state.result["step_results"]
+    assert {(item["tool_name"], item["planning_mode"], item["plan_version"]) for item in step_results} == {
+        ("safe", "UNKNOWN", 1),
+        ("network", "UNKNOWN", 2),
+    }
+    outcome_versions = {
+        item["observation"]["plan_version"]
+        for item in final_state.result["step_outcomes"]
+    }
+    assert outcome_versions == {1, 2}
     store.close()
+
+
+def test_replanned_message_commit_survives_restart_as_unknown_without_reexecution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    safe = APITestTool("safe")
+    network = APITestTool("network", capabilities=["NETWORK_ACCESS"], risk="high")
+    service, store, _ = make_service(tmp_path, safe)
+    service.orchestrator.tools.register(network)
+    planner = FollowupPlanner()
+    service.orchestrator.planner = planner
+    created = store.create_queued_task(
+        "complete the first safe action",
+        initial_message="complete the first safe action",
+    )
+    followup_message_ids: list[str] = []
+    original_execute = safe.execute
+
+    def inject_followup(inputs, context):
+        if safe.calls == 0:
+            queued = service.append_task_message(created["task_id"], "Then run the network step")
+            assert queued.status == "PENDING"
+            followup_message_ids.append(queued.message_id)
+        return original_execute(inputs, context)
+
+    safe.execute = inject_followup
+    original_save_task_state = store.save_task_state
+
+    def crash_after_replanned_commit(
+        state,
+        checkpoint_type: str,
+        *,
+        task_status: str | None = None,
+        consume_message_ids=(),
+    ) -> None:
+        original_save_task_state(
+            state,
+            checkpoint_type,
+            task_status=task_status,
+            consume_message_ids=consume_message_ids,
+        )
+        if checkpoint_type == "CONVERSATION_REPLANNED":
+            raise SimulatedProcessCrash
+
+    monkeypatch.setattr(store, "save_task_state", crash_after_replanned_commit)
+    worker = BackgroundWorker(service.orchestrator, worker_id="worker-crash-at-replan")
+
+    with pytest.raises(SimulatedProcessCrash):
+        worker.run_once()
+
+    assert safe.calls == 1
+    assert network.calls == 0
+    assert len(planner.calls) == 2
+    assert len(followup_message_ids) == 1
+    store.close()
+
+    restarted_service, reopened_store, _ = make_service(tmp_path, safe)
+    restarted_service.orchestrator.tools.register(network)
+    restarted_planner = FollowupPlanner()
+    restarted_service.orchestrator.planner = restarted_planner
+    reopened_store.db.execute(
+        "UPDATE task_queue SET lease_expires_at = ? WHERE task_id = ?",
+        ("1970-01-01T00:00:00+00:00", created["task_id"]),
+    )
+    reopened_store.db.commit()
+
+    restarted_worker = BackgroundWorker(
+        restarted_service.orchestrator,
+        worker_id="worker-after-restart",
+    )
+    recovered = restarted_worker.run_once()
+
+    assert recovered["status"] == "EXECUTION_UNKNOWN"
+    assert recovered["task_id"] == created["task_id"]
+    assert recovered["processed"] is False
+    persisted_payload = reopened_store.get_task_state(created["task_id"])
+    assert persisted_payload is not None
+    persisted = TaskState.from_dict(persisted_payload)
+    messages = reopened_store.task_messages(created["task_id"])
+    consumed_followups = [
+        item for item in messages if item["message_id"] in followup_message_ids
+    ]
+    assert len(consumed_followups) == 1
+    assert consumed_followups[0]["status"] == "CONSUMED"
+    assert consumed_followups[0]["consumed_checkpoint"] == "CONVERSATION_REPLANNED"
+    assert persisted.plan_version == 2
+    replans = persisted.context["conversation_replans"]
+    assert len(replans) == 1
+    assert replans[0]["message_ids"] == followup_message_ids
+    replanned_checkpoints = [
+        item for item in reopened_store.task_checkpoints(created["task_id"])
+        if item["checkpoint_type"] == "CONVERSATION_REPLANNED"
+    ]
+    assert len(replanned_checkpoints) == 1
+    assert reopened_store.latest_task_checkpoint(created["task_id"])["checkpoint_type"] == "EXECUTION_UNKNOWN"
+    assert persisted.status == "EXECUTION_UNKNOWN"
+    assert persisted.stop_reason is not None
+    assert persisted.stop_reason.code.value == "EXECUTION_UNKNOWN"
+    assert reopened_store.task_queue_record(created["task_id"])["queue_status"] == "EXECUTION_UNKNOWN"
+
+    first_step = persisted.plan["steps"][0]
+    first_key = action_fingerprint(
+        plan_version=persisted.plan_version,
+        step_id=first_step["id"],
+        tool=first_step["tool"],
+        inputs=first_step["input"],
+    )
+    assert first_key in persisted.completed_actions
+    assert persisted.action_records[first_key]["status"] == "VERIFIED"
+    assert safe.calls == 1
+    assert network.calls == 0
+    assert restarted_planner.calls == []
+    assert restarted_worker.run_once()["status"] == "NO_TASK"
+    assert safe.calls == 1
+    assert network.calls == 0
+    assert len(restarted_planner.calls) == 0
+    reopened_store.close()
 
 
 def test_unchanged_followup_plan_preserves_verified_outcome(tmp_path: Path) -> None:

@@ -33,6 +33,12 @@ from private_agent.core.knowledge import (
     sha256_hex,
 )
 from private_agent.core.orchestrator import Orchestrator
+from private_agent.core.planning_provenance import (
+    UNKNOWN,
+    normalize_plan_version,
+    normalize_planning_mode,
+    planning_mode_from_plan,
+)
 from private_agent.core.task_state import (
     MAX_TASK_GOAL_LENGTH,
     TASK_STATUSES,
@@ -73,7 +79,7 @@ from private_agent.worker import BackgroundWorker
 
 
 API_VERSION = "v1"
-API_SCHEMA_VERSION = 1
+API_SCHEMA_VERSION = 3
 SERVICE_NAME = "private-agent"
 LOGGER = logging.getLogger(__name__)
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -91,6 +97,26 @@ _REDACTED_KEYS = {
     "authorization",
     "credentials",
 }
+_PUBLIC_RECOVERY_REASONS = frozenset({
+    "approval_required", "policy_blocked", "capability_unavailable",
+    "execution_interrupted_before_verified_result", "worker_lease_expired",
+    "worker_execution_interrupted", "ambiguous_execution_state_invalid_action_record",
+    "invalid_persisted_action_record", "ambiguous_execution_state_missing_action_record",
+    "ambiguous_execution_state_requires_observation", "unknown_execution_resolution_not_safe",
+    "resume_security_revalidation_blocked", "persisted_action_completion_conflict",
+    "persisted_verified_action_untrusted", "persisted_execution_result_corrupted",
+    "conversation_security_revalidation_error", "max_execution_age_exceeded",
+})
+_PUBLIC_RECOVERY_REASON_PREFIXES = frozenset({"persisted_plan_invalid", "resume_security_revalidation_error"})
+_PUBLIC_RECOVERY_STRATEGIES = frozenset({
+    "RETRY", "RETRY_WITH_MODIFIED_INPUT", "CHANGE_TOOL", "CHANGE_PARAMETERS",
+    "SKIP_OPTIONAL_STEP", "REPLAN", "ABORT",
+})
+_PUBLIC_FAILURE_TYPES = frozenset({
+    "TOOL_ERROR", "INVALID_INPUT", "MISSING_DEPENDENCY", "PERMISSION_BLOCKED",
+    "TIMEOUT", "RATE_LIMITED", "NETWORK_ERROR", "VERIFICATION_FAILED",
+    "INSUFFICIENT_RESULT", "INVALID_OUTPUT", "UNKNOWN_FAILURE",
+})
 _BEARER = HTTPBearer(auto_error=False)
 
 
@@ -455,15 +481,101 @@ class TaskMessageResponse(APIModel):
     request_id: str = ""
 
 
+class TaskResultEventResponse(APIModel):
+    event_id: str
+    conversation_id: str
+    task_id: str
+    sequence: int
+    role: str
+    message_kind: str
+    task_status: str
+    verification_status: str
+    planning_mode: str
+    plan_version: int
+    result_available: bool
+    verified_action_count: int
+    failed_action_count: int
+    blocked_action_count: int
+    pending_action_count: int
+    approval_pending_count: int
+    approval_approved_count: int
+    approval_denied_count: int
+    approval_expired_count: int
+    approval_cancelled_count: int
+    result_digest: str
+    created_at: str
+
+
+class TaskConversationItemResponse(APIModel):
+    item_type: str
+    sequence: int
+    message: TaskMessageResponse | None = None
+    result_event: TaskResultEventResponse | None = None
+
+    @model_validator(mode="after")
+    def validate_item(self) -> "TaskConversationItemResponse":
+        if self.item_type == "USER_MESSAGE":
+            if self.message is None or self.result_event is not None or self.message.sequence != self.sequence:
+                raise ValueError("task_conversation_item_invalid")
+        elif self.item_type == "SYSTEM_RESULT":
+            if self.result_event is None or self.message is not None or self.result_event.sequence != self.sequence:
+                raise ValueError("task_conversation_item_invalid")
+        else:
+            raise ValueError("task_conversation_item_invalid")
+        return self
+
+
+class TaskAssistantReplyResponse(APIModel):
+    reply_id: str
+    conversation_id: str
+    task_id: str
+    source_event_id: str
+    source_sequence: int
+    role: str
+    message_kind: str
+    reply_code: str
+    content: str
+    created_at: str
+
+
 class TaskConversationResponse(APIModel):
     conversation_id: str
     task_id: str
     task_status: str
     queue_status: str
+    items: list[TaskConversationItemResponse] = Field(default_factory=list)
     messages: list[TaskMessageResponse]
+    result_events: list[TaskResultEventResponse] = Field(default_factory=list)
+    assistant_replies: list[TaskAssistantReplyResponse] = Field(default_factory=list)
+    assistant_reply_supported: bool = False
+    next_cursor: int | None = None
+    has_more: bool = False
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
+
+    @model_validator(mode="after")
+    def validate_ordered_items(self) -> "TaskConversationResponse":
+        sequences = [item.sequence for item in self.items]
+        if any(sequence < 1 for sequence in sequences) or any(
+            left >= right for left, right in zip(sequences, sequences[1:])
+        ):
+            raise ValueError("task_conversation_sequence_invalid")
+        message_ids = [item.message.message_id for item in self.items if item.message is not None]
+        result_ids = [item.result_event.event_id for item in self.items if item.result_event is not None]
+        if message_ids != [message.message_id for message in self.messages] or result_ids != [
+            event.event_id for event in self.result_events
+        ]:
+            raise ValueError("task_conversation_items_mismatch")
+        event_bindings = {(event.event_id, event.sequence) for event in self.result_events}
+        if any((reply.source_event_id, reply.source_sequence) not in event_bindings for reply in self.assistant_replies):
+            raise ValueError("task_conversation_assistant_reply_mismatch")
+        if self.has_more:
+            if not sequences or self.next_cursor != sequences[-1]:
+                raise ValueError("task_conversation_cursor_invalid")
+        elif self.next_cursor is not None:
+            raise ValueError("task_conversation_cursor_invalid")
+        return self
 
 
 class TaskStatusFilter(str, Enum):
@@ -554,6 +666,8 @@ class ActionSummary(APIModel):
     step_id: str = ""
     tool_name: str = ""
     execution_status: str = ""
+    planning_mode: str = UNKNOWN
+    plan_version: int = 0
     input_fingerprint: str = ""
     updated_at: str = ""
 
@@ -585,6 +699,7 @@ class TaskStateResponse(APIModel):
     current_phase: str
     current_step: str
     plan_version: int
+    planning_mode: str
     completed_actions: list[str]
     pending_actions: list[str]
     failed_actions: list[str]
@@ -802,6 +917,114 @@ def _public_value(value: Any, *, key: str = "") -> Any:
     return safe_metadata({"value": value}).get("value")
 
 
+def _recovery_identifier(value: Any) -> str:
+    if isinstance(value, str) and _REQUEST_ID_PATTERN.fullmatch(value):
+        return value
+    return ""
+
+
+def _recovery_identifier_list(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(
+        item for item in (_recovery_identifier(candidate) for candidate in value[:limit]) if item
+    ))
+
+
+def _public_recovery_state(value: Any) -> dict[str, Any]:
+    """Project task recovery data through a closed schema; omit raw diagnostics and inputs."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    reason = value.get("reason")
+    if isinstance(reason, str):
+        reason_code = reason.partition(":")[0]
+        if reason in _PUBLIC_RECOVERY_REASONS:
+            result["reason"] = reason
+        elif reason_code in _PUBLIC_RECOVERY_REASON_PREFIXES:
+            result["reason"] = reason_code
+        else:
+            result["reason"] = "recovery_required"
+
+    decision_value = value.get("decision")
+    if isinstance(decision_value, dict):
+        decision: dict[str, Any] = {}
+        strategy = decision_value.get("strategy")
+        if isinstance(strategy, str) and strategy in _PUBLIC_RECOVERY_STRATEGIES:
+            decision["strategy"] = strategy
+        for field in ("step_id", "original_tool", "replacement_tool"):
+            identifier = _recovery_identifier(decision_value.get(field))
+            if identifier:
+                decision[field] = identifier
+        terminal_status = decision_value.get("terminal_status")
+        if isinstance(terminal_status, str) and terminal_status in {"FAILED", "BLOCKED", "CANCELLED", "COMPLETED"}:
+            decision["terminal_status"] = terminal_status
+        if decision:
+            result["decision"] = decision
+
+    diagnosis_value = value.get("diagnosis")
+    if isinstance(diagnosis_value, dict):
+        diagnosis: dict[str, Any] = {}
+        failure_type = diagnosis_value.get("failure_type")
+        if isinstance(failure_type, str) and failure_type in _PUBLIC_FAILURE_TYPES:
+            diagnosis["failure_type"] = failure_type
+        for field in ("failed_step", "tool_name"):
+            identifier = _recovery_identifier(diagnosis_value.get(field))
+            if identifier:
+                diagnosis[field] = identifier
+        recoverable = diagnosis_value.get("recoverable")
+        if isinstance(recoverable, bool):
+            diagnosis["recoverable"] = recoverable
+        suggested_recovery = diagnosis_value.get("suggested_recovery")
+        if isinstance(suggested_recovery, str) and suggested_recovery in _PUBLIC_RECOVERY_STRATEGIES:
+            diagnosis["suggested_recovery"] = suggested_recovery
+        if diagnosis:
+            result["diagnosis"] = diagnosis
+
+    round_number = value.get("round")
+    if isinstance(round_number, int) and not isinstance(round_number, bool) and 0 <= round_number <= 1_000_000:
+        result["round"] = round_number
+
+    if value.get("external_side_effect_may_have_occurred") is True:
+        result["external_side_effect_may_have_occurred"] = True
+    for field in ("action_key", "step_id"):
+        identifier = _recovery_identifier(value.get(field))
+        if identifier:
+            result[field] = identifier
+    invalid_keys = value.get("invalid_action_record_keys")
+    if isinstance(invalid_keys, list):
+        result["invalid_action_record_count"] = min(len(invalid_keys), 100_000)
+
+    gap_value = value.get("capability_gap")
+    if isinstance(gap_value, dict):
+        gap: dict[str, Any] = {}
+        code = gap_value.get("code")
+        if isinstance(code, str) and code in {"UNREGISTERED_TOOL_REQUEST", "NO_REGISTERED_TOOLS"}:
+            gap["code"] = code
+        if gap_value.get("source") == "planner_registry_validation":
+            gap["source"] = "planner_registry_validation"
+        summary_by_code = {
+            "UNREGISTERED_TOOL_REQUEST": "The planner requested a tool that is not registered; no tool was executed or installed.",
+            "NO_REGISTERED_TOOLS": "No tools are registered for planning; no tool was executed or installed.",
+        }
+        if isinstance(code, str) and code in summary_by_code and gap_value.get("summary") == summary_by_code[code]:
+            gap["summary"] = summary_by_code[code]
+        for field, limit in (("requested_tools", 20), ("registered_tools", 50)):
+            identifiers = _recovery_identifier_list(gap_value.get(field), limit=limit)
+            if field in gap_value:
+                gap[field] = identifiers
+        unavailable_count = gap_value.get("unavailable_tool_count")
+        if isinstance(unavailable_count, int) and not isinstance(unavailable_count, bool) and 0 <= unavailable_count <= 1_000_000:
+            gap["unavailable_tool_count"] = unavailable_count
+        for field in ("execution_attempted", "acquisition_attempted", "permissions_granted"):
+            flag = gap_value.get(field)
+            if isinstance(flag, bool):
+                gap[field] = flag
+        if gap:
+            result["capability_gap"] = gap
+    return result
+
+
 def _safe_id(value: str, field: str) -> str:
     if not value or len(value) > 256 or not _REQUEST_ID_PATTERN.fullmatch(value):
         raise APIError(400, f"invalid_{field}", f"Invalid {field}")
@@ -953,6 +1176,14 @@ class AgentAPIService:
         self.require_owner_auth = os.getenv("AGENT_REQUIRE_OWNER_AUTH", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.auto_requeue_approvals = False
         self._lock = threading.RLock()
+
+    @property
+    def assistant_reply_supported(self) -> bool:
+        planner = getattr(self.orchestrator, "planner", None)
+        provider = getattr(planner, "provider", None)
+        if not callable(getattr(provider, "generate_json", None)):
+            return False
+        return getattr(provider, "is_configured", True) is not False
 
     @staticmethod
     def auth_user_response(user: AuthUser) -> AuthUserResponse:
@@ -1533,6 +1764,8 @@ class AgentAPIService:
                     step_id=str(raw.get("step_id", "")),
                     tool_name=str(raw.get("tool_name", "")),
                     execution_status=str(raw.get("execution_status", "")),
+                    planning_mode=normalize_planning_mode(raw.get("planning_mode", UNKNOWN)),
+                    plan_version=normalize_plan_version(raw.get("plan_version", 0)),
                     input_fingerprint=str(raw.get("input_fingerprint", "")),
                     updated_at=str(raw.get("updated_at", "")),
                 )
@@ -1550,6 +1783,7 @@ class AgentAPIService:
             current_phase=state.current_phase,
             current_step=state.current_step,
             plan_version=state.plan_version,
+            planning_mode=planning_mode_from_plan(state.plan),
             completed_actions=list(state.completed_actions),
             pending_actions=list(state.pending_actions),
             failed_actions=list(state.failed_actions),
@@ -1676,9 +1910,15 @@ class AgentAPIService:
         *,
         request_id: str = "",
         principal: AuthenticatedPrincipal | None = None,
+        after_sequence: int = 0,
+        limit: int = 100,
     ) -> TaskConversationResponse:
         task_id = _safe_id(task_id, "task_id")
         self._assert_task_access(task_id, principal)
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int) or after_sequence < 0:
+            raise APIError(400, "invalid_conversation_cursor", "Invalid conversation cursor", task_id=task_id)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise APIError(400, "invalid_conversation_limit", "Invalid conversation page size", task_id=task_id)
         state = self._state(task_id)
         queue = self.store.task_queue_record(task_id) or {}
         owner_user_id = (
@@ -1686,28 +1926,95 @@ class AgentAPIService:
             if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
             else None
         )
-        messages = self.store.task_messages(task_id, owner_user_id=owner_user_id)
+        page = self.store.task_conversation_items(
+            task_id,
+            owner_user_id=owner_user_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+        messages: list[TaskMessageResponse] = []
+        result_events: list[TaskResultEventResponse] = []
+        items: list[TaskConversationItemResponse] = []
+        for item in page["items"]:
+            sequence = int(item["sequence"])
+            if item["item_type"] == "USER_MESSAGE":
+                source = item["message"]
+                message = TaskMessageResponse(
+                    message_id=str(source["message_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    sequence=sequence,
+                    role=str(source["role"]),
+                    message_kind=str(source["message_kind"]),
+                    content=str(source["content"]),
+                    status=str(source["status"]),
+                    created_at=str(source["created_at"]),
+                    consumed_at=str(source.get("consumed_at", "")),
+                    consumed_checkpoint=str(source.get("consumed_checkpoint", "")),
+                )
+                messages.append(message)
+                items.append(TaskConversationItemResponse(
+                    item_type="USER_MESSAGE", sequence=sequence, message=message,
+                ))
+            else:
+                source = item["result_event"]
+                result_event = TaskResultEventResponse(
+                    event_id=str(source["event_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    sequence=sequence,
+                    role=str(source["role"]),
+                    message_kind=str(source["message_kind"]),
+                    task_status=str(source["task_status"]),
+                    verification_status=str(source["verification_status"]),
+                    planning_mode=str(source.get("planning_mode", "UNKNOWN")),
+                    plan_version=int(source.get("plan_version", 0)),
+                    result_available=bool(source["result_available"]),
+                    verified_action_count=int(source["verified_action_count"]),
+                    failed_action_count=int(source["failed_action_count"]),
+                    blocked_action_count=int(source["blocked_action_count"]),
+                    pending_action_count=int(source["pending_action_count"]),
+                    approval_pending_count=int(source["approval_pending_count"]),
+                    approval_approved_count=int(source["approval_approved_count"]),
+                    approval_denied_count=int(source["approval_denied_count"]),
+                    approval_expired_count=int(source["approval_expired_count"]),
+                    approval_cancelled_count=int(source["approval_cancelled_count"]),
+                    result_digest=str(source["result_digest"]),
+                    created_at=str(source["created_at"]),
+                )
+                result_events.append(result_event)
+                items.append(TaskConversationItemResponse(
+                    item_type="SYSTEM_RESULT", sequence=sequence, result_event=result_event,
+                ))
+        included_event_ids = {event.event_id for event in result_events}
+        assistant_replies = self.store.task_assistant_replies(task_id, owner_user_id=owner_user_id)
         return TaskConversationResponse(
             conversation_id=task_id,
             task_id=task_id,
             task_status=state.status,
             queue_status=str(queue.get("queue_status", "")),
-            messages=[
-                TaskMessageResponse(
-                    message_id=str(item["message_id"]),
+            items=items,
+            messages=messages,
+            result_events=result_events,
+            assistant_replies=[
+                TaskAssistantReplyResponse(
+                    reply_id=str(item["reply_id"]),
                     conversation_id=task_id,
                     task_id=task_id,
-                    sequence=int(item["sequence"]),
+                    source_event_id=str(item["event_id"]),
+                    source_sequence=int(item["source_sequence"]),
                     role=str(item["role"]),
                     message_kind=str(item["message_kind"]),
+                    reply_code=str(item["reply_code"]),
                     content=str(item["content"]),
-                    status=str(item["status"]),
                     created_at=str(item["created_at"]),
-                    consumed_at=str(item.get("consumed_at", "")),
-                    consumed_checkpoint=str(item.get("consumed_checkpoint", "")),
                 )
-                for item in messages
+                for item in assistant_replies
+                if str(item["event_id"]) in included_event_ids
             ],
+            assistant_reply_supported=self.assistant_reply_supported,
+            next_cursor=page["next_cursor"],
+            has_more=page["has_more"],
             request_id=request_id,
         )
 
@@ -1914,9 +2221,7 @@ class AgentAPIService:
         }
 
     def _capability_gap_recovery_state(self, state: TaskState) -> dict[str, Any]:
-        recovery = _public_value(state.recovery_state)
-        if not isinstance(recovery, dict):
-            return {}
+        recovery = _public_recovery_state(state.recovery_state)
         gap = recovery.get("capability_gap")
         if not isinstance(gap, dict):
             return recovery
@@ -2508,7 +2813,7 @@ def build_orchestrator(*, database_path: str | None = None) -> Orchestrator:
 
     register_repository_tools(registry)
     planner = None
-    if os.getenv("GEMINI_API_KEY"):
+    if os.getenv("GEMINI_API_KEY", "").strip():
         from private_agent.core.planner import Planner
 
         planner = Planner(build_provider())
@@ -2761,6 +3066,7 @@ def create_app(
     async def request_correlation(request: Request, call_next: Callable[..., Any]) -> Any:
         supplied = request.headers.get("X-Request-ID", "")
         request_id = supplied if _REQUEST_ID_PATTERN.fullmatch(supplied) else uuid.uuid4().hex
+        timeline_read = request.method == "GET" and re.fullmatch(r"/(?:api/v1/)?tasks/[^/]+/timeline", request.url.path) is not None
         request.state.request_id = request_id
         current_service = getattr(application.state, "agent_api_service", None)
         if current_service is None and (request.url.path.startswith("/api/") or request.url.path == "/tasks/run"):
@@ -2780,7 +3086,7 @@ def create_app(
                 with current_service._lock:
                     current_service.observability.emit(
                         "API_REQUEST_FAILED",
-                        task_id=getattr(request.state, "task_id", ""),
+                        task_id="" if timeline_read else getattr(request.state, "task_id", ""),
                         correlation_id=request_id,
                         component="api",
                         severity="ERROR",
@@ -2792,7 +3098,7 @@ def create_app(
             with current_service._lock:
                 current_service.observability.emit(
                     "API_REQUEST_COMPLETED",
-                    task_id=getattr(request.state, "task_id", ""),
+                    task_id="" if timeline_read else getattr(request.state, "task_id", ""),
                     correlation_id=request_id,
                     component="api",
                     severity="ERROR" if response.status_code >= 500 else "INFO",
@@ -3083,11 +3389,19 @@ def create_app(
     def get_task_conversation(
         request: Request,
         task_id: str = APIPath(..., min_length=1, max_length=256),
+        after_sequence: int = Query(default=0, ge=0, le=9223372036854775807),
+        limit: int = Query(default=100, ge=1, le=100),
         service: AgentAPIService = Depends(_service),
         principal: AuthenticatedPrincipal = Depends(_principal),
     ) -> TaskConversationResponse:
         request.state.task_id = task_id
-        return service.get_task_conversation(task_id, request_id=_request_id(request), principal=principal)
+        return service.get_task_conversation(
+            task_id,
+            request_id=_request_id(request),
+            principal=principal,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
 
     @router.post(
         "/tasks/{task_id}/messages",

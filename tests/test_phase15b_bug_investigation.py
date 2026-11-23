@@ -590,11 +590,12 @@ class _WrongPlanProvider:
         self.calls = 0
 
     def generate_json(self, *, system_prompt: str, user_prompt: str, response_schema: dict):
-        del system_prompt, user_prompt, response_schema
+        del system_prompt, response_schema
         self.calls += 1
+        goal = json.loads(user_prompt)["goal"]
         return LLMResponse(
             data={
-                "goal": "Investigate this bug in https://github.com/example/buggy: login fails",
+                "goal": goal,
                 "rationale": "provider proposal",
                 "steps": [{
                     "id": "wrong-tool",
@@ -622,3 +623,122 @@ def test_explicit_bug_goal_is_routed_to_investigator_even_with_provider(buggy_re
     assert provider.calls == 0
     assert plan.steps[0].tool == "investigate_repository_bug"
     assert plan.steps[0].input == {"repository": "example/buggy", "bug_report": plan.goal}
+
+
+@pytest.mark.parametrize(
+    "hook_name",
+    ["planning_inputs", "input_schema", "output_schema", "permission_level"],
+)
+def test_provider_uses_normal_plan_when_specialized_tool_hook_fails(
+    buggy_repository: Path,
+    hook_name: str,
+):
+    registry, _ = make_registry(buggy_repository)
+    investigator = registry.get("investigate_repository_bug")
+
+    def fail_hook(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("test hook failure")
+
+    setattr(investigator, hook_name, fail_hook)
+    provider = _WrongPlanProvider()
+    goal = "Investigate this bug in https://github.com/example/buggy: login fails"
+
+    plan = Planner(provider=provider).create(goal, registry, [])
+
+    assert provider.calls == 1
+    assert plan.steps[0].tool == "inspect_repository_structure"
+
+
+def test_provider_path_survives_registry_available_metadata_failure(buggy_repository: Path):
+    registry, _ = make_registry(buggy_repository)
+
+    def fail_available() -> None:
+        raise RuntimeError("test registry metadata failure")
+
+    registry.available = fail_available
+    provider = _WrongPlanProvider()
+
+    plan = Planner(provider=provider).create(
+        "Review repository architecture in https://github.com/example/buggy",
+        registry,
+        [],
+    )
+
+    assert provider.calls == 1
+    assert plan.steps[0].tool == "inspect_repository_structure"
+
+
+def test_provider_path_survives_registry_lookup_failure_for_specialized_tool(
+    buggy_repository: Path,
+):
+    registry, _ = make_registry(buggy_repository)
+    original_get = registry.get
+
+    def fail_investigator_lookup(name: str):
+        if name == "investigate_repository_bug":
+            raise RuntimeError("test registry lookup failure")
+        return original_get(name)
+
+    registry.get = fail_investigator_lookup
+    provider = _WrongPlanProvider()
+
+    plan = Planner(provider=provider).create(
+        "Investigate this bug in https://github.com/example/buggy: login fails",
+        registry,
+        [],
+    )
+
+    assert provider.calls == 1
+    assert plan.steps[0].tool == "inspect_repository_structure"
+
+
+def test_provider_falls_through_when_specialized_output_schema_is_missing(
+    buggy_repository: Path,
+):
+    registry, _ = make_registry(buggy_repository)
+    registry.get("investigate_repository_bug").output_schema = None
+    provider = _WrongPlanProvider()
+
+    plan = Planner(provider=provider).create(
+        "Investigate this bug in https://github.com/example/buggy: login fails",
+        registry,
+        [],
+    )
+
+    assert provider.calls == 1
+    assert plan.steps[0].tool == "inspect_repository_structure"
+
+
+def test_owner_reviewed_idor_route_falls_through_when_investigator_schema_fails(
+    buggy_repository: Path,
+):
+    registry, _ = make_registry(buggy_repository)
+    investigator = registry.get("investigate_repository_bug")
+
+    def fail_output_schema() -> None:
+        raise RuntimeError("test output schema failure")
+
+    investigator.output_schema = fail_output_schema
+    claim = {
+        "object_text": "Owner-confirmed IDOR/BOLA finding",
+        "knowledge_type": "reviewed_security_finding",
+        "domain": "cybersecurity.bugbounty",
+        "predicate": "owner_confirmed_after_evidence_gate",
+        "status": "SUPPORTED",
+        "verification_status": "verified",
+        "is_attested": True,
+        "is_active": True,
+        "is_fresh": True,
+        "is_verified": True,
+        "attestation_id": "attestation-1",
+        "metadata": {"review_id": "review-1", "evidence_sha256": "a" * 64},
+        "conflict_count": 0,
+        "conflict_suppression_ids": [],
+    }
+    provider = _WrongPlanProvider()
+    goal = "Investigate this bug: IDOR/BOLA in https://github.com/example/buggy"
+
+    plan = Planner(provider=provider).create(goal, registry, [claim])
+
+    assert provider.calls == 1
+    assert plan.steps[0].tool == "inspect_repository_structure"

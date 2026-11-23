@@ -130,6 +130,11 @@ class GeminiProvider(LLMProvider):
         self.sleep_fn = sleep_fn
         self.config.validate()
 
+    @property
+    def is_configured(self) -> bool:
+        """Report readiness without exposing or logging the credential."""
+        return bool(self.config.api_key.strip())
+
     def generate_json(
         self,
         *,
@@ -137,7 +142,7 @@ class GeminiProvider(LLMProvider):
         user_prompt: str,
         response_schema: dict[str, Any],
     ) -> LLMResponse:
-        if not self.config.api_key:
+        if not self.is_configured:
             raise LLMProviderConfigError("Gemini API key is required")
 
         payload = {

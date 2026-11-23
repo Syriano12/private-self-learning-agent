@@ -11,6 +11,7 @@ from private_agent.api import AgentAPIService, create_app
 from private_agent.core.llm import LLMResponse
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import Planner
+from private_agent.core.task_state import TaskState
 from private_agent.storage import Store, now
 from private_agent.tools.contracts import ToolResult
 from private_agent.tools.research import ToolRegistry
@@ -117,6 +118,8 @@ def test_unregistered_tool_request_blocks_before_execution_and_is_durable_and_vi
     assert persisted["status"] == "BLOCKED"
     assert persisted["current_phase"] == "CAPABILITY_GAP"
     assert persisted["recovery_state"] == {"reason": "capability_unavailable", "capability_gap": gap}
+    plan_row = store.db.execute("SELECT plan_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert json.loads(plan_row["plan_json"])["planning_mode"] == "UNKNOWN"
     store.close()
 
     reopened = Store(db_path)
@@ -232,6 +235,17 @@ def test_specialized_bug_bounty_route_blocks_when_selected_scanner_is_not_regist
     persisted_after_restart = reopened.get_task_state(result["task_id"])
     assert persisted_after_restart is not None
     assert persisted_after_restart["recovery_state"] == persisted["recovery_state"]
+    marker = "INERT_BUG_BOUNTY_RECOVERY_CANARY_941c"
+    state = TaskState.from_dict(persisted_after_restart)
+    state.recovery_state["diagnosis"] = {"details": {"raw_tool_diagnostic": marker}}
+    state.recovery_state["capability_gap"]["candidate_lifecycle"] = {"internal_debug": marker}
+    state.recovery_state["capability_gap"]["unrecognized_raw_field"] = marker
+    state.recovery_state["unrecognized_raw_field"] = marker
+    state.touch()
+    reopened.save_task_state(state, "TEST_BUG_BOUNTY_RECOVERY_REDACTION")
+    persisted_after_restart = reopened.get_task_state(result["task_id"])
+    assert persisted_after_restart is not None
+    assert marker in repr(persisted_after_restart["recovery_state"])
     service = AgentAPIService(Orchestrator(reopened, registry, planner=Planner(provider)), token=API_TOKEN)
     with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
         headers = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -240,6 +254,8 @@ def test_specialized_bug_bounty_route_blocks_when_selected_scanner_is_not_regist
 
     assert general.status_code == 200, general.text
     assert specialized.status_code == 200, specialized.text
+    assert marker not in general.text
+    assert marker not in specialized.text
     general_body = general.json()
     specialized_body = specialized.json()
     assert general_body["status"] == specialized_body["status"] == "BLOCKED"
@@ -292,6 +308,73 @@ def test_repeated_unregistered_tool_requests_remain_a_single_truthful_capability
     assert result["capability_gap"]["requested_tools"] == ["unavailable_tool"]
     assert result["capability_gap"]["unavailable_tool_count"] == 1
     assert result["capability_gap"]["execution_attempted"] is False
+    store.close()
+
+
+def test_task_detail_api_omits_raw_recovery_diagnostics_and_unknown_fields(tmp_path: Path) -> None:
+    goal = "Read a synthetic value with registered_read."
+    tool = CountingReadTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    provider = StaticPlanProvider(_plan(goal, tool.name))
+    store = Store(tmp_path / "recovery-redaction.sqlite3")
+    orchestrator = Orchestrator(store, registry, planner=Planner(provider))
+    result = orchestrator.run(goal)
+    task_id = result["task_id"]
+
+    marker = "INERT_RAW_TOOL_DIAGNOSTIC_CANARY_7f19"
+    persisted = store.get_task_state(task_id)
+    assert persisted is not None
+    state = TaskState.from_dict(persisted)
+    state.recovery_state = {
+        "reason": f"persisted_plan_invalid:ValueError:{marker}",
+        "decision": {
+            "strategy": "RETRY",
+            "reason": marker,
+            "step_id": "safe-step",
+            "original_tool": "registered_read",
+            "modified_input": {"value": marker},
+            "details": {"stderr": marker},
+        },
+        "diagnosis": {
+            "failure_type": "TOOL_ERROR",
+            "reason": marker,
+            "failed_step": "safe-step",
+            "tool_name": "registered_read",
+            "recoverable": True,
+            "suggested_recovery": "RETRY",
+            "evidence": [{"type": "execution_error", "value": {"stderr": marker}}],
+            "details": {"debug": marker},
+        },
+        "round": 1,
+        "unrecognized_internal_field": marker,
+    }
+    state.touch()
+    store.save_task_state(state, "TEST_RECOVERY_DIAGNOSTIC_REDACTION")
+    assert marker in repr(store.get_task_state(task_id)["recovery_state"])
+
+    service = AgentAPIService(orchestrator, token=API_TOKEN)
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        response = client.get(
+            f"/api/v1/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {API_TOKEN}"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert marker not in response.text
+    recovery = response.json()["recovery_state"]
+    assert recovery == {
+        "reason": "persisted_plan_invalid",
+        "decision": {"strategy": "RETRY", "step_id": "safe-step", "original_tool": "registered_read"},
+        "diagnosis": {
+            "failure_type": "TOOL_ERROR",
+            "failed_step": "safe-step",
+            "tool_name": "registered_read",
+            "recoverable": True,
+            "suggested_recovery": "RETRY",
+        },
+        "round": 1,
+    }
     store.close()
 
 

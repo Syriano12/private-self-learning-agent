@@ -56,6 +56,17 @@ def test_active_scope_requires_explicit_identity_and_resource_binding():
     assert reason == "identity_required_for_active_testing"
 
 
+@pytest.mark.parametrize("mode", ("activee", "passivee", ""))
+def test_scope_rejects_unsupported_authorization_mode(mode):
+    scope = ScopeDefinition.from_dict(scope_payload())
+    decision, reason = scope.authorize(
+        "https://fixture.local/api/v1/orders/order-alice",
+        mode=mode,
+    )
+    assert decision is ScopeDecision.DENIED
+    assert reason == "mode_not_permitted"
+
+
 def test_scope_path_prefix_is_segment_bounded():
     scope = ScopeDefinition.from_dict(scope_payload())
     decision, reason = scope.authorize(

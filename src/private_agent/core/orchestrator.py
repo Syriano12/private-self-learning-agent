@@ -14,6 +14,14 @@ from private_agent.core.learning import LearningEngine, LearningMemory, SQLiteLe
 from private_agent.core.memory import ExperienceMemory, ExperienceQuery, SQLiteExperienceMemory
 from private_agent.core.observation import Observation, StepOutcome
 from private_agent.core.planner import CapabilityUnavailableError, PlanStep, Planner, PlanValidationError, TaskPlan
+from private_agent.core.planning_provenance import (
+    DETERMINISTIC_ROUTE,
+    PLANNING_MODES,
+    UNKNOWN,
+    normalize_plan_version,
+    normalize_planning_mode,
+    planning_mode_from_plan,
+)
 from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
@@ -164,6 +172,10 @@ class Orchestrator:
             tool = self.tools.get(step.tool)
         except KeyError:
             return None
+        except Exception:
+            # This is only an early preflight lookup; execute_step performs the
+            # authoritative lookup and authorization before any side effect.
+            return None
         if step.input_bindings:
             resolved_input, binding_error = self.executor._resolve_input_bindings(step, tool, context)
             if binding_error is not None:
@@ -202,7 +214,7 @@ class Orchestrator:
             "reason": "approval_required" if waiting else "policy_blocked",
             "decisions": [decision.to_dict()],
         }
-        state.result = {"final_status": "BLOCKED"}
+        state.result = {"final_status": "BLOCKED", **self._plan_provenance(state)}
         key = state.action_key_for_step(step)
         # Authorization is pending, but no execution has started. Preserve the
         # durable action as NOT_STARTED so resume validation cannot mistake a
@@ -268,10 +280,26 @@ class Orchestrator:
             outcomes[step.id] = outcome
         return outcomes
 
+    @staticmethod
+    def _plan_provenance(state: TaskState | None) -> dict[str, Any]:
+        if state is None or not state.plan:
+            return {"planning_mode": UNKNOWN, "plan_version": 0}
+        version = normalize_plan_version(state.plan_version)
+        if version < 1:
+            version = 0
+        return {"planning_mode": planning_mode_from_plan(state.plan), "plan_version": version}
+
+    @classmethod
+    def _bind_step_result_provenance(cls, result: StepResult, state: TaskState) -> None:
+        provenance = cls._plan_provenance(state)
+        result.planning_mode = provenance["planning_mode"]
+        result.plan_version = provenance["plan_version"]
+
     def _block_conversation_replan(self, state: TaskState, reason: str) -> dict[str, Any]:
         result = {
             "task_id": state.task_id,
             "goal": state.goal,
+            **self._plan_provenance(state),
             "errors": [reason],
             "verification": {"verified": False, "status": "BLOCKED"},
             "final_status": "BLOCKED",
@@ -418,6 +446,7 @@ class Orchestrator:
                 goal=effective_goal,
                 steps=merged_steps,
                 rationale=f"{proposed.rationale}; previously verified actions retained",
+                planning_mode=proposed.planning_mode,
             )
         except Exception as exc:
             blocked = self._block_conversation_replan(state, "conversation_replan_failed")
@@ -597,6 +626,7 @@ class Orchestrator:
                         success_criteria={"required_fields": required_fields},
                     )],
                     rationale="Specialized Bug Bounty route; normal plan validation and execution authorization remain authoritative",
+                    planning_mode=DETERMINISTIC_ROUTE,
                 )
             else:
                 initial_plan = self._create_plan(
@@ -672,7 +702,7 @@ class Orchestrator:
                     "reason": "approval_required" if waiting else "policy_blocked",
                     "decisions": [decision.to_dict() for decision in blocked],
                 }
-                state.result = {"final_status": "BLOCKED"}
+                state.result = {"final_status": "BLOCKED", **self._plan_provenance(state)}
                 state.checkpoint(
                     "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED",
                     status="WAITING_APPROVAL" if waiting else "BLOCKED",
@@ -793,6 +823,7 @@ class Orchestrator:
                     metadata={"tool_name": step.tool, "round": rounds},
                 )
                 step_result = self._execute_one(step, step_context)
+                self._bind_step_result_provenance(step_result, state)
                 all_step_results.append(step_result)
                 state.mark_action(
                     key,
@@ -1025,6 +1056,8 @@ class Orchestrator:
             "step_outcomes": [outcome.to_dict() for outcome in all_outcomes],
             "final_step_outcomes": [outcome.to_dict() for outcome in final_outcomes],
             "verification": verification_payload,
+            "planning_mode": state.plan.get("planning_mode", UNKNOWN) if state.plan else UNKNOWN,
+            "plan_version": state.plan_version if state.plan else 0,
             "diagnoses": diagnoses,
             "recovery_attempts": [attempt.to_dict() for attempt in self.recovery.attempts],
             "learned_strategies_used": learned_context,
@@ -1086,7 +1119,7 @@ class Orchestrator:
             task_id,
             goal,
             storage_status,
-            {"rationale": current_plan.rationale, "steps": [step.__dict__ for step in current_plan.steps]},
+            self._plan_payload(current_plan),
             result,
             rounds,
         )
@@ -1147,6 +1180,8 @@ class Orchestrator:
             "recovery_attempts": [],
             "security_decisions": [],
             "capability_gap": gap,
+            "planning_mode": state.plan.get("planning_mode", UNKNOWN) if state.plan else UNKNOWN,
+            "plan_version": state.plan_version if state.plan else 0,
             "final_status": "BLOCKED",
         }
         state.result = result
@@ -1175,7 +1210,12 @@ class Orchestrator:
             state.task_id,
             state.goal,
             "blocked",
-            {"goal": state.goal, "rationale": "Planning stopped at the registered-tool boundary", "steps": []},
+            {
+                "goal": state.goal,
+                "rationale": "Planning stopped at the registered-tool boundary",
+                "planning_mode": result["planning_mode"],
+                "steps": [],
+            },
             result,
             0,
         )
@@ -1227,6 +1267,7 @@ class Orchestrator:
         result = {
             "task_id": task_id,
             "goal": goal,
+            **self._plan_provenance(state),
             "sources": [],
             "errors": ["security_policy_blocked"],
             "prior_knowledge_used": prior,
@@ -1299,7 +1340,7 @@ class Orchestrator:
                     task_id=state.task_id,
                     metadata={"terminal_state": True},
                 )
-            return state.result or self._resume_failure(task_id, "terminal_state_missing_result")
+            return state.result or self._resume_failure(task_id, "terminal_state_missing_result", state=state)
 
         def valid_persisted_action_record(key: str, record: Any) -> bool:
             if not isinstance(key, str) or not isinstance(record, dict):
@@ -1519,7 +1560,9 @@ class Orchestrator:
             state.checkpoint("APPROVAL_REVALIDATED", status="READY", phase="APPROVAL_REVALIDATED", successful=True)
             self._save_checkpoint(state, "APPROVAL_REVALIDATED")
             return True, []
-        pending_plan = TaskPlan(plan.goal, pending_steps, plan.rationale)
+        pending_plan = TaskPlan(
+            plan.goal, pending_steps, plan.rationale, planning_mode=plan.planning_mode,
+        )
         decisions = self.security.preflight_plan(
             state.task_id,
             pending_plan,
@@ -1782,6 +1825,7 @@ class Orchestrator:
                         metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
                     )
                     step_result = self._execute_one(step, step_context)
+                    self._bind_step_result_provenance(step_result, state)
                     state.mark_action(
                         key,
                         status="OBSERVING",
@@ -1984,6 +2028,7 @@ class Orchestrator:
             "step_outcomes": [item.to_dict() for item in all_outcomes],
             "final_step_outcomes": [item.to_dict() for item in final_outcomes],
             "verification": verification_payload,
+            **self._plan_provenance(state),
             "diagnoses": diagnoses,
             "recovery_attempts": [attempt.to_dict() for attempt in self.recovery.attempts],
             "learned_strategies_used": learned_context,
@@ -2075,6 +2120,7 @@ class Orchestrator:
                 "errors": list(result.get("errors", [])) + [reason],
                 "security_decisions": [decision.to_dict() for decision in decisions] if decisions else list(state.security_decisions.values()),
                 "final_status": "BLOCKED",
+                **self._plan_provenance(state),
             }
         )
         if self.security is not None:
@@ -2104,9 +2150,15 @@ class Orchestrator:
             )
         return result
 
-    def _resume_failure(self, task_id: str, reason: str) -> dict[str, Any]:
+    def _resume_failure(self, task_id: str, reason: str, *, state: TaskState | None = None) -> dict[str, Any]:
         self.store.save_event(task_id, "resume_blocked", {"reason": reason})
-        return {"task_id": task_id, "errors": [reason], "final_status": "BLOCKED", "verification": {"verified": False, "status": "BLOCKED"}}
+        return {
+            "task_id": task_id,
+            "errors": [reason],
+            "final_status": "BLOCKED",
+            "verification": {"verified": False, "status": "BLOCKED"},
+            **self._plan_provenance(state),
+        }
 
     def _plan_from_payload(self, payload: dict[str, Any]) -> TaskPlan:
         if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
@@ -2126,7 +2178,13 @@ class Orchestrator:
             )
         if not steps:
             raise StateIntegrityError("persisted_plan_empty")
-        return TaskPlan(str(payload.get("goal", "")), steps, str(payload.get("rationale", "")))
+        planning_mode = payload.get("planning_mode", UNKNOWN)
+        if not isinstance(planning_mode, str) or planning_mode not in PLANNING_MODES:
+            raise StateIntegrityError("persisted_plan_planning_mode_invalid")
+        return TaskPlan(
+            str(payload.get("goal", "")), steps, str(payload.get("rationale", "")),
+            planning_mode=planning_mode,
+        )
 
     def _experience_from_state(self, state: TaskState, plan: TaskPlan) -> ExperienceRecord:
         payload = state.result.get("experience", {})
@@ -2156,7 +2214,16 @@ class Orchestrator:
             from private_agent.tools.contracts import ToolError
 
             error = ToolError(error_payload.get("code", "unknown"), error_payload.get("message", ""), error_payload.get("details", {}))
-        return StepResult(payload["step_id"], payload["tool_name"], payload.get("status", "failed"), payload.get("output"), error, dict(payload.get("metadata", {})))
+        return StepResult(
+            payload["step_id"],
+            payload["tool_name"],
+            payload.get("status", "failed"),
+            payload.get("output"),
+            error,
+            dict(payload.get("metadata", {})),
+            normalize_planning_mode(payload.get("planning_mode", UNKNOWN)),
+            normalize_plan_version(payload.get("plan_version", 0)),
+        )
 
     def _save_checkpoint_after(self, state: TaskState, checkpoint_type: str, step_id: str, *, status: str = "OBSERVING") -> None:
         state.checkpoint(checkpoint_type, status=status, phase=checkpoint_type, step_id=step_id)
@@ -2568,6 +2635,7 @@ class Orchestrator:
         return {
             "goal": plan.goal,
             "rationale": plan.rationale,
+            "planning_mode": plan.planning_mode if plan.planning_mode in PLANNING_MODES else UNKNOWN,
             "steps": [step.__dict__ for step in plan.steps],
         }
 

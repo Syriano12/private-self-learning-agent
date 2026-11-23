@@ -407,7 +407,7 @@ class WebResearchTool:
         query = inputs["query"]
         limit = inputs.get("limit", 5)
         if type(limit) is not int or limit < 1 or limit > MAX_SEARCH_LIMIT:
-            return ToolResult.failed("invalid_input", "Research limit is invalid", output={"query": _redact_text(query), "sources": [], "errors": ["limit_invalid"]})
+            return ToolResult.failed("invalid_input", "Research limit is invalid", output={"query": _redact_text(query), "sources": [], "errors": ["limit_invalid"]}, no_side_effects=True)
         found = self._search_internal(query, limit=limit)
         errors = list(found.errors)
         if not found.sources:
@@ -415,6 +415,7 @@ class WebResearchTool:
                 "no_sources",
                 "Web research returned no sources",
                 output={"query": _redact_text(query), "sources": [], "errors": errors},
+                no_side_effects=True,
             )
 
         fetched: list[dict[str, Any]] = []

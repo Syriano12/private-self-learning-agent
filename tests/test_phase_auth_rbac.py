@@ -97,14 +97,16 @@ def test_cli_serve_accepts_explicit_database_path(monkeypatch: pytest.MonkeyPatc
     assert captured["uvicorn_kwargs"] == {"host": "127.0.0.1", "port": 18123}
 
 
-def test_schema_v14_reopens_with_auth_ownership_research_review_worker_and_conversation_tables(tmp_path: Path) -> None:
+def test_schema_v18_reopens_with_auth_ownership_research_review_worker_and_assistant_tables(tmp_path: Path) -> None:
     path = tmp_path / "schema-v8.sqlite3"
     store = Store(path)
     versions = [row["schema_version"] for row in store.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
     assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_users'").fetchone()
     assert store.db.execute("SELECT 1 FROM pragma_table_info('bugbounty_research_stages') WHERE name = 'lease_id'").fetchone()
     assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_research_stages_claim'").fetchone()
+    assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_result_events'").fetchone()
+    assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_assistant_replies'").fetchone()
     store.close()
     reopened = Store(path)
     assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_sessions'").fetchone()
@@ -112,6 +114,7 @@ def test_schema_v14_reopens_with_auth_ownership_research_review_worker_and_conve
     assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_owners'").fetchone()
     assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bugbounty_research_stages'").fetchone()
     assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bugbounty_finding_reviews'").fetchone()
+    assert reopened.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_assistant_replies'").fetchone()
     reopened.close()
 
 

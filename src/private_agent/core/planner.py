@@ -9,6 +9,13 @@ from typing import Any
 
 from private_agent.core.learning import SQLiteLearningMemory
 from private_agent.core.llm import LLMProvider
+from private_agent.core.planning_provenance import (
+    DETERMINISTIC_FALLBACK,
+    DETERMINISTIC_ROUTE,
+    PROVIDER_VALIDATED,
+    UNKNOWN,
+)
+from private_agent.tools.contracts import validate_schema_value
 from private_agent.tools.github_access import RepositoryAccessError, parse_repository
 from private_agent.tools.research import ToolRegistry
 
@@ -55,6 +62,7 @@ class TaskPlan:
     goal: str
     steps: list[PlanStep]
     rationale: str
+    planning_mode: str = UNKNOWN
 
 
 PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -101,6 +109,10 @@ PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
 
 class Planner:
     """Generate plans through an injected LLM provider and validate them deterministically."""
+
+    _MAX_FALLBACK_SCHEMA_DEPTH = 64
+    _MAX_FALLBACK_SCHEMA_NODES = 4096
+    _FALLBACK_SCHEMA_UNSET = object()
 
     def __init__(
         self,
@@ -157,46 +169,53 @@ class Planner:
             # report contract. Route it through the registered tool proposal
             # before consulting the provider; the normal validator and execution
             # authorization still remain authoritative.
-            try:
-                investigator = tools.get("investigate_repository_bug")
-            except KeyError:
-                investigator = None
-            propose = getattr(investigator, "planning_inputs", None)
-            proposed_inputs = propose(goal) if callable(propose) else None
-            if isinstance(proposed_inputs, dict):
-                output_schema = getattr(investigator, "output_schema", lambda: {})()
-                required_fields = list(output_schema.get("required", [])) if isinstance(output_schema, dict) else []
-                return self.validate(
-                    {
-                        "goal": goal,
-                        "rationale": "Deterministic repository bug-investigation route; provider is not consulted",
-                        "steps": [{
-                            "id": str(uuid.uuid4()),
-                            "objective": "Investigate the reported repository bug using bounded evidence",
-                            "tool": "investigate_repository_bug",
-                            "input": proposed_inputs,
-                            "reason": "Explicit bug-report goal routed to the specialized read-only diagnostic contract",
-                            "depends_on": [],
-                            "success_criteria": {"required_fields": required_fields},
-                        }],
-                    },
-                    goal=goal,
-                    tools=tools,
-                    permissions=permissions,
-                )
+            investigator = self._safe_tool_lookup(tools, "investigate_repository_bug")
+            proposed_inputs = self._safe_tool_hook(investigator, "planning_inputs", goal)
+            declared_permission = self._safe_tool_permission_level(investigator)
+            if (
+                isinstance(proposed_inputs, dict)
+                and declared_permission is not None
+                and (permissions is None or permissions.get("investigate_repository_bug") == declared_permission)
+            ):
+                input_schema = self._safe_tool_hook(investigator, "input_schema")
+                if self._safe_inputs_are_compatible(investigator, proposed_inputs, schema=input_schema):
+                    required_fields = self._safe_output_required_fields(investigator)
+                    if required_fields is not None:
+                        plan = self.validate(
+                            {
+                                "goal": goal,
+                                "rationale": "Deterministic repository bug-investigation route; provider is not consulted",
+                                "steps": [{
+                                    "id": str(uuid.uuid4()),
+                                    "objective": "Investigate the reported repository bug using bounded evidence",
+                                    "tool": "investigate_repository_bug",
+                                    "input": proposed_inputs,
+                                    "reason": "Explicit bug-report goal routed to the specialized read-only diagnostic contract",
+                                    "depends_on": [],
+                                    "success_criteria": {"required_fields": required_fields},
+                                }],
+                            },
+                            goal=goal,
+                            tools=tools,
+                            permissions=permissions,
+                        )
+                        plan.planning_mode = DETERMINISTIC_ROUTE
+                        return plan
         learned_route = self._owner_reviewed_idor_route(
             goal, tools, prior_knowledge, permissions
         )
         if learned_route is not None:
-            return self.validate(
+            plan = self.validate(
                 learned_route,
                 goal=goal,
                 tools=tools,
                 permissions=permissions,
             )
+            plan.planning_mode = DETERMINISTIC_ROUTE
+            return plan
         if self.provider is None:
             fallback = self._unavailable_fallback(goal, tools, prior_knowledge, planning_strategies, permissions)
-            return self.validate(
+            plan = self.validate(
                 {
                     "goal": fallback.goal,
                     "rationale": fallback.rationale,
@@ -218,10 +237,12 @@ class Planner:
                 tools=tools,
                 permissions=permissions,
             )
+            plan.planning_mode = DETERMINISTIC_FALLBACK
+            return plan
 
         context = {
             "goal": goal,
-            "available_tools": tools.describe(),
+            "available_tools": self._safe_describe_tools(tools),
             "relevant_memory": prior_knowledge,
             "relevant_experiences": retrieved_experiences or [],
             "reflection_insights": reflection_insights or [],
@@ -240,7 +261,9 @@ class Planner:
             user_prompt=json.dumps(context, ensure_ascii=False, sort_keys=True),
             response_schema=PLAN_RESPONSE_SCHEMA,
         )
-        return self.validate(response.data, goal=goal, tools=tools, permissions=permissions)
+        plan = self.validate(response.data, goal=goal, tools=tools, permissions=permissions)
+        plan.planning_mode = PROVIDER_VALIDATED
+        return plan
 
     def _owner_reviewed_idor_route(
         self,
@@ -304,14 +327,19 @@ class Planner:
             return None
         repository = next(iter(repositories))
 
-        try:
-            investigator = tools.get("investigate_repository_bug")
-        except KeyError:
+        investigator = self._safe_tool_lookup(tools, "investigate_repository_bug")
+        if investigator is None:
             return None
-        inspector = getattr(investigator, "inspector", None)
-        local_repositories = getattr(inspector, "local_repositories", None)
-        required_capabilities = set(getattr(investigator, "required_capabilities", []))
-        permission_level = getattr(investigator, "permission_level", None)
+        try:
+            inspector = getattr(investigator, "inspector", None)
+            local_repositories = getattr(inspector, "local_repositories", None)
+            declared_capabilities = getattr(investigator, "required_capabilities", None)
+            if not isinstance(declared_capabilities, (list, tuple, set, frozenset)):
+                return None
+            required_capabilities = set(declared_capabilities)
+        except Exception:
+            return None
+        permission_level = self._safe_tool_permission_level(investigator)
         if (
             not isinstance(local_repositories, dict)
             or repository.lower() not in local_repositories
@@ -321,8 +349,13 @@ class Planner:
         ):
             return None
 
-        output_schema = getattr(investigator, "output_schema", lambda: {})()
-        required_fields = list(output_schema.get("required", [])) if isinstance(output_schema, dict) else []
+        route_inputs = {"repository": repository, "bug_report": goal}
+        input_schema = self._safe_tool_hook(investigator, "input_schema")
+        if not self._safe_inputs_are_compatible(investigator, route_inputs, schema=input_schema):
+            return None
+        required_fields = self._safe_output_required_fields(investigator)
+        if required_fields is None:
+            return None
         return {
             "goal": goal,
             "rationale": (
@@ -333,7 +366,7 @@ class Planner:
                 "id": str(uuid.uuid4()),
                 "objective": "Re-examine the requested IDOR/BOLA boundary using bounded local evidence",
                 "tool": "investigate_repository_bug",
-                "input": {"repository": repository, "bug_report": goal},
+                "input": route_inputs,
                 "reason": (
                     "Relevant attested memory may guide tool choice, but the new task's findings remain untrusted "
                     "until independently checked; normal plan and security authorization remain authoritative."
@@ -461,16 +494,30 @@ class Planner:
                     tool = None
                     unavailable_tools.append(tool_name)
                     errors.append(f"unknown_tool:{tool_name}")
+                except Exception:
+                    tool = None
+                    errors.append(f"tool_lookup_failed:{tool_name}")
+                else:
+                    if tool is None:
+                        errors.append(f"tool_lookup_failed:{tool_name}")
                 if tool is not None:
-                    tool_schema = getattr(tool, "input_schema", lambda: {})()
-                    self._validate_input(
-                        step_id,
-                        step_input,
-                        tool_schema,
-                        errors,
-                        bound_fields=set(normalized_bindings),
-                    )
-                    declared_permission = getattr(tool, "permission_level", None)
+                    tool_schema = self._safe_tool_hook(tool, "input_schema")
+                    if not isinstance(tool_schema, dict):
+                        errors.append(f"tool_input_schema_unavailable:{tool_name}")
+                    else:
+                        try:
+                            self._validate_input(
+                                step_id,
+                                step_input,
+                                tool_schema,
+                                errors,
+                                bound_fields=set(normalized_bindings),
+                            )
+                        except Exception:
+                            errors.append(f"tool_input_schema_invalid:{tool_name}")
+                    declared_permission = self._safe_tool_permission_level(tool)
+                    if declared_permission is None:
+                        errors.append(f"tool_permission_unavailable:{tool_name}")
                     requested_permission = raw_step.get("permission_level", declared_permission)
                     if requested_permission != declared_permission:
                         errors.append(f"permission_mismatch:{tool_name}")
@@ -502,8 +549,12 @@ class Planner:
                 continue
             try:
                 target_tool = tools.get(step.tool)
-                target_properties = target_tool.input_schema().get("properties", {})
-            except (KeyError, AttributeError, TypeError):
+                target_schema = self._safe_tool_hook(target_tool, "input_schema")
+                if not isinstance(target_schema, dict):
+                    raise ValueError("target_input_schema_unavailable")
+                target_properties = target_schema.get("properties", {})
+            except Exception:
+                errors.append(f"input_binding_target_schema_unavailable:{step.id}")
                 continue
             for target, binding in step.input_bindings.items():
                 source_id = binding["source_step_id"]
@@ -520,11 +571,17 @@ class Planner:
                     continue
                 try:
                     source_tool = tools.get(source_step.tool)
-                    source_schema = source_tool.output_schema()
-                except (KeyError, AttributeError, TypeError):
+                    source_schema = self._safe_tool_hook(source_tool, "output_schema")
+                    if not isinstance(source_schema, dict):
+                        raise ValueError("source_output_schema_unavailable")
+                except Exception:
+                    errors.append(f"input_binding_source_schema_unavailable:{step.id}.{source_id}")
                     continue
                 source_properties = source_schema.get("properties", {}) if isinstance(source_schema, dict) else {}
                 source_required = source_schema.get("required", []) if isinstance(source_schema, dict) else []
+                if not isinstance(source_properties, dict) or not isinstance(source_required, list):
+                    errors.append(f"input_binding_source_schema_invalid:{step.id}.{source_id}")
+                    continue
                 source_field_schema = source_properties.get(output_key) if isinstance(source_properties, dict) else None
                 if not isinstance(source_field_schema, dict) or output_key not in source_required:
                     errors.append(f"input_binding_source_output_unavailable:{step.id}.{source_id}.{output_key}")
@@ -606,61 +663,122 @@ class Planner:
         learned_strategies: list[dict[str, Any]],
         permissions: dict[str, str] | None,
     ) -> TaskPlan:
-        available = tools.available()
+        available = self._safe_available_tools(tools)
         if not available:
             raise CapabilityUnavailableError([], reason="no_registered_tools")
         # Trusted registered tools may propose a relevant input without I/O.
         # This is still only a proposal: create() applies the normal validator,
         # and Orchestrator/GenericExecutor apply the unchanged authorization.
         for metadata in available:
-            candidate = tools.get(metadata["name"])
-            if permissions is not None and permissions.get(metadata["name"]) != getattr(candidate, "permission_level", None):
+            name = metadata["name"]
+            candidate = self._safe_tool_lookup(tools, name)
+            if candidate is None:
                 continue
-            propose = getattr(candidate, "planning_inputs", None)
-            values = propose(goal) if callable(propose) else None
-            if isinstance(values, dict):
-                return TaskPlan(
-                    goal,
-                    [PlanStep(
-                        id=str(uuid.uuid4()), objective="Inspect selected repository using bounded evidence",
-                        tool=metadata["name"], input=values,
-                        reason="Deterministic registered-tool proposal; no LLM provider or authorization inferred",
-                        success_criteria={"required_fields": list(candidate.output_schema().get("required", []))},
-                    )],
-                    "LLM planner unavailable; bounded registered-tool proposal subject to normal policy checks",
-                )
+            if permissions is not None:
+                permission_level = self._safe_tool_permission_level(candidate)
+                if permission_level is None or permissions.get(name) != permission_level:
+                    continue
+            values = self._safe_tool_hook(candidate, "planning_inputs", goal)
+            if not isinstance(values, dict):
+                continue
+            schema = self._safe_tool_hook(candidate, "input_schema")
+            if not self._safe_inputs_are_compatible(candidate, values, schema=schema):
+                continue
+            required_fields = self._safe_output_required_fields(candidate)
+            if required_fields is None:
+                continue
+            return TaskPlan(
+                goal,
+                [PlanStep(
+                    id=str(uuid.uuid4()), objective="Inspect selected repository using bounded evidence",
+                    tool=name, input=values,
+                    reason="Deterministic registered-tool proposal; no LLM provider or authorization inferred",
+                    success_criteria={"required_fields": required_fields},
+                )],
+                "LLM planner unavailable; bounded registered-tool proposal subject to normal policy checks",
+            )
         available_names = [metadata["name"] for metadata in available]
-        permitted_names = [
-            name for name in available_names
-            if permissions is None or permissions.get(name) == getattr(tools.get(name), "permission_level", None)
-        ]
+        if permissions is None:
+            permitted_names = available_names
+        else:
+            permitted_names = []
+            for name in available_names:
+                permission_level = self._safe_tool_permission_level(self._safe_tool_lookup(tools, name))
+                if permission_level is not None and permissions.get(name) == permission_level:
+                    permitted_names.append(name)
         selection_names = permitted_names or available_names
-        selected_name = _learned_preferred_tool(learned_strategies, selection_names, self.learned_strategy_threshold)
-        avoided_names = _learned_avoided_tools(learned_strategies, self.learned_strategy_threshold)
-        if not selected_name and selection_names and selection_names[0] in avoided_names:
-            selected_name = next((name for name in selection_names if name not in avoided_names), selection_names[0])
-        selected_name = selected_name or selection_names[0]
-        first_tool = tools.get(selected_name)
-        input_values: dict[str, Any] = {}
-        schema = getattr(first_tool, "input_schema", lambda: {})()
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        if "query" in properties:
-            input_values["query"] = goal
-        if "limit" in properties:
-            input_values["limit"] = 6
+        compatible_inputs: dict[str, dict[str, Any]] = {}
+        compatible_output_requirements: dict[str, list[str]] = {}
+        for name in selection_names:
+            candidate = self._safe_tool_lookup(tools, name)
+            if candidate is None:
+                continue
+            schema = self._safe_tool_hook(candidate, "input_schema")
+            if not isinstance(schema, dict):
+                continue
+            try:
+                properties = schema.get("properties", {})
+                if not isinstance(properties, dict):
+                    continue
+                input_values: dict[str, Any] = {}
+                query_definition = properties.get("query")
+                if isinstance(query_definition, dict) and query_definition.get("type") == "string":
+                    input_values["query"] = goal
+                limit_definition = properties.get("limit")
+                if isinstance(limit_definition, dict) and limit_definition.get("type") == "integer":
+                    limit = 6
+                    minimum = limit_definition.get("minimum")
+                    maximum = limit_definition.get("maximum")
+                    if isinstance(minimum, int) and not isinstance(minimum, bool):
+                        limit = max(limit, minimum)
+                    if isinstance(maximum, int) and not isinstance(maximum, bool):
+                        limit = min(limit, maximum)
+                    input_values["limit"] = limit
+            except Exception:
+                continue
+            if not self._safe_inputs_are_compatible(candidate, input_values, schema=schema):
+                continue
+            required_fields = self._safe_output_required_fields(candidate)
+            if required_fields is None:
+                continue
+            compatible_inputs[name] = input_values
+            compatible_output_requirements[name] = required_fields
+
+        compatible_names = [name for name in selection_names if name in compatible_inputs]
+        if not compatible_names:
+            raise PlanValidationError([
+                "no_compatible_tool_for_unavailable_planner",
+                "llm_provider_unavailable",
+            ])
+
+        baseline_name = compatible_names[0]
+        preferred_name = _learned_preferred_tool(
+            learned_strategies, compatible_names, self.learned_strategy_threshold
+        )
+        avoided_names = _learned_avoided_tools(
+            learned_strategies, self.learned_strategy_threshold
+        ) & set(compatible_names)
+        selected_name = preferred_name
+        if not selected_name and baseline_name in avoided_names:
+            selected_name = next(
+                (name for name in compatible_names if name not in avoided_names),
+                baseline_name,
+            )
+        selected_name = selected_name or baseline_name
+        input_values = compatible_inputs[selected_name]
         success_criteria: dict[str, Any] = {}
-        output_schema = getattr(first_tool, "output_schema", lambda: {})()
-        if isinstance(output_schema, dict) and output_schema.get("required"):
-            success_criteria = {"required_fields": list(output_schema["required"])}
+        required_fields = compatible_output_requirements[selected_name]
+        if required_fields:
+            success_criteria = {"required_fields": required_fields}
         learned_note = ""
-        if selected_name != selection_names[0] or learned_strategies:
+        if preferred_name or baseline_name in avoided_names:
             learned_note = f" Learned guidance considered: selected {selected_name}."
         return TaskPlan(
             goal=goal,
             steps=[
                 PlanStep(
                     id=str(uuid.uuid4()),
-                    objective="Execute the first registered permitted tool as a compatibility fallback",
+                    objective="Execute a compatible registered tool subject to normal permission checks",
                     tool=selected_name,
                     input=input_values,
                     reason=(
@@ -678,6 +796,177 @@ class Planner:
             ),
         )
 
+    @staticmethod
+    def _safe_tool_lookup(tools: ToolRegistry, name: str) -> Any | None:
+        try:
+            return tools.get(name)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_available_tools(tools: ToolRegistry) -> list[dict[str, Any]]:
+        """Return valid registry metadata; a broken metadata hook grants no capability."""
+        try:
+            available = tools.available()
+        except Exception:
+            return []
+        if not isinstance(available, list):
+            return []
+        valid: list[dict[str, Any]] = []
+        for metadata in available:
+            try:
+                if isinstance(metadata, dict) and isinstance(metadata.get("name"), str):
+                    valid.append(metadata)
+            except Exception:
+                continue
+        return valid
+
+    @staticmethod
+    def _safe_describe_tools(tools: ToolRegistry) -> list[dict[str, Any]]:
+        """Describe only tools whose schemas can be read without invoking a failing hook."""
+        available = Planner._safe_available_tools(tools)
+        descriptions: list[dict[str, Any]] = []
+        for metadata in available:
+            if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
+                continue
+            candidate = Planner._safe_tool_lookup(tools, metadata["name"])
+            if candidate is None:
+                continue
+            input_schema = Planner._safe_tool_hook(candidate, "input_schema")
+            output_schema = Planner._safe_tool_hook(candidate, "output_schema")
+            if not isinstance(input_schema, dict) or not isinstance(output_schema, dict):
+                continue
+            description = Planner._safe_tool_hook(candidate, "description")
+            item = {
+                "name": metadata["name"],
+                "risk_level": metadata.get("risk_level") if isinstance(metadata.get("risk_level"), str) else "unknown",
+                "permission_level": metadata.get("permission_level") if isinstance(metadata.get("permission_level"), str) else "unknown",
+                "description": description if isinstance(description, str) else "",
+                "input_schema": input_schema,
+                "output_schema": output_schema,
+            }
+            descriptions.append(item)
+        return descriptions
+
+    @staticmethod
+    def _safe_tool_hook(tool: Any, hook_name: str, *args: Any) -> Any:
+        """Call a registered tool hook; an exception makes only that hook unavailable."""
+        try:
+            hook = getattr(tool, hook_name, None)
+            return hook(*args) if callable(hook) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_tool_permission_level(tool: Any) -> str | None:
+        try:
+            permission_level = getattr(tool, "permission_level", None)
+        except Exception:
+            return None
+        return permission_level if isinstance(permission_level, str) else None
+
+    @staticmethod
+    def _safe_output_required_fields(tool: Any) -> list[str] | None:
+        try:
+            output_hook = getattr(tool, "output_schema", None)
+        except Exception:
+            return None
+        if not callable(output_hook):
+            return None
+        try:
+            output_schema = output_hook()
+        except Exception:
+            return None
+        if not isinstance(output_schema, dict):
+            return None
+        try:
+            required = output_schema.get("required", [])
+            if not isinstance(required, list) or any(not isinstance(name, str) for name in required):
+                return None
+            return list(required)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_inputs_are_compatible(
+        tool: Any,
+        values: dict[str, Any],
+        *,
+        schema: Any = _FALLBACK_SCHEMA_UNSET,
+    ) -> bool:
+        try:
+            if schema is Planner._FALLBACK_SCHEMA_UNSET:
+                schema = Planner._safe_tool_hook(tool, "input_schema")
+            if not isinstance(values, dict) or not isinstance(schema, dict) or schema.get("type") != "object":
+                return False
+            if not Planner._fallback_schema_is_supported(schema):
+                return False
+            errors = validate_schema_value(values, schema, path="fallback")
+        except Exception:
+            return False
+        return not errors
+
+    @staticmethod
+    def _fallback_schema_is_supported(schema: Any) -> bool:
+        supported_keys = {
+            "type", "properties", "required", "additionalProperties", "items",
+            "minimum", "maximum", "description", "title", "default", "examples",
+        }
+        supported_types = {"object", "array", "string", "integer", "boolean", "null"}
+        active_schema_ids: set[int] = set()
+        remaining_nodes = [Planner._MAX_FALLBACK_SCHEMA_NODES]
+
+        def visit(current: Any, depth: int) -> bool:
+            if (
+                not isinstance(current, dict)
+                or depth > Planner._MAX_FALLBACK_SCHEMA_DEPTH
+                or remaining_nodes[0] <= 0
+            ):
+                return False
+            schema_id = id(current)
+            if schema_id in active_schema_ids:
+                return False
+            active_schema_ids.add(schema_id)
+            remaining_nodes[0] -= 1
+            try:
+                if any(not isinstance(key, str) or key not in supported_keys for key in current):
+                    return False
+                schema_type = current.get("type")
+                if not isinstance(schema_type, str) or schema_type not in supported_types:
+                    return False
+                properties = current.get("properties", {})
+                required = current.get("required", [])
+                if (
+                    not isinstance(properties, dict)
+                    or any(not isinstance(name, str) for name in properties)
+                    or not isinstance(required, list)
+                    or any(not isinstance(name, str) for name in required)
+                ):
+                    return False
+                if schema_type != "object" and (properties or required or "additionalProperties" in current):
+                    return False
+                if "additionalProperties" in current and not isinstance(current["additionalProperties"], bool):
+                    return False
+                if "items" in current:
+                    if schema_type != "array" or not visit(current["items"], depth + 1):
+                        return False
+                if any(key in current for key in ("minimum", "maximum")):
+                    if schema_type != "integer":
+                        return False
+                    for key in ("minimum", "maximum"):
+                        bound = current.get(key)
+                        if bound is not None and (
+                            not isinstance(bound, (int, float))
+                            or isinstance(bound, bool)
+                            or not math.isfinite(float(bound))
+                        ):
+                            return False
+                return all(visit(value, depth + 1) for value in properties.values())
+            finally:
+                active_schema_ids.remove(schema_id)
+
+        return visit(schema, 0)
+
 
 def _planning_advisory_context(
     strategies: list[dict[str, Any]],
@@ -694,7 +983,7 @@ def _planning_advisory_context(
     context = {
         "goal": goal,
         "task_type": "general",
-        "tools": [metadata["name"] for metadata in tools.available()],
+        "tools": [metadata["name"] for metadata in Planner._safe_available_tools(tools)],
     }
     if task_id:
         context["task_id"] = task_id
@@ -741,11 +1030,16 @@ def _planning_eligible_learned_strategies(
 ) -> list[dict[str, Any]]:
     if learning_memory is None:
         return []
-    available_names = {metadata["name"] for metadata in tools.available()}
-    permitted_names = {
-        name for name in available_names
-        if permissions is None or permissions.get(name) == getattr(tools.get(name), "permission_level", None)
-    }
+    available_names = {metadata["name"] for metadata in Planner._safe_available_tools(tools)}
+    permitted_names: set[str] = set()
+    for name in available_names:
+        permission_level = Planner._safe_tool_permission_level(
+            Planner._safe_tool_lookup(tools, name)
+        )
+        if permission_level is not None and (
+            permissions is None or permissions.get(name) == permission_level
+        ):
+            permitted_names.add(name)
     goal_tokens = {token.lower() for token in re.findall(r"\w+", goal) if len(token) > 2}
     eligible: list[dict[str, Any]] = []
     for untrusted_strategy in strategies:

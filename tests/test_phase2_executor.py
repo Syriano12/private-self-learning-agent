@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from private_agent.core.execution import ExecutionContext, GenericExecutor, StepResult
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import PlanStep, TaskPlan
@@ -48,7 +50,7 @@ class FakeContractTool:
         if self.malformed:
             return {"result": "not wrapped"}
         if self.failure:
-            return ToolResult.failed(self.failure, "fake tool failure")
+            return ToolResult.failed(self.failure, "fake tool failure", no_side_effects=True)
         return ToolResult.success({"result": f"{self.name}:{inputs}"})
 
 
@@ -130,12 +132,17 @@ def test_successful_dependency_allows_dependent_step() -> None:
 def test_failed_dependency_blocks_dependent_step_without_running_it() -> None:
     first = FakeContractTool("first", failure="upstream_failed")
     second = FakeContractTool("second")
-    plan = TaskPlan("goal", [step("one", "first"), step("two", "second", depends_on=["one"])], "test")
-    results = GenericExecutor(registry(first, second), SecurityController()).execute_plan(plan)
-    assert results[0].status == "failed"
-    assert results[1].status == "blocked"
-    assert results[1].error is not None
-    assert results[1].error.code == "dependency_failed"
+    security = SecurityController()
+    result = GenericExecutor(registry(first, second), security).execute_step(
+        step("two", "second", depends_on=["one"]),
+        ExecutionContext(
+            previous_results={"one": StepResult.failed("one", "first", "controlled_failure", "known failed dependency")},
+            security_controller=security,
+        ),
+    )
+    assert result.status == "blocked"
+    assert result.error is not None and result.error.code == "dependency_failed"
+    assert first.calls == []
     assert second.calls == []
 
 
@@ -148,21 +155,18 @@ def test_missing_dependency_is_blocked() -> None:
     assert second.calls == []
 
 
-def test_tool_exception_is_structured_failure() -> None:
+def test_tool_exception_after_execution_does_not_return_normal_failure() -> None:
     failing = FakeContractTool("failing", failure="exception")
-    result = GenericExecutor(registry(failing), SecurityController()).execute_step(step("s1", "failing"))
-    assert result.status == "failed"
-    assert result.error is not None
-    assert result.error.code == "tool_exception"
-    assert result.error.details == {"exception_type": "RuntimeError"}
+    with pytest.raises(RuntimeError, match="Tool operation raised after execution may have started"):
+        GenericExecutor(registry(failing), SecurityController()).execute_step(step("s1", "failing"))
+    assert failing.calls == [{}]
 
 
-def test_malformed_tool_result_is_structured_failure() -> None:
+def test_malformed_tool_result_does_not_return_normal_failure_after_execution() -> None:
     malformed = FakeContractTool("malformed", malformed=True)
-    result = GenericExecutor(registry(malformed), SecurityController()).execute_step(step("s1", "malformed"))
-    assert result.status == "failed"
-    assert result.error is not None
-    assert result.error.code == "malformed_tool_result"
+    with pytest.raises(RuntimeError, match="unvalidated result after execution may have started"):
+        GenericExecutor(registry(malformed), SecurityController()).execute_step(step("s1", "malformed"))
+    assert malformed.calls == [{}]
 
 
 def test_unapproved_permission_is_blocked_before_execution() -> None:

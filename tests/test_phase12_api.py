@@ -97,6 +97,7 @@ def make_service(
     *,
     token: str | None = API_TOKEN,
     hook=None,
+    planner=None,
 ) -> tuple[AgentAPIService, Store, ObservabilityMonitor]:
     store = Store(tmp_path / "api.sqlite3")
     monitor = ObservabilityMonitor(store)
@@ -104,7 +105,7 @@ def make_service(
     core = Orchestrator(
         store,
         make_registry(tool),
-        planner=APIPlanner(tool.name),
+        planner=planner or APIPlanner(tool.name),
         security_controller=security,
         observability=monitor,
         checkpoint_hook=hook,
@@ -182,7 +183,7 @@ def test_valid_authentication_creates_real_typed_task_response(tmp_path: Path) -
     assert body["current_phase"] == "QUEUED"
     assert body["created_at"]
     assert body["api_version"] == "v1"
-    assert body["schema_version"] == 1
+    assert body["schema_version"] == 3
     assert body["request_id"] == response.headers["X-Request-ID"]
     assert store.get_task_state(task_id)["status"] == "QUEUED"
     listed = client.get("/api/v1/tasks", headers=auth_headers())
@@ -448,7 +449,7 @@ def test_api_cannot_bypass_capability_or_quarantined_skill_boundaries(tmp_path: 
 
 
 def test_observability_timeline_metrics_failures_security_and_tools_are_read_only(tmp_path: Path) -> None:
-    tool = APITestTool("safe", [ToolResult.failed("tool_failed", "controlled failure")])
+    tool = APITestTool("safe", [ToolResult.failed("tool_failed", "controlled failure", no_side_effects=True)])
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)
     _, task_id = run_core_task(service, "complete a safe API task")
@@ -470,7 +471,7 @@ def test_observability_timeline_metrics_failures_security_and_tools_are_read_onl
 
 def test_task_failure_exposes_only_closed_reason_not_raw_error_or_event_metadata(tmp_path: Path) -> None:
     raw_detail = "RAW_TOOL_EXCEPTION_do_not_expose_9c2d"
-    repeated_failure = ToolResult.failed("tool_failed", raw_detail)
+    repeated_failure = ToolResult.failed("tool_failed", raw_detail, no_side_effects=True)
     tool = APITestTool("safe", [repeated_failure for _ in range(8)])
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)
@@ -516,6 +517,32 @@ def test_request_correlation_uses_header_and_never_contains_credentials(tmp_path
     assert completed[-1]["correlation_id"] == "request-phase12-001"
     raw = json.dumps(store.all_observability_events(), ensure_ascii=False)
     assert API_TOKEN not in raw
+    store.close()
+
+
+def test_task_timeline_read_is_logged_globally_without_growing_its_task_timeline(tmp_path: Path) -> None:
+    service, store, monitor = make_service(tmp_path, APITestTool("safe"))
+    client = client_for(service)
+    created = client.post("/api/v1/tasks", json={"goal": "timeline read correlation"}, headers=auth_headers(key="timeline-read-create"))
+    assert created.status_code == 201
+    task_id = created.json()["task_id"]
+    before = monitor.get_task_timeline(task_id)
+
+    headers = auth_headers()
+    headers["X-Request-ID"] = "timeline-read-no-feedback"
+    response = client.get(f"/api/v1/tasks/{task_id}/timeline", headers=headers)
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "timeline-read-no-feedback"
+    after = monitor.get_task_timeline(task_id)
+    assert [event["event_id"] for event in after] == [event["event_id"] for event in before]
+    assert [event["event_id"] for event in response.json()] == [event["event_id"] for event in before]
+
+    global_completions = [
+        event for event in store.all_observability_events()
+        if event["event_type"] == "API_REQUEST_COMPLETED" and event["correlation_id"] == "timeline-read-no-feedback"
+    ]
+    assert len(global_completions) == 1
+    assert global_completions[0]["task_id"] == ""
     store.close()
 
 

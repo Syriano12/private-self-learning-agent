@@ -694,18 +694,18 @@ class BugInvestigationTool:
         del context
         errors = validate_schema_value(inputs, self.input_schema(), path="input")
         if errors:
-            return ToolResult.failed("invalid_input", "Bug investigation input failed validation", details={"errors": errors})
+            return ToolResult.failed("invalid_input", "Bug investigation input failed validation", details={"errors": errors}, no_side_effects=True)
         repository = str(inputs.get("repository", "")).strip()
         ref = str(inputs.get("ref", "")).strip()
         bug_report = str(inputs.get("bug_report", "")).strip()
         if not repository or not bug_report or len(repository) > 256 or len(ref) > 256 or len(bug_report) > 4000:
-            return ToolResult.failed("invalid_input", "Bug investigation inputs are missing or exceed safe limits")
+            return ToolResult.failed("invalid_input", "Bug investigation inputs are missing or exceed safe limits", no_side_effects=True)
         try:
             report = self.investigator.investigate(repository=repository, ref=ref, bug_report=bug_report)
             return ToolResult.success(report, metadata={"read_only": True, "untrusted_data": True, "target_code_executed": False})
         except RepositoryAccessError as exc:
             if exc.code in {"repository_not_authorized", "private_repository_not_authorized", "sensitive_path", "invalid_path"}:
-                return ToolResult.blocked(exc.code, "Repository investigation was not authorized or safe")
-            return ToolResult.failed(exc.code, "Repository investigation could not obtain the required metadata")
+                return ToolResult.blocked(exc.code, "Repository investigation was not authorized or safe", no_side_effects=True)
+            return ToolResult.failed(exc.code, "Repository investigation could not obtain the required metadata", no_side_effects=True)
         except (OSError, TypeError, ValueError, KeyError, RecursionError):
-            return ToolResult.failed("repository_investigation_failed", "Repository investigation failed safely")
+            return ToolResult.failed("repository_investigation_failed", "Repository investigation failed safely", no_side_effects=True)

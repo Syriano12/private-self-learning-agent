@@ -9,14 +9,15 @@ from fastapi.testclient import TestClient
 
 from private_agent.api import AgentAPIService, create_app
 from private_agent.auth import AuthManager
-from private_agent.core.learning import SQLiteLearningMemory
+from private_agent.core.experience import ExperienceAction, ExperienceRecord
+from private_agent.core.learning import LearningEngine, SQLiteLearningMemory
 from private_agent.core.knowledge import KnowledgeAttestor, KnowledgeClaim, KnowledgeEvidence, KnowledgeSource, sha256_hex
 from private_agent.core.llm import LLMProvider, LLMResponse
 from private_agent.core.memory import ExperienceQuery, SQLiteExperienceMemory
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import Planner
 from private_agent.core.recovery import RecoveryManager
-from private_agent.core.reflection import SQLiteReflectionMemory
+from private_agent.core.reflection import ReflectionEngine, SQLiteReflectionMemory
 from private_agent.observability import ObservabilityMonitor
 from private_agent.security import SecurityController
 from private_agent.storage import Store
@@ -157,7 +158,7 @@ class LocalTool:
     def execute(self, inputs: dict[str, Any], context: Any) -> ToolResult:
         self.calls.append({"task_id": context.task_id, "inputs": dict(inputs)})
         if self.name == "tool_a":
-            return ToolResult.failed("malformed_tool_result", "deterministic local invalid-output fixture")
+            return ToolResult.failed("malformed_tool_result", "deterministic local invalid-output fixture", no_side_effects=True)
         return ToolResult.success({"result": f"verified-local:{self.name}:{inputs['value']}:task={context.task_id}"})
 
 
@@ -229,6 +230,20 @@ def _records_for_step(state: dict[str, Any], step_id: str) -> list[dict[str, Any
     ]
 
 
+def _run_until_task_completed(worker: BackgroundWorker, store: Store, task_id: str) -> dict[str, Any]:
+    for _ in range(50):
+        result = worker.run_once()
+        if result.get("status") == "ASSISTANT_REPLY_SAVED":
+            assert result.get("task_id") == task_id
+            queue = store.task_queue_record(task_id)
+            assert queue is not None and queue["queue_status"] == "QUEUED"
+            continue
+        assert result.get("status") == "COMPLETED", result
+        assert result.get("task_id") == task_id
+        return result
+    raise AssertionError(f"task_not_completed_after_assistant_reply:{task_id}")
+
+
 def _run_support_task(
     database: Path,
     calls: dict[str, list[dict[str, Any]]],
@@ -293,9 +308,7 @@ def _run_support_task(
         assert store.task_queue_record(task_id)["queue_status"] == "WAITING_APPROVAL"
         worker._reconcile_approved_waiting_tasks()
         assert store.task_queue_record(task_id)["queue_status"] == "QUEUED"
-        completed = worker.run_once()
-        assert completed["status"] == "COMPLETED", completed
-        assert completed["task_id"] == task_id
+        completed = _run_until_task_completed(worker, store, task_id)
         completed_state = store.get_task_state(task_id)
         assert completed_state is not None and completed_state["status"] == "COMPLETED"
         assert completed_state["result"]["final_status"] == "COMPLETED"
@@ -373,11 +386,11 @@ def test_conversation_approval_restart_and_future_verified_recovery_learning(tmp
     restored = memory.get(strategy_id)
     assert restored is not None and restored.to_dict() == learned.to_dict()
     future_retrieval = memory.retrieve_relevant(
-        {"goal": FUTURE_GOAL, "task_type": "general", "tools": ["tool_a", "tool_b", "safe_probe"]}
+        {"goal": FUTURE_GOAL, "task_type": "general", "tools": ["tool_a", "tool_b", "safe_probe"], "task_id": first_id}
     )
     assert [item.strategy_id for item in future_retrieval] == [strategy_id]
     experiences = SQLiteExperienceMemory(store).retrieve(
-        ExperienceQuery(FUTURE_GOAL, task_type="general", tools=["tool_a", "tool_b", "safe_probe"])
+        ExperienceQuery(FUTURE_GOAL, task_type="general", tools=["tool_a", "tool_b", "safe_probe"], task_id=first_id)
     )
     supported = {item.experience_id: item for item in experiences}
     assert {first_id, second_id}.issubset(supported)
@@ -418,7 +431,7 @@ def test_conversation_approval_restart_and_future_verified_recovery_learning(tmp
         assert approved.status_code == 200, approved.text
         worker = BackgroundWorker(orchestrator, worker_id="recovery-future-approved-worker")
         worker._reconcile_approved_waiting_tasks()
-        result = worker.run_once()
+        result = _run_until_task_completed(worker, store, future_id)
         assert result["status"] == "COMPLETED", result
         future_state = store.get_task_state(future_id)
         assert future_state is not None and future_state["status"] == "COMPLETED"
@@ -579,7 +592,12 @@ def test_memory_retrieval_isolated_between_task_owners(tmp_path: Path) -> None:
         waiting = BackgroundWorker(orchestrator, worker_id="owner-b-isolation-worker").run_once()
         assert waiting["status"] == "WAITING_APPROVAL", waiting
         assert provider.initial_choices == ["tool_a"]
-        assert len(provider.contexts) == 2
+        planning_contexts = [context for context in provider.contexts if "goal" in context]
+        reply_contexts = [context for context in provider.contexts if "task_result" in context]
+        assert len(provider.contexts) == 3
+        assert len(planning_contexts) == 2
+        assert len(reply_contexts) == 1
+        assert set(reply_contexts[0]) == {"task_result", "allowed_reply_codes"}
         all_provider_context = json.dumps(provider.contexts, ensure_ascii=False, sort_keys=True)
         for private_value in (
             "owner-a-private-target-marker",
@@ -592,10 +610,10 @@ def test_memory_retrieval_isolated_between_task_owners(tmp_path: Path) -> None:
             evidence_id,
         ):
             assert private_value not in all_provider_context
-        assert provider.contexts[0].get("learned_strategies") == []
-        assert provider.contexts[1].get("retrieved_experiences") == []
-        assert provider.contexts[1].get("reflection_insights") == []
-        assert provider.contexts[1].get("learned_strategies") == []
+        assert planning_contexts[0].get("learned_strategies") == []
+        assert planning_contexts[1].get("retrieved_experiences") == []
+        assert planning_contexts[1].get("reflection_insights") == []
+        assert planning_contexts[1].get("learned_strategies") == []
 
         state = store.get_task_state(task_b_id)
         assert state is not None
@@ -605,3 +623,380 @@ def test_memory_retrieval_isolated_between_task_owners(tmp_path: Path) -> None:
         assert state["context"]["learned_strategies_used"] == []
         assert owner_a_id != operator_b.user_id
     store.close()
+
+
+def test_unowned_api_task_and_direct_planner_cannot_retrieve_or_write_owner_learning(tmp_path: Path) -> None:
+    database = tmp_path / "ownerless-learning.sqlite3"
+    calls: dict[str, list[dict[str, Any]]] = {name: [] for name in ("tool_a", "tool_b", "safe_probe")}
+    store, owner_task_one, _ = _run_support_task(
+        database,
+        calls,
+        idempotency_key="ownerless-owner-support-one",
+        initialize_owner=True,
+    )
+    store.close()
+    store, owner_task_two, _ = _run_support_task(
+        database,
+        calls,
+        idempotency_key="ownerless-owner-support-two",
+        initialize_owner=False,
+    )
+    owner_a_id = store.task_owner_user_id(owner_task_one)
+    assert owner_a_id and store.task_owner_user_id(owner_task_two) == owner_a_id
+    strategies = SQLiteLearningMemory(store).list()
+    assert len(strategies) == 1
+    strategy = strategies[0]
+    store.close()
+
+    provider = LocalDeterministicProvider()
+    store, service, orchestrator = _build_components(database, calls, provider)
+    try:
+        memory = SQLiteLearningMemory(store)
+        owner_plan = orchestrator.planner.create(
+            FUTURE_GOAL,
+            orchestrator.tools,
+            [],
+            learned_strategies=[strategy.to_dict()],
+            task_id=owner_task_one,
+        )
+        assert owner_plan.steps[-1].tool == "tool_b"
+        assert provider.contexts[-1]["learned_strategies"][0]["strategy_id"] == strategy.strategy_id
+
+        unscoped_context = {
+            "goal": FUTURE_GOAL,
+            "task_type": "general",
+            "tools": ["tool_a", "tool_b", "safe_probe"],
+        }
+        assert memory.retrieve_relevant(unscoped_context) == []
+        assert memory.get_for_planning(strategy.strategy_id, unscoped_context) is None
+        unscoped_plan = orchestrator.planner.create(
+            FUTURE_GOAL,
+            orchestrator.tools,
+            [],
+            learned_strategies=[strategy.to_dict()],
+        )
+        assert unscoped_plan.steps[-1].tool == "tool_a"
+        assert provider.contexts[-1]["learned_strategies"] == []
+
+        # Simulate a legacy/unassigned API task whose client-controlled context
+        # claims Owner A. Only the authenticated principal may create the owner link.
+        created = service.create_task(
+            "Run the local safe probe without an owner",
+            idempotency_key="ownerless-no-learning-scope",
+            context={"owner_user_id": owner_a_id, "user_id": owner_a_id},
+            principal=None,
+        )
+        unowned_task_id = created.task_id
+        assert store.task_owner_user_id(unowned_task_id) is None
+
+        safe_tools = ToolRegistry()
+        safe_tools.register(LocalTool("safe_probe", calls))
+        safe_provider = LocalDeterministicProvider()
+        safe_orchestrator = Orchestrator(store, safe_tools, planner=Planner(safe_provider))
+        result = BackgroundWorker(safe_orchestrator, worker_id="ownerless-safe-worker").run_once()
+        assert result["status"] == "BLOCKED", result
+        assert result["task_id"] == unowned_task_id
+        assert _calls_for(calls, "safe_probe", unowned_task_id) == []
+        task_state = store.get_task_state(unowned_task_id)
+        assert task_state is not None
+        assert task_state["context"].get("retrieved_experiences", []) == []
+        assert task_state["context"].get("reflection_insights_used", []) == []
+        assert task_state["context"].get("learned_strategies_used", []) == []
+        assert all(context.get("learned_strategies", []) == [] for context in safe_provider.contexts)
+        assert store.get_experience(unowned_task_id) is None
+        assert SQLiteExperienceMemory(store).retrieve(
+            ExperienceQuery(FUTURE_GOAL, task_id=unowned_task_id)
+        ) == []
+        assert SQLiteReflectionMemory(store).list_relevant(
+            {"goal": FUTURE_GOAL, "task_id": unowned_task_id}
+        ) == []
+        assert [item.strategy_id for item in memory.list()] == [strategy.strategy_id]
+    finally:
+        store.close()
+
+    # Ownership, experience persistence, and the positive control survive reopening.
+    provider = LocalDeterministicProvider()
+    store, _service, orchestrator = _build_components(database, calls, provider)
+    try:
+        assert store.task_owner_user_id(unowned_task_id) is None
+        assert store.get_experience(unowned_task_id) is None
+        memory = SQLiteLearningMemory(store)
+        assert memory.retrieve_relevant(
+            {"goal": FUTURE_GOAL, "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": unowned_task_id}
+        ) == []
+        assert memory.get_for_planning(
+            strategy.strategy_id,
+            {"goal": FUTURE_GOAL, "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": unowned_task_id},
+        ) is None
+        unowned_plan = orchestrator.planner.create(
+            FUTURE_GOAL,
+            orchestrator.tools,
+            [],
+            learned_strategies=[strategy.to_dict()],
+            task_id=unowned_task_id,
+        )
+        assert unowned_plan.steps[-1].tool == "tool_a"
+        assert provider.contexts[-1]["learned_strategies"] == []
+        owner_plan = orchestrator.planner.create(
+            FUTURE_GOAL,
+            orchestrator.tools,
+            [],
+            learned_strategies=[strategy.to_dict()],
+            task_id=owner_task_one,
+        )
+        assert owner_plan.steps[-1].tool == "tool_b"
+        assert provider.contexts[-1]["learned_strategies"][0]["strategy_id"] == strategy.strategy_id
+        assert [item.strategy_id for item in memory.list()] == [strategy.strategy_id]
+    finally:
+        store.close()
+
+
+def test_execution_unknown_worker_does_not_persist_learning_and_owner_positive_control_survives_reopen(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "execution-unknown-worker-learning.sqlite3"
+    calls: dict[str, list[dict[str, Any]]] = {name: [] for name in ("tool_a", "tool_b", "safe_probe")}
+    store, owner_task_one, _ = _run_support_task(
+        database,
+        calls,
+        idempotency_key="unknown-owner-support-one",
+        initialize_owner=True,
+    )
+    store.close()
+    store, owner_task_two, _ = _run_support_task(
+        database,
+        calls,
+        idempotency_key="unknown-owner-support-two",
+        initialize_owner=False,
+    )
+    strategy = SQLiteLearningMemory(store).list()[0]
+    owner = next(user for user in AuthManager(store).list_users() if user.role == "OWNER")
+    operator_b = AuthManager(store).create_user(
+        "operator-unknown-learning@example.com",
+        OPERATOR_PASSWORD,
+        "OPERATOR",
+        actor_user_id=owner.user_id,
+    )
+    store.close()
+
+    provider = LocalDeterministicProvider()
+    store, service, orchestrator = _build_components(database, calls, provider)
+
+    def interrupt_after_execution(checkpoint_type: str, state: dict[str, Any]) -> None:
+        if checkpoint_type == "AFTER_EXECUTION":
+            raise RuntimeError("controlled interruption after local tool execution")
+
+    orchestrator.checkpoint_hook = interrupt_after_execution
+    try:
+        with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+            csrf = _login(client, operator_b.email, OPERATOR_PASSWORD)
+            unknown_task_id = _create_task(client, csrf, FUTURE_GOAL, "unknown-owner-learning-task")
+            assert store.task_owner_user_id(unknown_task_id) == operator_b.user_id
+            result = BackgroundWorker(orchestrator, worker_id="unknown-owner-learning-worker").run_once()
+            assert result["status"] == "EXECUTION_UNKNOWN", result
+            assert result["task_id"] == unknown_task_id
+            assert len(_calls_for(calls, "tool_a", unknown_task_id)) == 1
+            assert provider.initial_choices == ["tool_a"]
+            state = store.get_task_state(unknown_task_id)
+            assert state is not None and state["status"] == "EXECUTION_UNKNOWN"
+            assert store.task_queue_record(unknown_task_id)["queue_status"] == "EXECUTION_UNKNOWN"
+            assert store.get_experience(unknown_task_id) is None
+            assert [item.strategy_id for item in SQLiteLearningMemory(store).list()] == [strategy.strategy_id]
+    finally:
+        store.close()
+
+    # The uncertain action remains an execution-unknown state after reopening;
+    # it contributes neither an experience nor a new/promoted strategy.
+    store = Store(database)
+    try:
+        state = store.get_task_state(unknown_task_id)
+        assert state is not None and state["status"] == "EXECUTION_UNKNOWN"
+        assert store.task_queue_record(unknown_task_id)["queue_status"] == "EXECUTION_UNKNOWN"
+        assert store.get_experience(unknown_task_id) is None
+        assert SQLiteReflectionMemory(store).list_relevant(
+            {"goal": FUTURE_GOAL, "task_type": "general", "task_id": unknown_task_id}
+        ) == []
+        assert [item.strategy_id for item in SQLiteLearningMemory(store).list()] == [strategy.strategy_id]
+    finally:
+        store.close()
+
+    provider = LocalDeterministicProvider()
+    store, _service, orchestrator = _build_components(database, calls, provider)
+    try:
+        owner_b_plan = orchestrator.planner.create(
+            FUTURE_GOAL,
+            orchestrator.tools,
+            [],
+            learned_strategies=[strategy.to_dict()],
+            task_id=unknown_task_id,
+        )
+        assert owner_b_plan.steps[-1].tool == "tool_a"
+        assert provider.contexts[-1]["learned_strategies"] == []
+        owner_a_plan = orchestrator.planner.create(
+            FUTURE_GOAL,
+            orchestrator.tools,
+            [],
+            learned_strategies=[strategy.to_dict()],
+            task_id=owner_task_one,
+        )
+        assert owner_a_plan.steps[-1].tool == "tool_b"
+        assert provider.contexts[-1]["learned_strategies"][0]["strategy_id"] == strategy.strategy_id
+        assert store.task_owner_user_id(owner_task_two) == store.task_owner_user_id(owner_task_one)
+    finally:
+        store.close()
+
+
+def test_conflicting_execution_unknown_status_fails_closed_after_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "conflicting-execution-unknown.sqlite3"
+    calls: dict[str, list[dict[str, Any]]] = {name: [] for name in ("tool_a", "tool_b", "safe_probe")}
+    provider = LocalDeterministicProvider()
+    store, service, _orchestrator = _build_components(database, calls, provider)
+    auth = AuthManager(store)
+    auth.initialize_owner(auth.owner_email, OWNER_PASSWORD)
+    goal = "Research a local checksum with an unresolved verification result"
+    task_ids: list[str] = []
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        csrf = _login(client, auth.owner_email)
+        for index in range(3):
+            task_ids.append(_create_task(client, csrf, goal, f"conflicting-unknown-{index}"))
+
+    memory = SQLiteExperienceMemory(store)
+    for index, task_id in enumerate(task_ids):
+        claim = store.claim_next_task(f"synthetic-conflicting-unknown-{index}")
+        assert claim is not None and claim["task_id"] == task_id
+        record = ExperienceRecord(
+            task_id=task_id,
+            goal=goal,
+            context={"task_type": "research"},
+            initial_plan={"goal": goal},
+            actions=[
+                ExperienceAction(
+                    action_type="TOOL",
+                    step_id="verification-step",
+                    tool_name="tool_a",
+                    input_fingerprint="synthetic-conflicting-unknown-action",
+                    execution_status="unknown",
+                    observation={"result": "not safely confirmed"},
+                    verification={"status": "UNKNOWN", "verified": False},
+                    diagnosis={"failure_type": "VERIFICATION_FAILED"},
+                )
+            ],
+            final_outcome="COMPLETED",
+            verification_status="EXECUTION_UNKNOWN",
+            verification_scope="UNKNOWN",
+        )
+        with store.lease_context(task_id, claim["lease_id"], claim["worker_id"]):
+            memory.store(record)
+        store.finish_task_claim(
+            claim,
+            "EXECUTION_UNKNOWN",
+            error_code="synthetic_conflicting_execution_unknown",
+            state_status="EXECUTION_UNKNOWN",
+        )
+    store.close()
+
+    store = Store(database)
+    try:
+        query = ExperienceQuery(
+            goal,
+            task_type="research",
+            tools=["tool_a"],
+            failure_type="VERIFICATION_FAILED",
+            task_id=task_ids[0],
+        )
+        retrieved = SQLiteExperienceMemory(store).retrieve(query)
+        assert len(retrieved) == 3
+        assert all(item.outcome == "EXECUTION_UNKNOWN" for item in retrieved)
+        assert all(item.identity["verification_status"] == "EXECUTION_UNKNOWN" for item in retrieved)
+        reflection_memory = SQLiteReflectionMemory(store)
+        insights = ReflectionEngine(
+            SQLiteExperienceMemory(store),
+            reflection_memory,
+            min_supporting_experiences=2,
+        ).reflect(query)
+        learned = LearningEngine(SQLiteLearningMemory(store)).learn(insights)
+        assert insights == []
+        assert learned == []
+        assert reflection_memory.list_relevant(
+            {"goal": goal, "task_type": "research", "task_id": task_ids[0]}
+        ) == []
+        assert SQLiteLearningMemory(store).list() == []
+    finally:
+        store.close()
+
+
+def test_execution_unknown_experiences_cannot_generate_failure_patterns_after_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "execution-unknown-reflection.sqlite3"
+    calls: dict[str, list[dict[str, Any]]] = {name: [] for name in ("tool_a", "tool_b", "safe_probe")}
+    provider = LocalDeterministicProvider()
+    store, service, _orchestrator = _build_components(database, calls, provider)
+    auth = AuthManager(store)
+    auth.initialize_owner(auth.owner_email, OWNER_PASSWORD)
+    goal = "Research local checksum artifact with a deterministic failure marker"
+    task_ids: list[str] = []
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        csrf = _login(client, auth.owner_email)
+        for index in range(3):
+            task_ids.append(_create_task(client, csrf, goal, f"unknown-reflection-{index}"))
+    memory = SQLiteExperienceMemory(store)
+    for index, task_id in enumerate(task_ids):
+        claim = store.claim_next_task(f"synthetic-unknown-reflection-{index}")
+        assert claim is not None and claim["task_id"] == task_id
+        record = ExperienceRecord(
+            task_id=task_id,
+            goal=goal,
+            context={"task_type": "research"},
+            initial_plan={"goal": goal},
+            actions=[
+                ExperienceAction(
+                    action_type="TOOL",
+                    step_id="primary-step",
+                    tool_name="tool_a",
+                    input_fingerprint="synthetic-unknown-action",
+                    execution_status="unknown",
+                    observation={"result": "not safely confirmed"},
+                    verification={"status": "UNKNOWN"},
+                    diagnosis={"failure_type": "TOOL_ERROR"},
+                )
+            ],
+            final_outcome="EXECUTION_UNKNOWN",
+            verification_status="EXECUTION_UNKNOWN",
+            verification_scope="UNKNOWN",
+        )
+        with store.lease_context(task_id, claim["lease_id"], claim["worker_id"]):
+            memory.store(record)
+        store.finish_task_claim(
+            claim,
+            "EXECUTION_UNKNOWN",
+            error_code="synthetic_execution_unknown",
+            state_status="EXECUTION_UNKNOWN",
+        )
+    store.close()
+
+    store = Store(database)
+    try:
+        query = ExperienceQuery(
+            goal,
+            task_type="research",
+            tools=["tool_a"],
+            failure_type="TOOL_ERROR",
+            task_id=task_ids[0],
+        )
+        retrieved = SQLiteExperienceMemory(store).retrieve(query)
+        assert len(retrieved) == 3
+        assert all(item.outcome == "EXECUTION_UNKNOWN" for item in retrieved)
+        reflection_memory = SQLiteReflectionMemory(store)
+        insights = ReflectionEngine(
+            SQLiteExperienceMemory(store),
+            reflection_memory,
+            min_supporting_experiences=2,
+        ).reflect(query)
+        learned = LearningEngine(SQLiteLearningMemory(store)).learn(insights)
+        assert insights == []
+        assert learned == []
+        assert reflection_memory.list_relevant(
+            {"goal": goal, "task_type": "research", "task_id": task_ids[0]}
+        ) == []
+        assert SQLiteLearningMemory(store).list() == []
+    finally:
+        store.close()

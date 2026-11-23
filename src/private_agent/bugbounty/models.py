@@ -297,6 +297,8 @@ class ScopeDefinition:
             if str(exc) == "scope_not_yet_active":
                 return ScopeDecision.NOT_YET_ACTIVE, str(exc)
             return ScopeDecision.AMBIGUOUS, str(exc)
+        if mode not in ("passive", "active"):
+            return ScopeDecision.DENIED, "mode_not_permitted"
         parsed = urlparse(url)
         if parsed.scheme.lower() not in {"http", "https"}:
             return ScopeDecision.DENIED, "scheme_not_permitted"
