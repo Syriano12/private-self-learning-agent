@@ -728,7 +728,21 @@ class BackgroundWorker:
         self._track_heartbeat(stage_heartbeat)
         stage_heartbeat.start()
         try:
-            outcome = self.stage_executor.execute(stage, analysis)
+            if stage.stage_type == "REPORT_PREPARATION":
+                try:
+                    report_artifacts = self.research_stages.resolve_report_artifacts(stage)
+                except ValueError:
+                    outcome = StageExecutionOutcome(
+                        ResearchStageStatus.FAILED.value,
+                        {},
+                        {},
+                        "report_source_integrity_failed",
+                        "A bound report source could not be verified; no report was prepared",
+                    )
+                else:
+                    outcome = self.stage_executor.execute(stage, analysis, report_artifacts=report_artifacts)
+            else:
+                outcome = self.stage_executor.execute(stage, analysis)
             if time.monotonic() - started > stage.budget.timeout_seconds:
                 outcome = StageExecutionOutcome(
                     ResearchStageStatus.UNKNOWN.value,
