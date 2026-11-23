@@ -2723,6 +2723,7 @@ def create_app(
     async def request_correlation(request: Request, call_next: Callable[..., Any]) -> Any:
         supplied = request.headers.get("X-Request-ID", "")
         request_id = supplied if _REQUEST_ID_PATTERN.fullmatch(supplied) else uuid.uuid4().hex
+        timeline_read = request.method == "GET" and re.fullmatch(r"/(?:api/v1/)?tasks/[^/]+/timeline", request.url.path) is not None
         request.state.request_id = request_id
         current_service = getattr(application.state, "agent_api_service", None)
         if current_service is None and (request.url.path.startswith("/api/") or request.url.path == "/tasks/run"):
@@ -2742,7 +2743,7 @@ def create_app(
                 with current_service._lock:
                     current_service.observability.emit(
                         "API_REQUEST_FAILED",
-                        task_id=getattr(request.state, "task_id", ""),
+                        task_id="" if timeline_read else getattr(request.state, "task_id", ""),
                         correlation_id=request_id,
                         component="api",
                         severity="ERROR",
@@ -2754,7 +2755,7 @@ def create_app(
             with current_service._lock:
                 current_service.observability.emit(
                     "API_REQUEST_COMPLETED",
-                    task_id=getattr(request.state, "task_id", ""),
+                    task_id="" if timeline_read else getattr(request.state, "task_id", ""),
                     correlation_id=request_id,
                     component="api",
                     severity="ERROR" if response.status_code >= 500 else "INFO",

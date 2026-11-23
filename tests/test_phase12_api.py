@@ -519,6 +519,32 @@ def test_request_correlation_uses_header_and_never_contains_credentials(tmp_path
     store.close()
 
 
+def test_task_timeline_read_is_logged_globally_without_growing_its_task_timeline(tmp_path: Path) -> None:
+    service, store, monitor = make_service(tmp_path, APITestTool("safe"))
+    client = client_for(service)
+    created = client.post("/api/v1/tasks", json={"goal": "timeline read correlation"}, headers=auth_headers(key="timeline-read-create"))
+    assert created.status_code == 201
+    task_id = created.json()["task_id"]
+    before = monitor.get_task_timeline(task_id)
+
+    headers = auth_headers()
+    headers["X-Request-ID"] = "timeline-read-no-feedback"
+    response = client.get(f"/api/v1/tasks/{task_id}/timeline", headers=headers)
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "timeline-read-no-feedback"
+    after = monitor.get_task_timeline(task_id)
+    assert [event["event_id"] for event in after] == [event["event_id"] for event in before]
+    assert [event["event_id"] for event in response.json()] == [event["event_id"] for event in before]
+
+    global_completions = [
+        event for event in store.all_observability_events()
+        if event["event_type"] == "API_REQUEST_COMPLETED" and event["correlation_id"] == "timeline-read-no-feedback"
+    ]
+    assert len(global_completions) == 1
+    assert global_completions[0]["task_id"] == ""
+    store.close()
+
+
 def test_health_and_readiness_distinguish_process_liveness_from_dependencies(tmp_path: Path) -> None:
     service, store, _ = make_service(tmp_path, APITestTool("safe"))
     client = client_for(service)
