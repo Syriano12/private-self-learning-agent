@@ -460,6 +460,102 @@ def test_owner_created_stage_executes_analysis_owned_by_another_principal(tmp_pa
     store.close()
 
 
+def test_report_stage_rejects_client_artifacts_and_incomplete_sources(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"), token=None)
+    AuthManager(store).initialize_owner(OWNER_EMAIL, OWNER_PASSWORD)
+    client = TestClient(create_app(service=service), raise_server_exceptions=False)
+    csrf = _login(client, OWNER_EMAIL, OWNER_PASSWORD)
+    analysis_id = client.post(
+        "/api/v1/bug-bounty/programs/analyze",
+        json={"program_url": "https://example.com/policy", "policy_text": json.dumps(scope_payload())},
+        headers={"X-CSRF-Token": csrf},
+    ).json()["analysis_id"]
+    pending = client.post(
+        f"/api/v1/bug-bounty/programs/{analysis_id}/stages",
+        json={"stage_type": "INVENTORY", "input_payload": {"artifacts": [{"name": "routes.json", "content_type": "application/json", "content": "{\"paths\":{}}"}]}},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert pending.status_code == 201, pending.text
+    for payload in (
+        {"artifacts": [{"name": "copied.json", "content_type": "application/json", "content": "{\"kind\":\"LOCAL_INVENTORY\"}"}]},
+        {"source_stage_ids": [pending.json()["stage_id"]]},
+    ):
+        rejected = client.post(
+            f"/api/v1/bug-bounty/programs/{analysis_id}/stages",
+            json={"stage_type": "REPORT_PREPARATION", "input_payload": payload},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert rejected.status_code == 422, rejected.text
+    store.close()
+
+
+def test_report_stage_binds_only_completed_same_owner_same_analysis_reportable_results(tmp_path: Path) -> None:
+    from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType
+
+    store = Store(tmp_path / "report-lineage-boundaries.sqlite3")
+    programs = ProgramAnalysisRepository(store)
+    analysis_a = programs.save(analyze_program("https://example.com/a", json.dumps(scope_payload())), owner_user_id="owner-a")
+    analysis_b = programs.save(analyze_program("https://example.com/b", json.dumps(scope_payload())), owner_user_id="owner-a")
+    stages = ResearchStageRepository(store)
+
+    def complete(analysis_id: str, stage_type: ResearchStageType, owner: str, result: dict):
+        source = stages.create(analysis_id, stage_type, owner_user_id=owner)
+        stages.start(source.stage_id, owner_user_id=owner)
+        return stages.finish(source.stage_id, ResearchStageStatus.COMPLETED, owner_user_id=owner, result=result)
+
+    queued = stages.create(analysis_a.analysis_id, ResearchStageType.INVENTORY, owner_user_id="owner-a")
+    with pytest.raises(ValueError, match="report_source_stage_not_completed"):
+        stages.create(analysis_a.analysis_id, ResearchStageType.REPORT_PREPARATION, owner_user_id="owner-a", input_payload={"source_stage_ids": [queued.stage_id]})
+
+    same_analysis_other_owner = complete(analysis_a.analysis_id, ResearchStageType.INVENTORY, "owner-b", {"kind": "LOCAL_INVENTORY"})
+    with pytest.raises(ValueError, match="report_source_stage_boundary_mismatch"):
+        stages.create(analysis_a.analysis_id, ResearchStageType.REPORT_PREPARATION, owner_user_id="owner-a", input_payload={"source_stage_ids": [same_analysis_other_owner.stage_id]})
+
+    other_analysis = complete(analysis_b.analysis_id, ResearchStageType.INVENTORY, "owner-a", {"kind": "LOCAL_INVENTORY"})
+    with pytest.raises(ValueError, match="report_source_stage_boundary_mismatch"):
+        stages.create(analysis_a.analysis_id, ResearchStageType.REPORT_PREPARATION, owner_user_id="owner-a", input_payload={"source_stage_ids": [other_analysis.stage_id]})
+
+    unsupported = complete(analysis_a.analysis_id, ResearchStageType.PROGRAM_ANALYSIS, "owner-a", {"kind": "PROGRAM_ANALYSIS"})
+    with pytest.raises(ValueError, match="report_source_stage_type_mismatch"):
+        stages.create(analysis_a.analysis_id, ResearchStageType.REPORT_PREPARATION, owner_user_id="owner-a", input_payload={"source_stage_ids": [unsupported.stage_id]})
+
+    invalid_result_kind = complete(analysis_a.analysis_id, ResearchStageType.INVENTORY, "owner-a", {"kind": "FOREIGN_RESULT"})
+    with pytest.raises(ValueError, match="report_source_result_kind_mismatch"):
+        stages.create(analysis_a.analysis_id, ResearchStageType.REPORT_PREPARATION, owner_user_id="owner-a", input_payload={"source_stage_ids": [invalid_result_kind.stage_id]})
+    store.close()
+
+
+def test_report_lineage_survives_database_reopen_and_rejects_result_digest_tampering(tmp_path: Path) -> None:
+    from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType
+
+    path = tmp_path / "report-lineage-reopen.sqlite3"
+    store = Store(path)
+    analysis = ProgramAnalysisRepository(store).save(analyze_program("https://example.com/policy", json.dumps(scope_payload())), owner_user_id="owner-a")
+    stages = ResearchStageRepository(store)
+    source = stages.create(analysis.analysis_id, ResearchStageType.INVENTORY, owner_user_id="owner-a")
+    stages.start(source.stage_id, owner_user_id="owner-a")
+    source = stages.finish(source.stage_id, ResearchStageStatus.COMPLETED, owner_user_id="owner-a", result={"kind": "LOCAL_INVENTORY", "endpoints": ["GET /orders/{id}"]})
+    report = stages.create(analysis.analysis_id, ResearchStageType.REPORT_PREPARATION, owner_user_id="owner-a", input_payload={"source_stage_ids": [source.stage_id]})
+    stored = store.db.execute("SELECT input_json FROM bugbounty_research_stages WHERE stage_id = ?", (report.stage_id,)).fetchone()
+    assert stored is not None
+    persisted_input = json.loads(stored["input_json"])
+    assert set(persisted_input) == {"source_stage_refs"}
+    assert "artifacts" not in stored["input_json"]
+    store.close()
+
+    reopened = Store(path)
+    reopened_stages = ResearchStageRepository(reopened)
+    persisted_report = reopened_stages.get(report.stage_id, owner_user_id="owner-a")
+    assert persisted_report is not None
+    assert reopened_stages.resolve_report_artifacts(persisted_report)[0]["content"] == json.dumps({"kind": "LOCAL_INVENTORY", "endpoints": ["GET /orders/{id}"]}, sort_keys=True)
+    tampered = json.dumps({"kind": "LOCAL_INVENTORY", "endpoints": ["GET /admin"]}, sort_keys=True)
+    with reopened._db_lock, reopened.db:
+        reopened.db.execute("UPDATE bugbounty_research_stages SET result_json = ? WHERE stage_id = ?", (tampered, source.stage_id))
+    with pytest.raises(ValueError, match="report_source_result_digest_mismatch"):
+        reopened_stages.resolve_report_artifacts(persisted_report)
+    reopened.close()
+
+
 def test_api_to_worker_local_research_pipeline_prepares_observations_hypotheses_verification_and_report(tmp_path: Path) -> None:
     service, store, _ = make_service(tmp_path, APITestTool("safe"), token=None)
     AuthManager(store).initialize_owner(OWNER_EMAIL, OWNER_PASSWORD)
@@ -482,6 +578,7 @@ def test_api_to_worker_local_research_pipeline_prepares_observations_hypotheses_
         ]
     }
     worker = BackgroundWorker(service.orchestrator, worker_id="api-local-pipeline-worker")
+    stage_ids: dict[str, str] = {}
 
     def create_and_run(stage_type: str, input_payload: dict) -> dict:
         created = client.post(
@@ -490,6 +587,7 @@ def test_api_to_worker_local_research_pipeline_prepares_observations_hypotheses_
             headers={"X-CSRF-Token": csrf},
         )
         assert created.status_code == 201, created.text
+        stage_ids[stage_type] = created.json()["stage_id"]
         assert worker.run_once()["status"] == "STAGE_COMPLETED"
         fetched = client.get(f"/api/v1/bug-bounty/research-stages/{created.json()['stage_id']}")
         assert fetched.status_code == 200, fetched.text
@@ -501,19 +599,21 @@ def test_api_to_worker_local_research_pipeline_prepares_observations_hypotheses_
     verification = create_and_run("VERIFICATION", {"artifacts": [{"name": "fixture.json", "content_type": "application/json", "content": json.dumps(fixture)}]})
     report = create_and_run(
         "REPORT_PREPARATION",
-        {
-            "artifacts": [
-                {"name": "passive.json", "content_type": "application/json", "content": json.dumps(passive)},
-                {"name": "hypotheses.json", "content_type": "application/json", "content": json.dumps(hypotheses)},
-                {"name": "verification.json", "content_type": "application/json", "content": json.dumps(verification)},
-            ]
-        },
+        {"source_stage_ids": [stage_ids["PASSIVE_RESEARCH"], stage_ids["HYPOTHESIS_GENERATION"], stage_ids["VERIFICATION"]]},
     )
     assert passive["network_accessed"] is False
     assert hypotheses["hypotheses"]
     assert verification["finding_confirmation_allowed"] is False
     assert report["kind"] == "LOCAL_REPORT"
     assert report["report_status"] == "LOCAL_ONLY_UNVERIFIED"
+    report_row = store.db.execute("SELECT input_json FROM bugbounty_research_stages WHERE stage_id = ?", (stage_ids["REPORT_PREPARATION"],)).fetchone()
+    assert report_row is not None
+    stored_lineage = json.loads(report_row["input_json"])["source_stage_refs"]
+    assert {item["stage_id"] for item in stored_lineage} == {stage_ids["PASSIVE_RESEARCH"], stage_ids["HYPOTHESIS_GENERATION"], stage_ids["VERIFICATION"]}
+    assert all(len(item["result_sha256"]) == 64 for item in stored_lineage)
+    report_response = client.get(f"/api/v1/bug-bounty/research-stages/{stage_ids['REPORT_PREPARATION']}").json()
+    assert report_response["source_stage_refs"] == stored_lineage
+    assert "input_payload" not in report_response
     assert client.get(f"/api/v1/bug-bounty/programs/{analysis_id}/stages").status_code == 200
     store.close()
 

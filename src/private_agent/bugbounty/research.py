@@ -5,6 +5,7 @@ scanners, executes tools, or turns a proposed scope into authorization.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Mapping
 
-from .local_evidence import normalize_research_input
+from .local_evidence import normalize_report_stage_refs, normalize_research_input
 from .models import safe_json, utc_now
 
 
@@ -30,6 +31,14 @@ class ResearchStageType(str, Enum):
     HYPOTHESIS_GENERATION = "HYPOTHESIS_GENERATION"
     VERIFICATION = "VERIFICATION"
     REPORT_PREPARATION = "REPORT_PREPARATION"
+
+
+_REPORT_SOURCE_RESULT_KINDS = {
+    ResearchStageType.INVENTORY.value: {"LOCAL_INVENTORY"},
+    ResearchStageType.PASSIVE_RESEARCH.value: {"LOCAL_PASSIVE_OBSERVATIONS", "PASSIVE_RESEARCH"},
+    ResearchStageType.HYPOTHESIS_GENERATION.value: {"LOCAL_HYPOTHESES"},
+    ResearchStageType.VERIFICATION.value: {"LOCAL_FIXTURE_VERIFICATION"},
+}
 
 
 class ResearchStageStatus(str, Enum):
@@ -131,6 +140,7 @@ class ResearchStage:
         return {
             "stage_id": self.stage_id, "analysis_id": self.analysis_id, "stage_type": self.stage_type,
             "stage_status": self.stage_status, "budget": self.budget.to_dict(),
+            "source_stage_refs": safe_json(self.input_payload.get("source_stage_refs", [])),
             "partial_result": safe_json(self.partial_result), "result": safe_json(self.result), "error_code": self.error_code,
             "started_at": self.started_at, "finished_at": self.finished_at,
             "created_at": self.created_at, "updated_at": self.updated_at,
@@ -148,6 +158,33 @@ class ResearchStageRepository:
     @staticmethod
     def _owner(owner_user_id: str | None) -> str:
         return owner_user_id or "legacy-owner"
+
+    @staticmethod
+    def _verified_report_source_json(row: Any, *, analysis_id: str, owner_user_id: str, ref: Mapping[str, Any] | None = None) -> tuple[str, str, str]:
+        if row is None:
+            raise ValueError("report_source_stage_missing")
+        stage_id = str(row["stage_id"])
+        stage_type = str(row["stage_type"])
+        if str(row["analysis_id"]) != analysis_id or str(row["owner_user_id"]) != owner_user_id:
+            raise ValueError("report_source_stage_boundary_mismatch")
+        if str(row["stage_status"]) != ResearchStageStatus.COMPLETED.value:
+            raise ValueError("report_source_stage_not_completed")
+        expected_kinds = _REPORT_SOURCE_RESULT_KINDS.get(stage_type)
+        if expected_kinds is None or (ref is not None and ref.get("stage_type") != stage_type):
+            raise ValueError("report_source_stage_type_mismatch")
+        result_json = row["result_json"]
+        if not isinstance(result_json, str):
+            raise ValueError("report_source_result_invalid")
+        digest = hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+        if ref is not None and ref.get("result_sha256") != digest:
+            raise ValueError("report_source_result_digest_mismatch")
+        try:
+            result = json.loads(result_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("report_source_result_invalid") from exc
+        if not isinstance(result, Mapping) or result.get("kind") not in expected_kinds:
+            raise ValueError("report_source_result_kind_mismatch")
+        return stage_id, stage_type, result_json
 
     @staticmethod
     def _row_to_stage(row: Any) -> ResearchStage:
@@ -172,21 +209,71 @@ class ResearchStageRepository:
         input_payload: Mapping[str, Any] | None = None,
     ) -> ResearchStage:
         owner = self._owner(owner_user_id)
-        stage = ResearchStage(
-            stage_id="STAGE-" + uuid.uuid4().hex,
-            analysis_id=analysis_id, owner_user_id=owner,
-            stage_type=ResearchStageType(stage_type).value,
-            budget=budget or StageBudget(), input_payload=dict(input_payload or {}), created_at=utc_now(), updated_at=utc_now(),
-        )
-        with self.store._db_lock, self.store.db:
-            count = self.store.db.execute("SELECT COUNT(*) AS count FROM bugbounty_research_stages WHERE analysis_id = ? AND owner_user_id = ?", (analysis_id, owner)).fetchone()
-            if int(count["count"]) >= MAX_STAGE_COUNT_PER_ANALYSIS:
-                raise ValueError("research_stage_limit_reached")
-            self.store.db.execute(
-                "INSERT INTO bugbounty_research_stages(stage_id, analysis_id, owner_user_id, stage_type, stage_status, budget_json, input_json, partial_result_json, result_json, error_code, started_at, finished_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (stage.stage_id, stage.analysis_id, stage.owner_user_id, stage.stage_type, stage.stage_status, json.dumps(stage.budget.to_dict(), sort_keys=True), json.dumps(stage.input_payload, ensure_ascii=False, sort_keys=True), json.dumps(stage.partial_result, sort_keys=True), json.dumps(stage.result, sort_keys=True), "", "", "", stage.created_at, stage.updated_at),
-            )
+        stage_type_value = ResearchStageType(stage_type).value
+        normalized_input = normalize_research_input(stage_type_value, input_payload)
+        if stage_type_value == ResearchStageType.REPORT_PREPARATION.value and set(normalized_input) != {"source_stage_ids"}:
+            raise ValueError("report_source_stage_ids_required")
+        stage_id = "STAGE-" + uuid.uuid4().hex
+        stamp = utc_now()
+        with self.store._db_lock:
+            self.store.db.execute("BEGIN IMMEDIATE")
+            try:
+                count = self.store.db.execute("SELECT COUNT(*) AS count FROM bugbounty_research_stages WHERE analysis_id = ? AND owner_user_id = ?", (analysis_id, owner)).fetchone()
+                if int(count["count"]) >= MAX_STAGE_COUNT_PER_ANALYSIS:
+                    raise ValueError("research_stage_limit_reached")
+                stored_input = normalized_input
+                if stage_type_value == ResearchStageType.REPORT_PREPARATION.value:
+                    source_refs: list[dict[str, str]] = []
+                    for source_stage_id in normalized_input["source_stage_ids"]:
+                        row = self.store.db.execute(
+                            "SELECT stage_id, analysis_id, owner_user_id, stage_type, stage_status, result_json FROM bugbounty_research_stages WHERE stage_id = ?",
+                            (source_stage_id,),
+                        ).fetchone()
+                        bound_id, bound_type, result_json = self._verified_report_source_json(
+                            row, analysis_id=analysis_id, owner_user_id=owner
+                        )
+                        source_refs.append({
+                            "stage_id": bound_id,
+                            "stage_type": bound_type,
+                            "result_sha256": hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
+                        })
+                    stored_input = {"source_stage_refs": source_refs}
+                stage = ResearchStage(
+                    stage_id=stage_id,
+                    analysis_id=analysis_id, owner_user_id=owner,
+                    stage_type=stage_type_value,
+                    budget=budget or StageBudget(), input_payload=stored_input, created_at=stamp, updated_at=stamp,
+                )
+                self.store.db.execute(
+                    "INSERT INTO bugbounty_research_stages(stage_id, analysis_id, owner_user_id, stage_type, stage_status, budget_json, input_json, partial_result_json, result_json, error_code, started_at, finished_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (stage.stage_id, stage.analysis_id, stage.owner_user_id, stage.stage_type, stage.stage_status, json.dumps(stage.budget.to_dict(), sort_keys=True), json.dumps(stage.input_payload, ensure_ascii=False, sort_keys=True), json.dumps(stage.partial_result, sort_keys=True), json.dumps(stage.result, sort_keys=True), "", "", "", stage.created_at, stage.updated_at),
+                )
+                self.store.db.commit()
+            except Exception:
+                self.store.db.rollback()
+                raise
         return stage
+
+    def resolve_report_artifacts(self, stage: ResearchStage) -> list[dict[str, str]]:
+        if stage.stage_type != ResearchStageType.REPORT_PREPARATION.value:
+            raise ValueError("report_stage_required")
+        refs = normalize_report_stage_refs(stage.input_payload.get("source_stage_refs"))
+        artifacts: list[dict[str, str]] = []
+        with self.store._db_lock:
+            for ref in refs:
+                row = self.store.db.execute(
+                    "SELECT stage_id, analysis_id, owner_user_id, stage_type, stage_status, result_json FROM bugbounty_research_stages WHERE stage_id = ?",
+                    (ref["stage_id"],),
+                ).fetchone()
+                source_id, source_type, result_json = self._verified_report_source_json(
+                    row, analysis_id=stage.analysis_id, owner_user_id=stage.owner_user_id, ref=ref
+                )
+                artifacts.append({
+                    "name": f"{source_type.lower()}-{source_id}.json",
+                    "content_type": "application/json",
+                    "content": result_json,
+                })
+        return artifacts
 
     @staticmethod
     def _lease_deadline(ttl_seconds: int) -> str:

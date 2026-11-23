@@ -416,6 +416,7 @@ class ResearchStageResponse(APIModel):
     stage_type: str
     stage_status: str
     budget: dict[str, int]
+    source_stage_refs: list[dict[str, str]] = Field(default_factory=list)
     partial_result: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] = Field(default_factory=dict)
     error_code: str = ""

@@ -19,6 +19,12 @@ from tests.test_program_analysis import scope_payload
 from tests.test_phase12_api import APITestTool, make_service
 
 
+def complete_stage(repository: ResearchStageRepository, analysis_id: str, stage_type: ResearchStageType, result: dict, owner: str = "legacy-owner"):
+    stage = repository.create(analysis_id, stage_type, owner_user_id=owner)
+    running = repository.start(stage.stage_id, owner_user_id=owner)
+    return repository.finish(running.stage_id, ResearchStageStatus.COMPLETED, owner_user_id=owner, result=result)
+
+
 def test_background_worker_completes_local_program_analysis_stage_without_network(tmp_path: Path) -> None:
     service, store, _ = make_service(tmp_path, APITestTool("safe"))
     analysis = ProgramAnalysisRepository(store).save(
@@ -204,15 +210,13 @@ def test_report_preparation_preserves_public_source_provenance_as_unverified(tmp
             }
         ],
     }
-    stage = ResearchStageRepository(store).create(
+    stages = ResearchStageRepository(store)
+    source = complete_stage(stages, analysis.analysis_id, ResearchStageType.PASSIVE_RESEARCH, passive_result)
+    stage = stages.create(
         analysis.analysis_id,
         ResearchStageType.REPORT_PREPARATION,
         owner_user_id="legacy-owner",
-        input_payload={
-            "artifacts": [
-                {"name": "passive-result.json", "content_type": "application/json", "content": json.dumps(passive_result)}
-            ]
-        },
+        input_payload={"source_stage_ids": [source.stage_id]},
     )
     result = BackgroundWorker(service.orchestrator, worker_id="stage-worker-report-passive").run_once()
     assert result["status"] == "STAGE_COMPLETED"
@@ -226,6 +230,48 @@ def test_report_preparation_preserves_public_source_provenance_as_unverified(tmp
     store.close()
 
 
+def test_worker_fails_closed_when_report_source_digest_changes(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    analysis = ProgramAnalysisRepository(store).save(
+        analyze_program("https://example.com/policy", json.dumps(scope_payload())), owner_user_id="legacy-owner"
+    )
+    stages = ResearchStageRepository(store)
+    source = complete_stage(
+        stages,
+        analysis.analysis_id,
+        ResearchStageType.INVENTORY,
+        {"kind": "LOCAL_INVENTORY", "endpoints": ["GET /orders/{id}"]},
+    )
+    report = stages.create(
+        analysis.analysis_id,
+        ResearchStageType.REPORT_PREPARATION,
+        owner_user_id="legacy-owner",
+        input_payload={"source_stage_ids": [source.stage_id]},
+    )
+    with store._db_lock, store.db:
+        store.db.execute(
+            "UPDATE bugbounty_research_stages SET result_json = ? WHERE stage_id = ?",
+            (json.dumps({"kind": "LOCAL_INVENTORY", "endpoints": ["GET /admin"]}, sort_keys=True), source.stage_id),
+        )
+
+    class NoReportExecution:
+        def execute(self, _stage: object, _analysis: object, **_kwargs: object) -> StageExecutionOutcome:
+            raise AssertionError("tampered report sources must not reach the executor")
+
+    result = BackgroundWorker(
+        service.orchestrator,
+        worker_id="stage-worker-report-tamper",
+        stage_executor=NoReportExecution(),  # type: ignore[arg-type]
+    ).run_once()
+    assert result["status"] == "STAGE_FAILED"
+    assert result["error_code"] == "report_source_integrity_failed"
+    persisted = stages.get(report.stage_id, owner_user_id="legacy-owner")
+    assert persisted is not None and persisted.stage_status == ResearchStageStatus.FAILED.value
+    assert persisted.error_code == "report_source_integrity_failed"
+    assert persisted.result == {}
+    store.close()
+
+
 @pytest.mark.parametrize(
     "stage_type",
     [
@@ -233,7 +279,6 @@ def test_report_preparation_preserves_public_source_provenance_as_unverified(tmp
         ResearchStageType.PASSIVE_RESEARCH,
         ResearchStageType.HYPOTHESIS_GENERATION,
         ResearchStageType.VERIFICATION,
-        ResearchStageType.REPORT_PREPARATION,
     ],
 )
 def test_background_worker_marks_external_stage_unavailable_without_fallback(tmp_path: Path, stage_type: ResearchStageType) -> None:
@@ -533,17 +578,17 @@ def test_report_preparation_builds_bounded_local_report_from_stage_evidence(tmp_
     inventory = {"kind": "LOCAL_INVENTORY", "network_accessed": False, "endpoints": ["GET /orders/{id}"], "urls_observed": [], "packages": [], "files": [], "limitations": []}
     hypotheses = {"kind": "LOCAL_HYPOTHESES", "network_accessed": False, "hypotheses": [{"hypothesis_id": "HYP-LOCAL-1", "category": "IDOR_BOLA", "title": "Dynamic resource authorization review", "status": "UNVERIFIED", "evidence": [{"artifact_name": "openapi.json", "content_sha256": "a" * 64, "observation": "GET /orders/{id}"}], "verification_conditions": ["fixture"], "alternative_explanations": ["middleware"]}], "limitations": ["hypotheses_are_unverified"], "artifact_count": 1}
     verification = {"kind": "LOCAL_FIXTURE_VERIFICATION", "network_accessed": False, "finding_confirmation_allowed": False, "cases": [{"case_id": "owner-read", "matched": True, "expected_sha256": "b" * 64, "observed_sha256": "b" * 64}], "limitations": ["local_fixture_only"], "fixture_artifact_count": 1}
-    stage = ResearchStageRepository(store).create(
+    stages = ResearchStageRepository(store)
+    sources = [
+        complete_stage(stages, analysis.analysis_id, ResearchStageType.INVENTORY, inventory),
+        complete_stage(stages, analysis.analysis_id, ResearchStageType.HYPOTHESIS_GENERATION, hypotheses),
+        complete_stage(stages, analysis.analysis_id, ResearchStageType.VERIFICATION, verification),
+    ]
+    stage = stages.create(
         analysis.analysis_id,
         ResearchStageType.REPORT_PREPARATION,
         owner_user_id="legacy-owner",
-        input_payload={
-            "artifacts": [
-                {"name": "inventory.json", "content_type": "application/json", "content": json.dumps(inventory)},
-                {"name": "hypotheses.json", "content_type": "application/json", "content": json.dumps(hypotheses)},
-                {"name": "verification.json", "content_type": "application/json", "content": json.dumps(verification)},
-            ]
-        },
+        input_payload={"source_stage_ids": [source.stage_id for source in sources]},
     )
     result = BackgroundWorker(service.orchestrator, worker_id="stage-worker-report-local").run_once()
     assert result["status"] == "STAGE_COMPLETED"
@@ -573,12 +618,14 @@ def test_report_budget_does_not_keep_items_removed_from_structured_result(tmp_pa
         ],
         "limitations": [],
     }
-    stage = ResearchStageRepository(store).create(
+    stages = ResearchStageRepository(store)
+    source = complete_stage(stages, analysis.analysis_id, ResearchStageType.HYPOTHESIS_GENERATION, hypotheses)
+    stage = stages.create(
         analysis.analysis_id,
         ResearchStageType.REPORT_PREPARATION,
         owner_user_id="legacy-owner",
         budget=StageBudget(max_items=100, timeout_seconds=10, max_output_bytes=768),
-        input_payload={"artifacts": [{"name": "hypotheses.json", "content_type": "application/json", "content": json.dumps(hypotheses)}]},
+        input_payload={"source_stage_ids": [source.stage_id]},
     )
     assert BackgroundWorker(service.orchestrator, worker_id="stage-worker-report-budget").run_once()["status"] == "STAGE_COMPLETED"
     persisted = ResearchStageRepository(store).get(stage.stage_id, owner_user_id="legacy-owner")
