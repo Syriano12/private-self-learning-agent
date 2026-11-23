@@ -36,6 +36,28 @@ class MinimumLimitResearchTool(WebResearchTool):
         return schema
 
 
+class InvalidNestedProposalTool(WebResearchTool):
+    name = "nested_scope_research"
+
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["scope"],
+            "additionalProperties": False,
+        }
+
+    def planning_inputs(self, goal: str) -> dict:
+        return {"scope": {"name": 7, "goal": goal}}
+
+
 def test_default_application_registry_has_clear_outcome_when_no_fallback_inputs_fit(
     tmp_path, monkeypatch
 ) -> None:
@@ -137,6 +159,23 @@ def test_invalid_registered_input_proposal_is_rejected_before_fallback() -> None
         permissions={"web_research": "public_read"},
     )
 
+    assert plan.steps[0].input == {"query": goal, "limit": 6}
+
+
+def test_invalid_nested_proposal_is_rejected_before_fallback() -> None:
+    tools = ToolRegistry()
+    tools.register(InvalidNestedProposalTool())
+    tools.register(WebResearchTool())
+    goal = "Research a general topic"
+
+    plan = Planner().create(
+        goal,
+        tools,
+        [],
+        permissions={"nested_scope_research": "public_read", "web_research": "public_read"},
+    )
+
+    assert plan.steps[0].tool == "web_research"
     assert plan.steps[0].input == {"query": goal, "limit": 6}
 
 

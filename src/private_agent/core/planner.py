@@ -9,6 +9,7 @@ from typing import Any
 
 from private_agent.core.learning import SQLiteLearningMemory
 from private_agent.core.llm import LLMProvider
+from private_agent.tools.contracts import validate_schema_value
 from private_agent.tools.github_access import RepositoryAccessError, parse_repository
 from private_agent.tools.research import ToolRegistry
 
@@ -717,23 +718,58 @@ class Planner:
     @staticmethod
     def _fallback_inputs_are_compatible(tool: Any, values: dict[str, Any]) -> bool:
         schema = getattr(tool, "input_schema", lambda: {})()
+        if not isinstance(values, dict) or not isinstance(schema, dict) or schema.get("type") != "object":
+            return False
+        if not Planner._fallback_schema_is_supported(schema):
+            return False
+        try:
+            errors = validate_schema_value(values, schema, path="fallback")
+        except (AttributeError, RecursionError, TypeError, ValueError):
+            return False
+        return not errors
+
+    @staticmethod
+    def _fallback_schema_is_supported(schema: Any) -> bool:
         if not isinstance(schema, dict):
+            return False
+        supported_keys = {
+            "type", "properties", "required", "additionalProperties", "items",
+            "minimum", "maximum", "description", "title", "default", "examples",
+        }
+        if any(not isinstance(key, str) or key not in supported_keys for key in schema):
+            return False
+        schema_type = schema.get("type")
+        supported_types = {"object", "array", "string", "integer", "boolean", "null"}
+        if not isinstance(schema_type, str) or schema_type not in supported_types:
             return False
         properties = schema.get("properties", {})
         required = schema.get("required", [])
         if (
             not isinstance(properties, dict)
+            or any(not isinstance(name, str) for name in properties)
             or not isinstance(required, list)
             or any(not isinstance(name, str) for name in required)
-            or any(not isinstance(definition, dict) for definition in properties.values())
         ):
             return False
-        errors: list[str] = []
-        try:
-            Planner._validate_input("fallback", values, schema, errors)
-        except (AttributeError, TypeError, ValueError):
+        if schema_type != "object" and (properties or required or "additionalProperties" in schema):
             return False
-        return not errors
+        if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
+            return False
+        if "items" in schema:
+            if schema_type != "array" or not Planner._fallback_schema_is_supported(schema["items"]):
+                return False
+        if any(key in schema for key in ("minimum", "maximum")):
+            if schema_type != "integer":
+                return False
+            for key in ("minimum", "maximum"):
+                bound = schema.get(key)
+                if bound is not None and (
+                    not isinstance(bound, (int, float))
+                    or isinstance(bound, bool)
+                    or not math.isfinite(float(bound))
+                ):
+                    return False
+        return all(Planner._fallback_schema_is_supported(value) for value in properties.values())
 
 
 def _planning_advisory_context(
