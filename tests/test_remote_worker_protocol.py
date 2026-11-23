@@ -283,13 +283,14 @@ def test_credential_rotation_accepts_new_secret_and_never_persists_raw_secret(tm
     store.close()
 
 
-def test_schema_11_database_upgrades_through_schema_16_with_all_new_tables(tmp_path: Path) -> None:
+def test_schema_11_database_upgrades_through_schema_17_with_all_new_tables(tmp_path: Path) -> None:
     path = tmp_path / "schema-11.sqlite3"
     store = Store(path)
     store.db.execute("DELETE FROM task_state_schema WHERE schema_version >= 12")
     for table in (
         "knowledge_attestations",
         "task_messages",
+        "task_conversation_sequences",
         "remote_worker_nonces",
         "remote_worker_jobs",
         "remote_workers",
@@ -300,7 +301,7 @@ def test_schema_11_database_upgrades_through_schema_16_with_all_new_tables(tmp_p
 
     upgraded = Store(path)
     versions = [row["schema_version"] for row in upgraded.db.execute("SELECT schema_version FROM task_state_schema ORDER BY schema_version")]
-    assert versions[-5:] == [12, 13, 14, 15, 16]
+    assert versions[-6:] == [12, 13, 14, 15, 16, 17]
     for table in (
         "remote_workers",
         "remote_worker_jobs",

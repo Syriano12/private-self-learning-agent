@@ -182,7 +182,7 @@ def test_valid_authentication_creates_real_typed_task_response(tmp_path: Path) -
     assert body["current_phase"] == "QUEUED"
     assert body["created_at"]
     assert body["api_version"] == "v1"
-    assert body["schema_version"] == 2
+    assert body["schema_version"] == 3
     assert body["request_id"] == response.headers["X-Request-ID"]
     assert store.get_task_state(task_id)["status"] == "QUEUED"
     listed = client.get("/api/v1/tasks", headers=auth_headers())

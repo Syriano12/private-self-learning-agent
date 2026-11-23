@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone
+from threading import Barrier
 
 import pytest
 
@@ -16,6 +18,7 @@ from private_agent.tools.contracts import ToolResult
 from private_agent.worker import BackgroundWorker
 from tests.test_phase12_api import APITestTool, client_for, make_service
 from private_agent.api import APIError
+from private_agent.core.assistant_reply import render_reply_for_event
 
 
 def _owner_and_principal(store: Store, *, suffix: str = "result") -> tuple[str, AuthPrincipal]:
@@ -121,11 +124,14 @@ def test_worker_result_event_is_owner_bound_idempotent_immutable_and_survives_re
         "transition_fingerprint": "spoofed-owner-transition",
     })
     columns = list(stored_event)
-    with pytest.raises(sqlite3.IntegrityError, match="task_result_events_owner_mismatch"):
-        store.db.execute(
-            f"INSERT INTO task_result_events ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-            tuple(stored_event[column] for column in columns),
-        )
+    with store._db_lock:
+        store.db.execute("BEGIN IMMEDIATE")
+        store._allocate_task_conversation_sequence_in_transaction(task_id)
+        with pytest.raises(sqlite3.IntegrityError, match="task_result_events_owner_mismatch"):
+            store.db.execute(
+                f"INSERT INTO task_result_events ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                tuple(stored_event[column] for column in columns),
+            )
     store.db.rollback()
 
     state = store.get_task_state(task_id)
@@ -342,4 +348,190 @@ def test_client_cannot_spoof_system_role_in_user_message_request(tmp_path: Path)
     assert len(messages) == 1
     assert messages[0]["role"] == "USER"
     assert messages[0]["content"] == "reject spoofed sender roles"
+    store.close()
+
+
+
+def _downgrade_conversation_db_to_legacy_v16(path: Path, task_id: str) -> None:
+    db = sqlite3.connect(path)
+    try:
+        for trigger in (
+            "task_messages_sequence_counter_guard", "task_messages_sequence_cross_type_guard",
+            "task_messages_sequence_immutable", "task_result_events_sequence_counter_guard",
+            "task_result_events_sequence_cross_type_guard", "task_conversation_sequences_monotonic_guard",
+            "task_conversation_sequences_no_delete", "task_result_events_no_update",
+            "task_assistant_replies_no_update",
+        ):
+            db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db.execute("DROP TABLE task_conversation_sequences")
+        db.execute("DELETE FROM task_state_schema WHERE schema_version = 17")
+        db.execute("UPDATE task_messages SET sequence = sequence + 10000 WHERE task_id = ?", (task_id,))
+        db.execute("UPDATE task_result_events SET sequence = sequence + 10000 WHERE task_id = ?", (task_id,))
+        messages = db.execute(
+            "SELECT message_id FROM task_messages WHERE task_id = ? ORDER BY sequence", (task_id,)
+        ).fetchall()
+        events = db.execute(
+            "SELECT event_id FROM task_result_events WHERE task_id = ? ORDER BY sequence", (task_id,)
+        ).fetchall()
+        for sequence, row in enumerate(messages, start=1):
+            db.execute(
+                "UPDATE task_messages SET sequence = ?, created_at = '2026-01-01T00:00:00Z' WHERE message_id = ?",
+                (sequence, str(row[0])),
+            )
+        for sequence, row in enumerate(events, start=1):
+            db.execute(
+                "UPDATE task_result_events SET sequence = ?, created_at = '2026-01-01T00:00:00Z' WHERE event_id = ?",
+                (sequence, str(row[0])),
+            )
+        db.execute(
+            "UPDATE task_assistant_replies SET source_sequence = "
+            "(SELECT sequence FROM task_result_events WHERE event_id = task_assistant_replies.event_id) "
+            "WHERE task_id = ?", (task_id,),
+        )
+        db.execute("""CREATE TRIGGER task_result_events_no_update
+          BEFORE UPDATE ON task_result_events BEGIN
+            SELECT RAISE(ABORT, 'task_result_events_immutable');
+          END""")
+        db.execute("""CREATE TRIGGER task_assistant_replies_no_update
+          BEFORE UPDATE ON task_assistant_replies BEGIN
+            SELECT RAISE(ABORT, 'task_assistant_replies_immutable');
+          END""")
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_schema_17_backfills_legacy_history_with_same_timestamps_and_pages_after_reopen(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    owner_user_id, _ = _owner_and_principal(store, suffix="migration")
+    task_id = _make_owned_task(store, owner_user_id, "migrate a task with saved conversation history")
+    store.append_task_message(
+        task_id, "second user message", owner_user_id=owner_user_id,
+        idempotency_key="migration-message", request_fingerprint="migration-fingerprint",
+    )
+    assert BackgroundWorker(service.orchestrator, worker_id="migration-worker").run_once()["status"] == "COMPLETED"
+    claim = store.claim_next_task_assistant_reply_event("migration-reply-worker", task_id=task_id)
+    assert claim is not None
+    reply_content = render_reply_for_event(claim, "VERIFIED_A")
+    store.save_task_assistant_reply(
+        str(claim["event_id"]), worker_id="migration-reply-worker", reply_code="VERIFIED_A",
+        content=reply_content, generation_mode="DETERMINISTIC_FALLBACK",
+    )
+    path = store.path
+    old_message_ids = [row["message_id"] for row in store.task_messages(task_id)]
+    old_event_ids = [row["event_id"] for row in store.task_result_events(task_id)]
+    assert len(old_message_ids) == 2 and len(old_event_ids) >= 2
+    store.close()
+
+    _downgrade_conversation_db_to_legacy_v16(path, task_id)
+    reopened = Store(path)
+    page = reopened.task_conversation_items(task_id, owner_user_id=owner_user_id, limit=2)
+    assert page["has_more"] is True
+    assert page["next_cursor"] == page["items"][-1]["sequence"] == 2
+    all_items = list(page["items"])
+    cursor = int(page["next_cursor"])
+    while page["has_more"]:
+        page = reopened.task_conversation_items(
+            task_id, owner_user_id=owner_user_id, after_sequence=cursor, limit=2,
+        )
+        all_items.extend(page["items"])
+        if page["has_more"]:
+            assert page["next_cursor"] == page["items"][-1]["sequence"]
+            cursor = int(page["next_cursor"])
+    sequences = [int(item["sequence"]) for item in all_items]
+    assert sequences == list(range(1, len(all_items) + 1))
+    assert [item["item_type"] for item in all_items[:4]] == [
+        "USER_MESSAGE", "USER_MESSAGE", "SYSTEM_RESULT", "SYSTEM_RESULT",
+    ]
+    assert [item["message"]["message_id"] for item in all_items if item["item_type"] == "USER_MESSAGE"] == old_message_ids
+    assert [item["result_event"]["event_id"] for item in all_items if item["item_type"] == "SYSTEM_RESULT"] == old_event_ids
+    assert reopened.task_conversation_items(task_id, owner_user_id="different-user")["items"] == []
+    events_by_id = {event["event_id"]: event for event in reopened.task_result_events(task_id, owner_user_id=owner_user_id)}
+    replies = reopened.task_assistant_replies(task_id, owner_user_id=owner_user_id)
+    assert len(replies) == 1
+    assert replies[0]["source_sequence"] == events_by_id[replies[0]["event_id"]]["sequence"]
+    counter = reopened.db.execute(
+        "SELECT last_sequence FROM task_conversation_sequences WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    assert int(counter["last_sequence"]) == len(all_items)
+    reopened.close()
+
+    restarted = Store(path)
+    assert restarted.task_conversation_items(task_id)["items"][-1]["sequence"] == len(all_items)
+    with pytest.raises(sqlite3.IntegrityError, match="task_conversation_sequence_not_monotonic"):
+        restarted.db.execute(
+            "UPDATE task_conversation_sequences SET last_sequence = last_sequence - 1 WHERE task_id = ?",
+            (task_id,),
+        )
+    restarted.db.rollback()
+    restarted.close()
+
+
+def test_follow_up_idempotency_reuses_the_original_shared_sequence(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    owner_user_id, principal = _owner_and_principal(store, suffix="retry")
+    task_id = _make_owned_task(store, owner_user_id, "accept an idempotent follow-up")
+    first = service.append_task_message(task_id, "same submission", idempotency_key="same-key", principal=principal)
+    replay = service.append_task_message(task_id, "same submission", idempotency_key="same-key", principal=principal)
+    assert first.message_id == replay.message_id
+    assert first.sequence == replay.sequence
+    assert first.idempotent_replay is False
+    assert replay.idempotent_replay is True
+    assert len([row for row in store.task_messages(task_id) if row["message_kind"] == "FOLLOW_UP"]) == 1
+    with pytest.raises(APIError) as conflict:
+        service.append_task_message(task_id, "different text", idempotency_key="same-key", principal=principal)
+    assert conflict.value.error_code == "message_idempotency_conflict"
+    store.close()
+
+
+def test_cross_type_writes_from_two_sqlite_connections_allocate_distinct_sequences(tmp_path: Path) -> None:
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    owner_user_id, _ = _owner_and_principal(store, suffix="concurrent")
+    task_id = _make_owned_task(store, owner_user_id, "serialize concurrent conversation writes")
+    second = Store(store.path)
+    barrier = Barrier(2)
+
+    def append_message() -> dict:
+        barrier.wait(timeout=5)
+        return store.append_task_message(
+            task_id, "concurrent user message", owner_user_id=owner_user_id,
+            idempotency_key="concurrent-message", request_fingerprint="concurrent-fingerprint",
+        )
+
+    def append_result_event() -> None:
+        state = second.get_task_state(task_id)
+        barrier.wait(timeout=5)
+        with second._db_lock:
+            second.db.execute("BEGIN IMMEDIATE")
+            try:
+                second._persist_task_result_event_in_transaction(state, "PLANNING")
+                second.db.commit()
+            except Exception:
+                second.db.rollback()
+                raise
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        message_future = pool.submit(append_message)
+        event_future = pool.submit(append_result_event)
+        message = message_future.result(timeout=15)
+        event_future.result(timeout=15)
+    items = store.task_conversation_items(task_id)["items"]
+    sequences = [int(item["sequence"]) for item in items]
+    assert sequences == sorted(sequences)
+    assert len(sequences) == len(set(sequences))
+    assert message["sequence"] in sequences
+    assert any(item["item_type"] == "SYSTEM_RESULT" and item["sequence"] != 2 for item in items)
+    counter = store.db.execute(
+        "SELECT last_sequence FROM task_conversation_sequences WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    assert int(counter["last_sequence"]) == max(sequences)
+    with pytest.raises(sqlite3.IntegrityError, match="task_messages_sequence_not_allocated"):
+        store.db.execute(
+            "INSERT INTO task_messages (message_id, task_id, sequence, role, message_kind, content, status, "
+            "idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint) "
+            "VALUES ('unallocated-message', ?, ?, 'USER', 'FOLLOW_UP', 'forbidden', 'PENDING', NULL, '', 'now', '', '')",
+            (task_id, int(counter["last_sequence"]) + 1),
+        )
+    store.db.rollback()
+    second.close()
     store.close()

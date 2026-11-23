@@ -327,7 +327,7 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 17
 MAX_TASK_MESSAGE_LENGTH = MAX_TASK_GOAL_LENGTH
 MAX_TASK_CONVERSATION_MESSAGES = 32
 MAX_TASK_CONVERSATION_CHARS = 16_000
@@ -492,6 +492,11 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
         "task_assistant_reply_claims": {
             "event_id": "TEXT", "task_id": "TEXT", "owner_user_id": "TEXT", "lease_owner": "TEXT",
             "lease_expires_at": "TEXT", "attempt_count": "INTEGER", "created_at": "TEXT", "updated_at": "TEXT",
+        },
+    },
+    17: {
+        "task_conversation_sequences": {
+            "task_id": "TEXT", "last_sequence": "INTEGER",
         },
     },
 }
@@ -857,6 +862,17 @@ class Store:
                 ("trigger", "task_assistant_replies_no_delete"),
                 ("trigger", "task_assistant_reply_claims_owner_matches_event"),
             )
+        if version == 17:
+            return (
+                ("table", "task_conversation_sequences"),
+                ("trigger", "task_conversation_sequences_monotonic_guard"),
+                ("trigger", "task_conversation_sequences_no_delete"),
+                ("trigger", "task_messages_sequence_counter_guard"),
+                ("trigger", "task_messages_sequence_cross_type_guard"),
+                ("trigger", "task_messages_sequence_immutable"),
+                ("trigger", "task_result_events_sequence_counter_guard"),
+                ("trigger", "task_result_events_sequence_cross_type_guard"),
+            )
         return ()
 
     def _assert_migration_objects(
@@ -961,6 +977,10 @@ class Store:
                         "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
                         "FOREIGN KEY (OWNER_USER_ID) REFERENCES AUTH_USERS(USER_ID)",
                     ),
+                    "task_conversation_sequences": (
+                        "LAST_SEQUENCE INTEGER NOT NULL CHECK (LAST_SEQUENCE >= 0)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                    ),
                 }.get(name, ())
                 for fragment in required_fragments:
                     if fragment not in table_sql:
@@ -976,7 +996,7 @@ class Store:
                     raise UnsupportedSchemaVersion(
                         f"inconsistent_schema_version:{version}:invalid_index:{name}"
                     )
-            elif object_type == "trigger" and name.startswith(("task_result_events_", "task_assistant_replies_", "task_assistant_reply_claims_")):
+            elif object_type == "trigger" and name.startswith(("task_messages_sequence_", "task_result_events_", "task_assistant_replies_", "task_assistant_reply_claims_")):
                 trigger_row = self.db.execute(
                     "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)
                 ).fetchone()
@@ -1018,6 +1038,45 @@ class Store:
                         "NEW.EVENT_ID",
                         "NEW.OWNER_USER_ID",
                         "TASK_ASSISTANT_REPLY_CLAIM_OWNER_MISMATCH",
+                    ),
+                    "task_messages_sequence_counter_guard": (
+                        "BEFORE INSERT ON TASK_MESSAGES",
+                        "TASK_CONVERSATION_SEQUENCES",
+                        "LAST_SEQUENCE = NEW.SEQUENCE",
+                        "TASK_MESSAGES_SEQUENCE_NOT_ALLOCATED",
+                    ),
+                    "task_messages_sequence_cross_type_guard": (
+                        "BEFORE INSERT ON TASK_MESSAGES",
+                        "FROM TASK_RESULT_EVENTS",
+                        "NEW.TASK_ID",
+                        "NEW.SEQUENCE",
+                        "TASK_CONVERSATION_SEQUENCE_DUPLICATE",
+                    ),
+                    "task_messages_sequence_immutable": (
+                        "BEFORE UPDATE OF SEQUENCE ON TASK_MESSAGES",
+                        "TASK_MESSAGES_SEQUENCE_IMMUTABLE",
+                    ),
+                    "task_result_events_sequence_counter_guard": (
+                        "BEFORE INSERT ON TASK_RESULT_EVENTS",
+                        "TASK_CONVERSATION_SEQUENCES",
+                        "LAST_SEQUENCE = NEW.SEQUENCE",
+                        "TASK_RESULT_EVENTS_SEQUENCE_NOT_ALLOCATED",
+                    ),
+                    "task_result_events_sequence_cross_type_guard": (
+                        "BEFORE INSERT ON TASK_RESULT_EVENTS",
+                        "FROM TASK_MESSAGES",
+                        "NEW.TASK_ID",
+                        "NEW.SEQUENCE",
+                        "TASK_CONVERSATION_SEQUENCE_DUPLICATE",
+                    ),
+                    "task_conversation_sequences_monotonic_guard": (
+                        "BEFORE UPDATE OF LAST_SEQUENCE ON TASK_CONVERSATION_SEQUENCES",
+                        "NEW.LAST_SEQUENCE != OLD.LAST_SEQUENCE + 1",
+                        "TASK_CONVERSATION_SEQUENCE_NOT_MONOTONIC",
+                    ),
+                    "task_conversation_sequences_no_delete": (
+                        "BEFORE DELETE ON TASK_CONVERSATION_SEQUENCES",
+                        "TASK_CONVERSATION_SEQUENCE_IMMUTABLE",
                     ),
                 }.get(name, ())
                 if any(fragment not in trigger_sql for fragment in required_trigger_fragments):
@@ -1751,6 +1810,157 @@ class Store:
               END""")
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (16, now()))
             return
+        if version == 17:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_conversation_sequences (
+              task_id TEXT PRIMARY KEY,
+              last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+
+            # Result events and their assistant replies were immutable in v16.
+            # This one-time migration rewrites only their sequence bindings,
+            # then reinstalls the immutability guards in the same transaction.
+            self.db.execute("DROP TRIGGER IF EXISTS task_result_events_no_update")
+            self.db.execute("DROP TRIGGER IF EXISTS task_assistant_replies_no_update")
+
+            maximum = self.db.execute(
+                "SELECT MAX(sequence) AS sequence FROM ("
+                "SELECT sequence FROM task_messages UNION ALL "
+                "SELECT sequence FROM task_result_events)"
+            ).fetchone()
+            item_count = int(self.db.execute(
+                "SELECT (SELECT COUNT(*) FROM task_messages) + "
+                "(SELECT COUNT(*) FROM task_result_events) AS count"
+            ).fetchone()["count"])
+            offset = int(maximum["sequence"] or 0) + item_count + 1
+            if offset + int(maximum["sequence"] or 0) > (2**63 - 1):
+                raise UnsupportedSchemaVersion("conversation_sequence_migration_overflow")
+            self.db.execute("UPDATE task_messages SET sequence = sequence + ?", (offset,))
+            self.db.execute("UPDATE task_result_events SET sequence = sequence + ?", (offset,))
+            self.db.execute(
+                "UPDATE task_assistant_replies SET source_sequence = "
+                "(SELECT sequence FROM task_result_events WHERE event_id = task_assistant_replies.event_id)"
+            )
+
+            task_ids = [str(row["task_id"]) for row in self.db.execute(
+                "SELECT task_id FROM task_states ORDER BY task_id"
+            ).fetchall()]
+            migrated_last_sequences: dict[str, int] = {}
+            for task_id in task_ids:
+                messages = [dict(row) for row in self.db.execute(
+                    "SELECT message_id, sequence, created_at FROM task_messages "
+                    "WHERE task_id = ? ORDER BY sequence", (task_id,)
+                ).fetchall()]
+                events = [dict(row) for row in self.db.execute(
+                    "SELECT event_id, sequence, created_at FROM task_result_events "
+                    "WHERE task_id = ? ORDER BY sequence", (task_id,)
+                ).fetchall()]
+
+                # Preserve each legacy per-type sequence. Timestamps are used
+                # only to make a deterministic best-effort historical merge;
+                # ties put USER messages before SYSTEM results. Exact cross-type
+                # order for legacy timestamp ties was never stored.
+                merged: list[tuple[str, dict[str, Any]]] = []
+                message_index = event_index = 0
+                while message_index < len(messages) or event_index < len(events):
+                    if event_index >= len(events):
+                        item_type, item = "message", messages[message_index]
+                        message_index += 1
+                    elif message_index >= len(messages):
+                        item_type, item = "event", events[event_index]
+                        event_index += 1
+                    else:
+                        message = messages[message_index]
+                        result_event = events[event_index]
+                        message_key = (str(message["created_at"]), 0, int(message["sequence"]))
+                        event_key = (str(result_event["created_at"]), 1, int(result_event["sequence"]))
+                        if message_key <= event_key:
+                            item_type, item = "message", message
+                            message_index += 1
+                        else:
+                            item_type, item = "event", result_event
+                            event_index += 1
+                    merged.append((item_type, item))
+
+                for sequence, (item_type, item) in enumerate(merged, start=1):
+                    if item_type == "message":
+                        self.db.execute(
+                            "UPDATE task_messages SET sequence = ? WHERE message_id = ?",
+                            (sequence, str(item["message_id"])),
+                        )
+                    else:
+                        event_id = str(item["event_id"])
+                        self.db.execute(
+                            "UPDATE task_result_events SET sequence = ? WHERE event_id = ?",
+                            (sequence, event_id),
+                        )
+                        self.db.execute(
+                            "UPDATE task_assistant_replies SET source_sequence = ? WHERE event_id = ?",
+                            (sequence, event_id),
+                        )
+                migrated_last_sequences[task_id] = len(merged)
+
+            for task_id, last_sequence in migrated_last_sequences.items():
+                self.db.execute(
+                    "INSERT INTO task_conversation_sequences(task_id, last_sequence) VALUES (?, ?)",
+                    (task_id, last_sequence),
+                )
+
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_messages_sequence_counter_guard
+              BEFORE INSERT ON task_messages
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_conversation_sequences
+                WHERE task_id = NEW.task_id AND last_sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_messages_sequence_not_allocated');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_messages_sequence_cross_type_guard
+              BEFORE INSERT ON task_messages
+              WHEN EXISTS (
+                SELECT 1 FROM task_result_events
+                WHERE task_id = NEW.task_id AND sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_duplicate');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_messages_sequence_immutable
+              BEFORE UPDATE OF sequence ON task_messages BEGIN
+                SELECT RAISE(ABORT, 'task_messages_sequence_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_sequence_counter_guard
+              BEFORE INSERT ON task_result_events
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_conversation_sequences
+                WHERE task_id = NEW.task_id AND last_sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_sequence_not_allocated');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_sequence_cross_type_guard
+              BEFORE INSERT ON task_result_events
+              WHEN EXISTS (
+                SELECT 1 FROM task_messages
+                WHERE task_id = NEW.task_id AND sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_duplicate');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_conversation_sequences_monotonic_guard
+              BEFORE UPDATE OF last_sequence ON task_conversation_sequences
+              WHEN NEW.last_sequence != OLD.last_sequence + 1 BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_not_monotonic');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_conversation_sequences_no_delete
+              BEFORE DELETE ON task_conversation_sequences BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_no_update
+              BEFORE UPDATE ON task_result_events BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_no_update
+              BEFORE UPDATE ON task_assistant_replies BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_immutable');
+              END""")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (17, now()))
+            return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
     def latest_owner_policy_version(self) -> int:
@@ -2013,6 +2223,23 @@ class Store:
         )
         self._persist_task_result_event_in_transaction(payload, status)
 
+    def _allocate_task_conversation_sequence_in_transaction(self, task_id: str) -> int:
+        """Allocate the next task-wide conversation sequence inside a write transaction."""
+        if not self.db.in_transaction:
+            raise RuntimeError("conversation_sequence_transaction_required")
+        self.db.execute(
+            "INSERT INTO task_conversation_sequences(task_id, last_sequence) VALUES (?, 1) "
+            "ON CONFLICT(task_id) DO UPDATE SET last_sequence = last_sequence + 1",
+            (str(task_id),),
+        )
+        row = self.db.execute(
+            "SELECT last_sequence FROM task_conversation_sequences WHERE task_id = ?",
+            (str(task_id),),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("conversation_sequence_allocation_failed")
+        return int(row["last_sequence"])
+
     def _persist_task_result_event_in_transaction(self, payload: dict[str, Any], status: str) -> None:
         """Append a compact immutable result snapshot when its trusted summary changes."""
         task_id = str(payload["task_id"])
@@ -2084,11 +2311,6 @@ class Store:
         ).fetchone()
         if latest is not None and all(latest[key] == value for key, value in summary.items()):
             return
-        previous = self.db.execute(
-            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM task_result_events WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        sequence = int(previous["sequence"] or 0) + 1
         transition = {
             "task_id": task_id,
             "state_version": int(payload["state_version"]),
@@ -2098,6 +2320,13 @@ class Store:
         transition_fingerprint = hashlib.sha256(
             json.dumps(transition, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        duplicate = self.db.execute(
+            "SELECT 1 FROM task_result_events WHERE task_id = ? AND transition_fingerprint = ?",
+            (task_id, transition_fingerprint),
+        ).fetchone()
+        if duplicate is not None:
+            return
+        sequence = self._allocate_task_conversation_sequence_in_transaction(task_id)
         event_id = hashlib.sha256(f"task-result:{task_id}:{transition_fingerprint}".encode("utf-8")).hexdigest()
         self.db.execute(
             """INSERT OR IGNORE INTO task_result_events
@@ -2331,15 +2560,17 @@ class Store:
                     "INSERT INTO task_owners (task_id, user_id, created_at) VALUES (?, ?, ?)",
                     (state.task_id, owner_user_id, stamp),
                 )
-                self._persist_task_result_event_in_transaction(payload, "QUEUED")
             if initial_message is not None:
+                initial_sequence = self._allocate_task_conversation_sequence_in_transaction(state.task_id)
                 self.db.execute(
                     """INSERT INTO task_messages
                     (message_id, task_id, sequence, role, message_kind, content, status,
                      idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint)
-                    VALUES (?, ?, 1, 'USER', 'INITIAL', ?, 'CONSUMED', NULL, '', ?, ?, 'TASK_QUEUED')""",
-                    (str(uuid.uuid4()), state.task_id, initial_message, stamp, stamp),
+                    VALUES (?, ?, ?, 'USER', 'INITIAL', ?, 'CONSUMED', NULL, '', ?, ?, 'TASK_QUEUED')""",
+                    (str(uuid.uuid4()), state.task_id, initial_sequence, initial_message, stamp, stamp),
                 )
+            if owner_user_id is not None:
+                self._persist_task_result_event_in_transaction(payload, "QUEUED")
             if idempotency_key:
                 self.db.execute(
                     """INSERT INTO api_idempotency_keys
@@ -2411,6 +2642,101 @@ class Store:
         with self._db_lock:
             rows = self.db.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def task_conversation_items(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str | None = None,
+        after_sequence: int = 0,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Read one server-ordered page; the cursor is exclusive and append-only."""
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int) or after_sequence < 0:
+            raise ValueError("conversation_cursor_invalid")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500
+        ):
+            raise ValueError("conversation_limit_invalid")
+        task_id = str(task_id)
+        message_owner = ""
+        event_owner = ""
+        params: list[Any] = [task_id]
+        if owner_user_id is not None:
+            message_owner = " AND EXISTS (SELECT 1 FROM task_owners AS mo " \
+                "WHERE mo.task_id = m.task_id AND mo.user_id = ?)"
+            event_owner = " AND e.owner_user_id = ?"
+        if owner_user_id is not None:
+            params.append(str(owner_user_id))
+        params.append(task_id)
+        if owner_user_id is not None:
+            params.append(str(owner_user_id))
+        params.append(after_sequence)
+        query = (
+            "SELECT * FROM ("
+            "SELECT 'USER_MESSAGE' AS item_type, m.message_id AS item_id, m.sequence, m.task_id, "
+            "m.role, m.message_kind, m.content, m.status, m.created_at, m.consumed_at, "
+            "m.consumed_checkpoint, NULL AS task_status, NULL AS verification_status, "
+            "NULL AS result_available, NULL AS verified_action_count, NULL AS failed_action_count, "
+            "NULL AS blocked_action_count, NULL AS pending_action_count, NULL AS approval_pending_count, "
+            "NULL AS approval_approved_count, NULL AS approval_denied_count, NULL AS approval_expired_count, "
+            "NULL AS approval_cancelled_count, NULL AS result_digest "
+            "FROM task_messages AS m WHERE m.task_id = ?" + message_owner + " UNION ALL "
+            "SELECT 'SYSTEM_RESULT' AS item_type, e.event_id AS item_id, e.sequence, e.task_id, "
+            "e.role, e.message_kind, NULL AS content, NULL AS status, e.created_at, NULL AS consumed_at, "
+            "NULL AS consumed_checkpoint, e.task_status, e.verification_status, e.result_available, "
+            "e.verified_action_count, e.failed_action_count, e.blocked_action_count, e.pending_action_count, "
+            "e.approval_pending_count, e.approval_approved_count, e.approval_denied_count, "
+            "e.approval_expired_count, e.approval_cancelled_count, e.result_digest "
+            "FROM task_result_events AS e JOIN task_owners AS eo "
+            "ON eo.task_id = e.task_id AND eo.user_id = e.owner_user_id "
+            "WHERE e.task_id = ?" + event_owner + ") AS conversation_items "
+            "WHERE sequence > ? ORDER BY sequence"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit + 1)
+        with self._db_lock:
+            rows = [dict(row) for row in self.db.execute(query, tuple(params)).fetchall()]
+        has_more = limit is not None and len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            sequence = int(row["sequence"])
+            if row["item_type"] == "USER_MESSAGE":
+                message = {
+                    "message_id": str(row["item_id"]), "task_id": task_id, "sequence": sequence,
+                    "role": str(row["role"]), "message_kind": str(row["message_kind"]),
+                    "content": str(row["content"]), "status": str(row["status"]),
+                    "created_at": str(row["created_at"]), "consumed_at": str(row["consumed_at"]),
+                    "consumed_checkpoint": str(row["consumed_checkpoint"]),
+                }
+                items.append({"item_type": "USER_MESSAGE", "sequence": sequence, "message": message})
+            else:
+                result_event = {
+                    "event_id": str(row["item_id"]), "task_id": task_id, "sequence": sequence,
+                    "role": str(row["role"]), "message_kind": str(row["message_kind"]),
+                    "task_status": str(row["task_status"]),
+                    "verification_status": str(row["verification_status"]),
+                    "result_available": bool(row["result_available"]),
+                    "verified_action_count": int(row["verified_action_count"]),
+                    "failed_action_count": int(row["failed_action_count"]),
+                    "blocked_action_count": int(row["blocked_action_count"]),
+                    "pending_action_count": int(row["pending_action_count"]),
+                    "approval_pending_count": int(row["approval_pending_count"]),
+                    "approval_approved_count": int(row["approval_approved_count"]),
+                    "approval_denied_count": int(row["approval_denied_count"]),
+                    "approval_expired_count": int(row["approval_expired_count"]),
+                    "approval_cancelled_count": int(row["approval_cancelled_count"]),
+                    "result_digest": str(row["result_digest"]), "created_at": str(row["created_at"]),
+                }
+                items.append({"item_type": "SYSTEM_RESULT", "sequence": sequence, "result_event": result_event})
+        return {
+            "items": items,
+            "has_more": bool(has_more),
+            "next_cursor": int(items[-1]["sequence"]) if has_more and items else None,
+        }
 
     def claim_next_task_assistant_reply_event(
         self,
@@ -2643,8 +2969,8 @@ class Store:
             if not eligible:
                 raise ValueError("conversation_not_accepting_messages")
             totals = self.db.execute(
-                "SELECT COUNT(*) AS message_count, COALESCE(SUM(length(content)), 0) AS total_chars, "
-                "COALESCE(MAX(sequence), 0) AS last_sequence FROM task_messages WHERE task_id = ?",
+                "SELECT COUNT(*) AS message_count, COALESCE(SUM(length(content)), 0) AS total_chars "
+                "FROM task_messages WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
             if int(totals["message_count"] or 0) >= MAX_TASK_CONVERSATION_MESSAGES:
@@ -2653,7 +2979,7 @@ class Store:
                 raise ValueError("conversation_size_limit")
             stamp = now()
             message_id = str(uuid.uuid4())
-            sequence = int(totals["last_sequence"] or 0) + 1
+            sequence = self._allocate_task_conversation_sequence_in_transaction(task_id)
             self.db.execute(
                 """INSERT INTO task_messages
                 (message_id, task_id, sequence, role, message_kind, content, status,
