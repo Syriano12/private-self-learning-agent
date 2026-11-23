@@ -130,6 +130,11 @@ class GeminiProvider(LLMProvider):
         self.sleep_fn = sleep_fn
         self.config.validate()
 
+    @property
+    def is_configured(self) -> bool:
+        """Report readiness without exposing or logging the credential."""
+        return bool(self.config.api_key.strip())
+
     def generate_json(
         self,
         *,

@@ -124,7 +124,7 @@ def test_schema_13_conversation_layout_migrates_to_15_without_losing_messages(tm
     ).fetchone()
     assert migrated.db.execute(
         "SELECT schema_version FROM task_state_schema ORDER BY schema_version DESC LIMIT 1"
-    ).fetchone()["schema_version"] == 15
+    ).fetchone()["schema_version"] == 16
     migrated.close()
 
 

@@ -478,6 +478,19 @@ class TaskResultEventResponse(APIModel):
     created_at: str
 
 
+class TaskAssistantReplyResponse(APIModel):
+    reply_id: str
+    conversation_id: str
+    task_id: str
+    source_event_id: str
+    source_sequence: int
+    role: str
+    message_kind: str
+    reply_code: str
+    content: str
+    created_at: str
+
+
 class TaskConversationResponse(APIModel):
     conversation_id: str
     task_id: str
@@ -485,6 +498,7 @@ class TaskConversationResponse(APIModel):
     queue_status: str
     messages: list[TaskMessageResponse]
     result_events: list[TaskResultEventResponse] = Field(default_factory=list)
+    assistant_replies: list[TaskAssistantReplyResponse] = Field(default_factory=list)
     assistant_reply_supported: bool = False
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
@@ -978,6 +992,14 @@ class AgentAPIService:
         self.require_owner_auth = os.getenv("AGENT_REQUIRE_OWNER_AUTH", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.auto_requeue_approvals = False
         self._lock = threading.RLock()
+
+    @property
+    def assistant_reply_supported(self) -> bool:
+        planner = getattr(self.orchestrator, "planner", None)
+        provider = getattr(planner, "provider", None)
+        if not callable(getattr(provider, "generate_json", None)):
+            return False
+        return getattr(provider, "is_configured", True) is not False
 
     @staticmethod
     def auth_user_response(user: AuthUser) -> AuthUserResponse:
@@ -1713,6 +1735,7 @@ class AgentAPIService:
         )
         messages = self.store.task_messages(task_id, owner_user_id=owner_user_id)
         result_events = self.store.task_result_events(task_id, owner_user_id=owner_user_id)
+        assistant_replies = self.store.task_assistant_replies(task_id, owner_user_id=owner_user_id)
         return TaskConversationResponse(
             conversation_id=task_id,
             task_id=task_id,
@@ -1759,7 +1782,22 @@ class AgentAPIService:
                 )
                 for item in result_events
             ],
-            assistant_reply_supported=False,
+            assistant_replies=[
+                TaskAssistantReplyResponse(
+                    reply_id=str(item["reply_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    source_event_id=str(item["event_id"]),
+                    source_sequence=int(item["source_sequence"]),
+                    role=str(item["role"]),
+                    message_kind=str(item["message_kind"]),
+                    reply_code=str(item["reply_code"]),
+                    content=str(item["content"]),
+                    created_at=str(item["created_at"]),
+                )
+                for item in assistant_replies
+            ],
+            assistant_reply_supported=self.assistant_reply_supported,
             request_id=request_id,
         )
 

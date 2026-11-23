@@ -327,7 +327,7 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 MAX_TASK_MESSAGE_LENGTH = MAX_TASK_GOAL_LENGTH
 MAX_TASK_CONVERSATION_MESSAGES = 32
 MAX_TASK_CONVERSATION_CHARS = 16_000
@@ -482,6 +482,18 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
             "transition_fingerprint": "TEXT", "created_at": "TEXT",
         },
     },
+    16: {
+        "task_assistant_replies": {
+            "reply_id": "TEXT", "reply_key": "TEXT", "event_id": "TEXT", "task_id": "TEXT",
+            "owner_user_id": "TEXT", "source_sequence": "INTEGER", "source_digest": "TEXT",
+            "role": "TEXT", "message_kind": "TEXT", "reply_code": "TEXT", "content": "TEXT",
+            "generation_mode": "TEXT", "created_at": "TEXT",
+        },
+        "task_assistant_reply_claims": {
+            "event_id": "TEXT", "task_id": "TEXT", "owner_user_id": "TEXT", "lease_owner": "TEXT",
+            "lease_expires_at": "TEXT", "attempt_count": "INTEGER", "created_at": "TEXT", "updated_at": "TEXT",
+        },
+    },
 }
 
 _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -513,6 +525,8 @@ _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
     "idx_task_messages_task_sequence": ("task_id", "sequence"),
     "idx_task_messages_pending": ("task_id", "status", "sequence"),
     "idx_task_result_events_task_sequence": ("task_id", "sequence"),
+    "idx_task_assistant_replies_task_sequence": ("task_id", "source_sequence"),
+    "idx_task_assistant_reply_claims_lease": ("lease_expires_at", "event_id"),
 }
 
 
@@ -832,6 +846,17 @@ class Store:
                 ("trigger", "task_result_events_no_update"),
                 ("trigger", "task_result_events_no_delete"),
             )
+        if version == 16:
+            return (
+                ("table", "task_assistant_replies"),
+                ("table", "task_assistant_reply_claims"),
+                ("index", "idx_task_assistant_replies_task_sequence"),
+                ("index", "idx_task_assistant_reply_claims_lease"),
+                ("trigger", "task_assistant_replies_owner_matches_event"),
+                ("trigger", "task_assistant_replies_no_update"),
+                ("trigger", "task_assistant_replies_no_delete"),
+                ("trigger", "task_assistant_reply_claims_owner_matches_event"),
+            )
         return ()
 
     def _assert_migration_objects(
@@ -920,6 +945,22 @@ class Store:
                         "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
                         "FOREIGN KEY (OWNER_USER_ID) REFERENCES AUTH_USERS(USER_ID)",
                     ),
+                    "task_assistant_replies": (
+                        "CHECK (ROLE = 'ASSISTANT')",
+                        "CHECK (MESSAGE_KIND = 'RESULT_REPLY')",
+                        "CHECK (REPLY_CODE IN",
+                        "EVENT_ID TEXT NOT NULL UNIQUE",
+                        "UNIQUE (TASK_ID, REPLY_KEY)",
+                        "FOREIGN KEY (EVENT_ID) REFERENCES TASK_RESULT_EVENTS(EVENT_ID)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                        "FOREIGN KEY (OWNER_USER_ID) REFERENCES AUTH_USERS(USER_ID)",
+                    ),
+                    "task_assistant_reply_claims": (
+                        "EVENT_ID TEXT PRIMARY KEY",
+                        "FOREIGN KEY (EVENT_ID) REFERENCES TASK_RESULT_EVENTS(EVENT_ID)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                        "FOREIGN KEY (OWNER_USER_ID) REFERENCES AUTH_USERS(USER_ID)",
+                    ),
                 }.get(name, ())
                 for fragment in required_fragments:
                     if fragment not in table_sql:
@@ -935,7 +976,7 @@ class Store:
                     raise UnsupportedSchemaVersion(
                         f"inconsistent_schema_version:{version}:invalid_index:{name}"
                     )
-            elif object_type == "trigger" and name.startswith("task_result_events_"):
+            elif object_type == "trigger" and name.startswith(("task_result_events_", "task_assistant_replies_", "task_assistant_reply_claims_")):
                 trigger_row = self.db.execute(
                     "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)
                 ).fetchone()
@@ -955,6 +996,28 @@ class Store:
                     "task_result_events_no_delete": (
                         "BEFORE DELETE ON TASK_RESULT_EVENTS",
                         "TASK_RESULT_EVENTS_IMMUTABLE",
+                    ),
+                    "task_assistant_replies_owner_matches_event": (
+                        "BEFORE INSERT ON TASK_ASSISTANT_REPLIES",
+                        "FROM TASK_RESULT_EVENTS",
+                        "NEW.EVENT_ID",
+                        "NEW.OWNER_USER_ID",
+                        "TASK_ASSISTANT_REPLIES_OWNER_MISMATCH",
+                    ),
+                    "task_assistant_replies_no_update": (
+                        "BEFORE UPDATE ON TASK_ASSISTANT_REPLIES",
+                        "TASK_ASSISTANT_REPLIES_IMMUTABLE",
+                    ),
+                    "task_assistant_replies_no_delete": (
+                        "BEFORE DELETE ON TASK_ASSISTANT_REPLIES",
+                        "TASK_ASSISTANT_REPLIES_IMMUTABLE",
+                    ),
+                    "task_assistant_reply_claims_owner_matches_event": (
+                        "BEFORE INSERT ON TASK_ASSISTANT_REPLY_CLAIMS",
+                        "FROM TASK_RESULT_EVENTS",
+                        "NEW.EVENT_ID",
+                        "NEW.OWNER_USER_ID",
+                        "TASK_ASSISTANT_REPLY_CLAIM_OWNER_MISMATCH",
                     ),
                 }.get(name, ())
                 if any(fragment not in trigger_sql for fragment in required_trigger_fragments):
@@ -1617,6 +1680,77 @@ class Store:
               END""")
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (15, now()))
             return
+        if version == 16:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_assistant_replies (
+              reply_id TEXT PRIMARY KEY,
+              reply_key TEXT NOT NULL UNIQUE,
+              event_id TEXT NOT NULL UNIQUE,
+              task_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              source_sequence INTEGER NOT NULL CHECK (source_sequence >= 1),
+              source_digest TEXT NOT NULL,
+              role TEXT NOT NULL CHECK (role = 'ASSISTANT'),
+              message_kind TEXT NOT NULL CHECK (message_kind = 'RESULT_REPLY'),
+              reply_code TEXT NOT NULL CHECK (reply_code IN (
+                'VERIFIED_A', 'VERIFIED_B', 'UNVERIFIED_A', 'UNVERIFIED_B',
+                'FAILED_A', 'FAILED_B', 'BLOCKED_A', 'BLOCKED_B', 'UNKNOWN_A', 'UNKNOWN_B',
+                'APPROVAL_PENDING_A', 'APPROVAL_PENDING_B', 'APPROVAL_DECISION_A', 'APPROVAL_DECISION_B',
+                'IN_PROGRESS_A', 'IN_PROGRESS_B'
+              )),
+              content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 500),
+              generation_mode TEXT NOT NULL CHECK (generation_mode IN ('MODEL_VARIANT', 'DETERMINISTIC_FALLBACK')),
+              created_at TEXT NOT NULL,
+              UNIQUE (task_id, reply_key),
+              FOREIGN KEY (event_id) REFERENCES task_result_events(event_id),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id),
+              FOREIGN KEY (owner_user_id) REFERENCES auth_users(user_id)
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_assistant_reply_claims (
+              event_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              lease_owner TEXT NOT NULL,
+              lease_expires_at TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (event_id) REFERENCES task_result_events(event_id),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id),
+              FOREIGN KEY (owner_user_id) REFERENCES auth_users(user_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_assistant_replies_task_sequence ON task_assistant_replies(task_id, source_sequence)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_assistant_reply_claims_lease ON task_assistant_reply_claims(lease_expires_at, event_id)")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_owner_matches_event
+              BEFORE INSERT ON task_assistant_replies
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_result_events AS e
+                JOIN task_owners AS o ON o.task_id = e.task_id AND o.user_id = e.owner_user_id
+                WHERE e.event_id = NEW.event_id AND e.task_id = NEW.task_id
+                  AND e.owner_user_id = NEW.owner_user_id AND e.sequence = NEW.source_sequence
+                  AND e.result_digest = NEW.source_digest
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_owner_mismatch');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_no_update
+              BEFORE UPDATE ON task_assistant_replies BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_no_delete
+              BEFORE DELETE ON task_assistant_replies BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_reply_claims_owner_matches_event
+              BEFORE INSERT ON task_assistant_reply_claims
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_result_events AS e
+                JOIN task_owners AS o ON o.task_id = e.task_id AND o.user_id = e.owner_user_id
+                WHERE e.event_id = NEW.event_id AND e.task_id = NEW.task_id
+                  AND e.owner_user_id = NEW.owner_user_id
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_reply_claim_owner_mismatch');
+              END""")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (16, now()))
+            return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
     def latest_owner_policy_version(self) -> int:
@@ -2274,6 +2408,159 @@ class Store:
             query += " AND e.owner_user_id = ?"
             params = (str(task_id), str(owner_user_id))
         query += " ORDER BY e.sequence"
+        with self._db_lock:
+            rows = self.db.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_next_task_assistant_reply_event(
+        self,
+        worker_id: str,
+        *,
+        lease_ttl_seconds: int = 300,
+        task_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Lease the latest unanswered user-facing result event across restarts."""
+        worker_id = str(worker_id).strip()
+        if not worker_id or len(worker_id) > 200:
+            raise ValueError("assistant_reply_worker_id_invalid")
+        if isinstance(lease_ttl_seconds, bool) or int(lease_ttl_seconds) < 1:
+            raise ValueError("assistant_reply_lease_invalid")
+        current = now()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=int(lease_ttl_seconds))).isoformat()
+        conditions = [
+            "(e.task_status IN ('COMPLETED', 'FAILED', 'BLOCKED', 'EXECUTION_UNKNOWN', 'WAITING_APPROVAL') "
+            "OR e.verification_status IN ('FAILED', 'BLOCKED', 'EXECUTION_UNKNOWN', 'WAITING_APPROVAL'))",
+            "NOT EXISTS (SELECT 1 FROM task_assistant_replies AS r WHERE r.event_id = e.event_id)",
+            "NOT EXISTS (SELECT 1 FROM task_result_events AS newer WHERE newer.task_id = e.task_id AND newer.sequence > e.sequence)",
+            "NOT EXISTS (SELECT 1 FROM task_assistant_reply_claims AS c WHERE c.event_id = e.event_id AND c.lease_expires_at > ?)",
+        ]
+        params: list[Any] = [current]
+        if task_id is not None:
+            conditions.append("e.task_id = ?")
+            params.append(str(task_id))
+        with self._db_lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.db.execute(
+                    "SELECT e.* FROM task_result_events AS e WHERE " + " AND ".join(conditions)
+                    + " ORDER BY e.created_at, e.sequence LIMIT 1",
+                    tuple(params),
+                ).fetchone()
+                if row is None:
+                    self.db.commit()
+                    return None
+                event = dict(row)
+                existing = self.db.execute(
+                    "SELECT attempt_count, created_at FROM task_assistant_reply_claims WHERE event_id = ?",
+                    (str(event["event_id"]),),
+                ).fetchone()
+                attempt_count = int(existing["attempt_count"]) + 1 if existing is not None else 1
+                created_at = str(existing["created_at"]) if existing is not None else current
+                self.db.execute(
+                    """INSERT INTO task_assistant_reply_claims
+                    (event_id, task_id, owner_user_id, lease_owner, lease_expires_at, attempt_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET task_id = excluded.task_id,
+                      owner_user_id = excluded.owner_user_id, lease_owner = excluded.lease_owner,
+                      lease_expires_at = excluded.lease_expires_at, attempt_count = excluded.attempt_count,
+                      updated_at = excluded.updated_at""",
+                    (
+                        str(event["event_id"]), str(event["task_id"]), str(event["owner_user_id"]),
+                        worker_id, expires, attempt_count, created_at, current,
+                    ),
+                )
+                self.db.commit()
+                event["result_available"] = bool(event["result_available"])
+                return event
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def save_task_assistant_reply(
+        self,
+        event_id: str,
+        *,
+        worker_id: str,
+        reply_code: str,
+        content: str,
+        generation_mode: str,
+    ) -> dict[str, Any]:
+        """Persist only a validated fixed phrase for the currently leased result."""
+        from private_agent.core.assistant_reply import render_reply_for_event
+
+        with self._db_lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                event_row = self.db.execute(
+                    "SELECT * FROM task_result_events WHERE event_id = ?", (str(event_id),)
+                ).fetchone()
+                if event_row is None:
+                    raise ValueError("assistant_reply_event_missing")
+                event = dict(event_row)
+                event["result_available"] = bool(event["result_available"])
+                expected_content = render_reply_for_event(event, str(reply_code))
+                if content != expected_content:
+                    raise ValueError("assistant_reply_content_not_allowlisted")
+                if generation_mode not in {"MODEL_VARIANT", "DETERMINISTIC_FALLBACK"}:
+                    raise ValueError("assistant_reply_generation_mode_invalid")
+                claim = self.db.execute(
+                    "SELECT lease_owner, lease_expires_at FROM task_assistant_reply_claims WHERE event_id = ?",
+                    (str(event_id),),
+                ).fetchone()
+                if claim is None or str(claim["lease_owner"]) != str(worker_id) or str(claim["lease_expires_at"]) <= now():
+                    raise QueueLeaseLost("assistant_reply_claim_lost")
+                reply_key = hashlib.sha256(
+                    f"assistant-reply:{event['event_id']}:{event['result_digest']}".encode("utf-8")
+                ).hexdigest()
+                reply_id = hashlib.sha256(f"assistant-reply-id:{reply_key}".encode("utf-8")).hexdigest()
+                created_at = now()
+                self.db.execute(
+                    """INSERT OR IGNORE INTO task_assistant_replies
+                    (reply_id, reply_key, event_id, task_id, owner_user_id, source_sequence, source_digest,
+                     role, message_kind, reply_code, content, generation_mode, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'ASSISTANT', 'RESULT_REPLY', ?, ?, ?, ?)""",
+                    (
+                        reply_id, reply_key, str(event["event_id"]), str(event["task_id"]),
+                        str(event["owner_user_id"]), int(event["sequence"]), str(event["result_digest"]),
+                        str(reply_code), expected_content, str(generation_mode), created_at,
+                    ),
+                )
+                self.db.execute(
+                    "DELETE FROM task_assistant_reply_claims WHERE event_id = ? AND lease_owner = ?",
+                    (str(event_id), str(worker_id)),
+                )
+                saved = self.db.execute(
+                    "SELECT * FROM task_assistant_replies WHERE event_id = ?", (str(event_id),)
+                ).fetchone()
+                if saved is None:
+                    raise RuntimeError("assistant_reply_persistence_failed")
+                self.db.commit()
+                return dict(saved)
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def task_assistant_replies(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read server-created replies only when both task and source-event owners match."""
+        query = (
+            "SELECT r.reply_id, r.task_id, r.owner_user_id, r.event_id, r.source_sequence, r.source_digest, "
+            "r.role, r.message_kind, r.reply_code, r.content, r.generation_mode, r.created_at "
+            "FROM task_assistant_replies AS r JOIN task_owners AS o "
+            "ON o.task_id = r.task_id AND o.user_id = r.owner_user_id "
+            "JOIN task_result_events AS e ON e.event_id = r.event_id AND e.task_id = r.task_id "
+            "AND e.owner_user_id = r.owner_user_id AND e.sequence = r.source_sequence "
+            "AND e.result_digest = r.source_digest WHERE r.task_id = ?"
+        )
+        params: tuple[Any, ...] = (str(task_id),)
+        if owner_user_id is not None:
+            query += " AND r.owner_user_id = ?"
+            params = (str(task_id), str(owner_user_id))
+        query += " ORDER BY r.source_sequence, r.created_at"
         with self._db_lock:
             rows = self.db.execute(query, params).fetchall()
         return [dict(row) for row in rows]
