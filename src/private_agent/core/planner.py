@@ -103,6 +103,10 @@ PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
 class Planner:
     """Generate plans through an injected LLM provider and validate them deterministically."""
 
+    _MAX_FALLBACK_SCHEMA_DEPTH = 64
+    _MAX_FALLBACK_SCHEMA_NODES = 4096
+    _FALLBACK_SCHEMA_UNSET = object()
+
     def __init__(
         self,
         provider: LLMProvider | None = None,
@@ -614,53 +618,75 @@ class Planner:
         # This is still only a proposal: create() applies the normal validator,
         # and Orchestrator/GenericExecutor apply the unchanged authorization.
         for metadata in available:
-            candidate = tools.get(metadata["name"])
-            if permissions is not None and permissions.get(metadata["name"]) != getattr(candidate, "permission_level", None):
+            name = metadata["name"]
+            candidate = tools.get(name)
+            if permissions is not None:
+                permission_level = self._fallback_tool_permission_level(candidate)
+                if permission_level is None or permissions.get(name) != permission_level:
+                    continue
+            values = self._fallback_tool_hook(candidate, "planning_inputs", goal)
+            if not isinstance(values, dict):
                 continue
-            propose = getattr(candidate, "planning_inputs", None)
-            values = propose(goal) if callable(propose) else None
-            if isinstance(values, dict) and self._fallback_inputs_are_compatible(candidate, values):
-                return TaskPlan(
-                    goal,
-                    [PlanStep(
-                        id=str(uuid.uuid4()), objective="Inspect selected repository using bounded evidence",
-                        tool=metadata["name"], input=values,
-                        reason="Deterministic registered-tool proposal; no LLM provider or authorization inferred",
-                        success_criteria={"required_fields": list(candidate.output_schema().get("required", []))},
-                    )],
-                    "LLM planner unavailable; bounded registered-tool proposal subject to normal policy checks",
-                )
+            schema = self._fallback_tool_hook(candidate, "input_schema")
+            if not self._fallback_inputs_are_compatible(candidate, values, schema=schema):
+                continue
+            required_fields = self._fallback_output_required_fields(candidate)
+            if required_fields is None:
+                continue
+            return TaskPlan(
+                goal,
+                [PlanStep(
+                    id=str(uuid.uuid4()), objective="Inspect selected repository using bounded evidence",
+                    tool=name, input=values,
+                    reason="Deterministic registered-tool proposal; no LLM provider or authorization inferred",
+                    success_criteria={"required_fields": required_fields},
+                )],
+                "LLM planner unavailable; bounded registered-tool proposal subject to normal policy checks",
+            )
         available_names = [metadata["name"] for metadata in available]
-        permitted_names = [
-            name for name in available_names
-            if permissions is None or permissions.get(name) == getattr(tools.get(name), "permission_level", None)
-        ]
+        if permissions is None:
+            permitted_names = available_names
+        else:
+            permitted_names = []
+            for name in available_names:
+                permission_level = self._fallback_tool_permission_level(tools.get(name))
+                if permission_level is not None and permissions.get(name) == permission_level:
+                    permitted_names.append(name)
         selection_names = permitted_names or available_names
         compatible_inputs: dict[str, dict[str, Any]] = {}
+        compatible_output_requirements: dict[str, list[str]] = {}
         for name in selection_names:
             candidate = tools.get(name)
-            schema = getattr(candidate, "input_schema", lambda: {})()
+            schema = self._fallback_tool_hook(candidate, "input_schema")
             if not isinstance(schema, dict):
                 continue
-            properties = schema.get("properties", {})
-            if not isinstance(properties, dict):
+            try:
+                properties = schema.get("properties", {})
+                if not isinstance(properties, dict):
+                    continue
+                input_values: dict[str, Any] = {}
+                query_definition = properties.get("query")
+                if isinstance(query_definition, dict) and query_definition.get("type") == "string":
+                    input_values["query"] = goal
+                limit_definition = properties.get("limit")
+                if isinstance(limit_definition, dict) and limit_definition.get("type") == "integer":
+                    limit = 6
+                    minimum = limit_definition.get("minimum")
+                    maximum = limit_definition.get("maximum")
+                    if isinstance(minimum, int) and not isinstance(minimum, bool):
+                        limit = max(limit, minimum)
+                    if isinstance(maximum, int) and not isinstance(maximum, bool):
+                        limit = min(limit, maximum)
+                    input_values["limit"] = limit
+            except Exception:
                 continue
-            input_values: dict[str, Any] = {}
-            query_definition = properties.get("query")
-            if isinstance(query_definition, dict) and query_definition.get("type") == "string":
-                input_values["query"] = goal
-            limit_definition = properties.get("limit")
-            if isinstance(limit_definition, dict) and limit_definition.get("type") == "integer":
-                limit = 6
-                minimum = limit_definition.get("minimum")
-                maximum = limit_definition.get("maximum")
-                if isinstance(minimum, int) and not isinstance(minimum, bool):
-                    limit = max(limit, minimum)
-                if isinstance(maximum, int) and not isinstance(maximum, bool):
-                    limit = min(limit, maximum)
-                input_values["limit"] = limit
-            if self._fallback_inputs_are_compatible(candidate, input_values):
-                compatible_inputs[name] = input_values
+            if not self._fallback_inputs_are_compatible(candidate, input_values, schema=schema):
+                continue
+            required_fields = self._fallback_output_required_fields(candidate)
+            if required_fields is None:
+                continue
+            compatible_inputs[name] = input_values
+            compatible_output_requirements[name] = required_fields
 
         compatible_names = [name for name in selection_names if name in compatible_inputs]
         if not compatible_names:
@@ -683,12 +709,11 @@ class Planner:
                 baseline_name,
             )
         selected_name = selected_name or baseline_name
-        first_tool = tools.get(selected_name)
         input_values = compatible_inputs[selected_name]
         success_criteria: dict[str, Any] = {}
-        output_schema = getattr(first_tool, "output_schema", lambda: {})()
-        if isinstance(output_schema, dict) and output_schema.get("required"):
-            success_criteria = {"required_fields": list(output_schema["required"])}
+        required_fields = compatible_output_requirements[selected_name]
+        if required_fields:
+            success_criteria = {"required_fields": required_fields}
         learned_note = ""
         if preferred_name or baseline_name in avoided_names:
             learned_note = f" Learned guidance considered: selected {selected_name}."
@@ -716,60 +741,123 @@ class Planner:
         )
 
     @staticmethod
-    def _fallback_inputs_are_compatible(tool: Any, values: dict[str, Any]) -> bool:
-        schema = getattr(tool, "input_schema", lambda: {})()
-        if not isinstance(values, dict) or not isinstance(schema, dict) or schema.get("type") != "object":
-            return False
-        if not Planner._fallback_schema_is_supported(schema):
-            return False
+    def _fallback_tool_hook(tool: Any, hook_name: str, *args: Any) -> Any:
+        """Call a registered tool hook; an exception makes only that candidate unusable."""
         try:
+            hook = getattr(tool, hook_name, None)
+            return hook(*args) if callable(hook) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fallback_tool_permission_level(tool: Any) -> str | None:
+        try:
+            permission_level = getattr(tool, "permission_level", None)
+        except Exception:
+            return None
+        return permission_level if isinstance(permission_level, str) else None
+
+    @staticmethod
+    def _fallback_output_required_fields(tool: Any) -> list[str] | None:
+        try:
+            output_hook = getattr(tool, "output_schema", None)
+        except Exception:
+            return None
+        if not callable(output_hook):
+            return []
+        try:
+            output_schema = output_hook()
+        except Exception:
+            return None
+        if not isinstance(output_schema, dict):
+            return None
+        try:
+            required = output_schema.get("required", [])
+            if not isinstance(required, list) or any(not isinstance(name, str) for name in required):
+                return None
+            return list(required)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fallback_inputs_are_compatible(
+        tool: Any,
+        values: dict[str, Any],
+        *,
+        schema: Any = _FALLBACK_SCHEMA_UNSET,
+    ) -> bool:
+        try:
+            if schema is Planner._FALLBACK_SCHEMA_UNSET:
+                schema = Planner._fallback_tool_hook(tool, "input_schema")
+            if not isinstance(values, dict) or not isinstance(schema, dict) or schema.get("type") != "object":
+                return False
+            if not Planner._fallback_schema_is_supported(schema):
+                return False
             errors = validate_schema_value(values, schema, path="fallback")
-        except (AttributeError, RecursionError, TypeError, ValueError):
+        except Exception:
             return False
         return not errors
 
     @staticmethod
     def _fallback_schema_is_supported(schema: Any) -> bool:
-        if not isinstance(schema, dict):
-            return False
         supported_keys = {
             "type", "properties", "required", "additionalProperties", "items",
             "minimum", "maximum", "description", "title", "default", "examples",
         }
-        if any(not isinstance(key, str) or key not in supported_keys for key in schema):
-            return False
-        schema_type = schema.get("type")
         supported_types = {"object", "array", "string", "integer", "boolean", "null"}
-        if not isinstance(schema_type, str) or schema_type not in supported_types:
-            return False
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
-        if (
-            not isinstance(properties, dict)
-            or any(not isinstance(name, str) for name in properties)
-            or not isinstance(required, list)
-            or any(not isinstance(name, str) for name in required)
-        ):
-            return False
-        if schema_type != "object" and (properties or required or "additionalProperties" in schema):
-            return False
-        if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
-            return False
-        if "items" in schema:
-            if schema_type != "array" or not Planner._fallback_schema_is_supported(schema["items"]):
+        active_schema_ids: set[int] = set()
+        remaining_nodes = [Planner._MAX_FALLBACK_SCHEMA_NODES]
+
+        def visit(current: Any, depth: int) -> bool:
+            if (
+                not isinstance(current, dict)
+                or depth > Planner._MAX_FALLBACK_SCHEMA_DEPTH
+                or remaining_nodes[0] <= 0
+            ):
                 return False
-        if any(key in schema for key in ("minimum", "maximum")):
-            if schema_type != "integer":
+            schema_id = id(current)
+            if schema_id in active_schema_ids:
                 return False
-            for key in ("minimum", "maximum"):
-                bound = schema.get(key)
-                if bound is not None and (
-                    not isinstance(bound, (int, float))
-                    or isinstance(bound, bool)
-                    or not math.isfinite(float(bound))
+            active_schema_ids.add(schema_id)
+            remaining_nodes[0] -= 1
+            try:
+                if any(not isinstance(key, str) or key not in supported_keys for key in current):
+                    return False
+                schema_type = current.get("type")
+                if not isinstance(schema_type, str) or schema_type not in supported_types:
+                    return False
+                properties = current.get("properties", {})
+                required = current.get("required", [])
+                if (
+                    not isinstance(properties, dict)
+                    or any(not isinstance(name, str) for name in properties)
+                    or not isinstance(required, list)
+                    or any(not isinstance(name, str) for name in required)
                 ):
                     return False
-        return all(Planner._fallback_schema_is_supported(value) for value in properties.values())
+                if schema_type != "object" and (properties or required or "additionalProperties" in current):
+                    return False
+                if "additionalProperties" in current and not isinstance(current["additionalProperties"], bool):
+                    return False
+                if "items" in current:
+                    if schema_type != "array" or not visit(current["items"], depth + 1):
+                        return False
+                if any(key in current for key in ("minimum", "maximum")):
+                    if schema_type != "integer":
+                        return False
+                    for key in ("minimum", "maximum"):
+                        bound = current.get(key)
+                        if bound is not None and (
+                            not isinstance(bound, (int, float))
+                            or isinstance(bound, bool)
+                            or not math.isfinite(float(bound))
+                        ):
+                            return False
+                return all(visit(value, depth + 1) for value in properties.values())
+            finally:
+                active_schema_ids.remove(schema_id)
+
+        return visit(schema, 0)
 
 
 def _planning_advisory_context(

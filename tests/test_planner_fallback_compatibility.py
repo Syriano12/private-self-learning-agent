@@ -58,6 +58,94 @@ class InvalidNestedProposalTool(WebResearchTool):
         return {"scope": {"name": 7, "goal": goal}}
 
 
+class CyclicInputSchemaTool(WebResearchTool):
+    name = "cyclic_schema_research"
+
+    def input_schema(self) -> dict:
+        schema = {"type": "object", "properties": {}, "additionalProperties": False}
+        schema["properties"]["recursive"] = schema
+        return schema
+
+
+class DeepInputSchemaTool(WebResearchTool):
+    name = "deep_schema_research"
+
+    def input_schema(self) -> dict:
+        schema = {"type": "object", "properties": {}, "additionalProperties": False}
+        current = schema
+        for index in range(70):
+            child = {"type": "object", "properties": {}, "additionalProperties": False}
+            current["properties"][f"nested_{index}"] = child
+            current = child
+        return schema
+
+
+class UnsupportedPatternSchemaTool(WebResearchTool):
+    name = "pattern_schema_research"
+
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"query": {"type": "string", "pattern": "^Research"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+
+
+class OverflowingBoundSchemaTool(WebResearchTool):
+    name = "overflowing_bound_research"
+
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "maximum": 10**10000}},
+            "additionalProperties": False,
+        }
+
+
+class NonFiniteBoundSchemaTool(WebResearchTool):
+    name = "nonfinite_bound_research"
+
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "maximum": float("inf")}},
+            "additionalProperties": False,
+        }
+
+
+class WideInputSchemaTool(WebResearchTool):
+    name = "wide_schema_research"
+
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {f"field_{index}": {"type": "string"} for index in range(4100)},
+            "additionalProperties": False,
+        }
+
+
+class RaisingInputSchemaTool(WebResearchTool):
+    name = "raising_input_schema_research"
+
+    def input_schema(self) -> dict:
+        raise RuntimeError("synthetic schema failure")
+
+
+class RaisingPlanningInputsTool(ScopeRequiredResearchTool):
+    name = "raising_planning_inputs_research"
+
+    def planning_inputs(self, goal: str) -> dict:
+        raise RuntimeError("synthetic proposal failure")
+
+
+class RaisingOutputSchemaTool(ProposedWebResearchTool):
+    name = "raising_output_schema_research"
+
+    def output_schema(self) -> dict:
+        raise RuntimeError("synthetic output schema failure")
+
+
 def test_default_application_registry_has_clear_outcome_when_no_fallback_inputs_fit(
     tmp_path, monkeypatch
 ) -> None:
@@ -135,6 +223,7 @@ def test_only_compatible_tool_remains_selected_when_avoided() -> None:
         "avoided_action": {"type": "avoid_unchanged_retry", "tool": "web_research"},
     }
 
+    # This direct call isolates selector behavior; trusted-storage integration is covered separately.
     plan = Planner()._unavailable_fallback(
         goal,
         tools,
@@ -177,6 +266,36 @@ def test_invalid_nested_proposal_is_rejected_before_fallback() -> None:
 
     assert plan.steps[0].tool == "web_research"
     assert plan.steps[0].input == {"query": goal, "limit": 6}
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [
+        CyclicInputSchemaTool,
+        DeepInputSchemaTool,
+        WideInputSchemaTool,
+        UnsupportedPatternSchemaTool,
+        OverflowingBoundSchemaTool,
+        NonFiniteBoundSchemaTool,
+        RaisingInputSchemaTool,
+        RaisingPlanningInputsTool,
+        RaisingOutputSchemaTool,
+    ],
+)
+def test_malformed_or_unbounded_fallback_schema_is_rejected_before_fallback(tool_type) -> None:
+    tools = ToolRegistry()
+    invalid_tool = tool_type()
+    tools.register(invalid_tool)
+    tools.register(WebResearchTool())
+
+    plan = Planner().create(
+        "Research a general topic",
+        tools,
+        [],
+        permissions={invalid_tool.name: "public_read", "web_research": "public_read"},
+    )
+
+    assert plan.steps[0].tool == "web_research"
 
 
 def test_fallback_clamps_limit_to_schema_bounds() -> None:

@@ -637,6 +637,69 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
         reopened.close()
 
 
+def test_trusted_retrieved_strategy_only_guides_compatible_permitted_fallback(tmp_path: Path) -> None:
+    store, _, _, _, training_ids, learned = _train_two_verified_recovery_experiences(
+        tmp_path / "trusted-fallback.sqlite3"
+    )
+    try:
+        memory = SQLiteLearningMemory(store)
+        goal = "research topic alpha follow-up"
+        task_id = training_ids[0]
+        context = {
+            "goal": goal,
+            "task_type": "general",
+            "tools": ["tool_a", "tool_b"],
+            "task_id": task_id,
+        }
+        retrieved = memory.retrieve_relevant(context)
+        assert [item.strategy_id for item in retrieved] == [learned.strategy_id]
+        trusted_guidance = [item.to_dict() for item in retrieved]
+
+        def create_plan(tools: ToolRegistry, permissions: dict[str, str]):
+            return Planner(learning_memory=memory).create(
+                goal,
+                tools,
+                [],
+                permissions=permissions,
+                learned_strategies=trusted_guidance,
+                task_id=task_id,
+            )
+
+        compatible_tools = registry(ControlledTool("tool_a", []), ControlledTool("tool_b", []))
+        compatible_plan = create_plan(
+            compatible_tools,
+            {"tool_a": "public_read", "tool_b": "public_read"},
+        )
+        assert compatible_plan.steps[0].tool == "tool_b"
+
+        class ScopeRequiredControlledTool(ControlledTool):
+            def input_schema(self) -> dict:
+                return {
+                    "type": "object",
+                    "properties": {"scope": {"type": "object"}},
+                    "required": ["scope"],
+                    "additionalProperties": False,
+                }
+
+        incompatible_tools = registry(
+            ControlledTool("tool_a", []), ScopeRequiredControlledTool("tool_b", [])
+        )
+        incompatible_plan = create_plan(
+            incompatible_tools,
+            {"tool_a": "public_read", "tool_b": "public_read"},
+        )
+        assert incompatible_plan.steps[0].tool == "tool_a"
+
+        permission_limited_tools = registry(ControlledTool("tool_a", []), ControlledTool("tool_b", []))
+        permission_limited_plan = create_plan(
+            permission_limited_tools,
+            {"tool_a": "public_read"},
+        )
+        assert permission_limited_plan.steps[0].tool == "tool_a"
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize(
     "invalid_support",
     ["missing", "unverified", "stale", "conflicted", "malformed_failure_types", "malformed_tools"],
