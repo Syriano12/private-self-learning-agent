@@ -1119,7 +1119,7 @@ class Orchestrator:
             task_id,
             goal,
             storage_status,
-            {"rationale": current_plan.rationale, "steps": [step.__dict__ for step in current_plan.steps]},
+            self._plan_payload(current_plan),
             result,
             rounds,
         )
@@ -1210,7 +1210,12 @@ class Orchestrator:
             state.task_id,
             state.goal,
             "blocked",
-            {"goal": state.goal, "rationale": "Planning stopped at the registered-tool boundary", "steps": []},
+            {
+                "goal": state.goal,
+                "rationale": "Planning stopped at the registered-tool boundary",
+                "planning_mode": result["planning_mode"],
+                "steps": [],
+            },
             result,
             0,
         )

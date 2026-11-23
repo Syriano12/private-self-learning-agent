@@ -118,6 +118,8 @@ def test_unregistered_tool_request_blocks_before_execution_and_is_durable_and_vi
     assert persisted["status"] == "BLOCKED"
     assert persisted["current_phase"] == "CAPABILITY_GAP"
     assert persisted["recovery_state"] == {"reason": "capability_unavailable", "capability_gap": gap}
+    plan_row = store.db.execute("SELECT plan_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert json.loads(plan_row["plan_json"])["planning_mode"] == "UNKNOWN"
     store.close()
 
     reopened = Store(db_path)

@@ -151,6 +151,8 @@ def test_worker_persists_provider_validated_plan_mode_in_state_result_and_conver
     state = store.get_task_state(task_id)
     assert state["plan"]["planning_mode"] == "PROVIDER_VALIDATED"
     assert state["plan_version"] == 1
+    legacy_plan_row = store.db.execute("SELECT plan_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert json.loads(legacy_plan_row["plan_json"])["planning_mode"] == "PROVIDER_VALIDATED"
     assert state["result"]["planning_mode"] == "PROVIDER_VALIDATED"
     assert state["result"]["plan_version"] == 1
     assert state["result"]["step_results"][0]["planning_mode"] == "PROVIDER_VALIDATED"
@@ -185,6 +187,8 @@ def test_worker_persists_deterministic_fallback_mode_on_step_result_and_action(t
     assert result["status"] == "COMPLETED", result
     state = store.get_task_state(task_id)
     assert state["plan"]["planning_mode"] == "DETERMINISTIC_FALLBACK"
+    legacy_plan_row = store.db.execute("SELECT plan_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert json.loads(legacy_plan_row["plan_json"])["planning_mode"] == "DETERMINISTIC_FALLBACK"
     assert state["result"]["step_results"][0]["planning_mode"] == "DETERMINISTIC_FALLBACK"
     assert state["result"]["step_results"][0]["plan_version"] == 1
     task = service.get_task(task_id, principal=principal)
