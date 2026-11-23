@@ -102,13 +102,16 @@ class SQLiteLearningMemory(LearningMemory):
         return LearnedStrategy.from_dict(payload) if isinstance(payload, dict) else None
 
     def retrieve_relevant(self, context: dict[str, Any], *, limit: int = 5) -> list[LearnedStrategy]:
+        scoped, owner_user_id = self._owner_scope(context)
+        if scoped and not owner_user_id:
+            return []
         candidates: list[tuple[float, LearnedStrategy]] = []
         for strategy in self.list():
             if strategy.status != "active" or strategy.confidence < self.min_confidence:
                 continue
             if not (
-                self._has_revalidated_recovery_support(strategy)
-                or self._has_revalidated_owner_review_support(strategy)
+                self._has_revalidated_recovery_support(strategy, owner_user_id=owner_user_id)
+                or self._has_revalidated_owner_review_support(strategy, owner_user_id=owner_user_id)
             ):
                 continue
             score = self._score(context, strategy)
@@ -121,6 +124,9 @@ class SQLiteLearningMemory(LearningMemory):
         """Return canonical stored advisory guidance only after current support checks."""
         if not isinstance(strategy_id, str) or not strategy_id:
             return None
+        scoped, owner_user_id = self._owner_scope(context)
+        if scoped and not owner_user_id:
+            return None
         try:
             strategy = self.get(strategy_id)
         except (KeyError, TypeError, ValueError):
@@ -130,15 +136,29 @@ class SQLiteLearningMemory(LearningMemory):
             or strategy.status != "active"
             or strategy.confidence < self.min_confidence
             or not (
-                self._has_revalidated_recovery_support(strategy)
-                or self._has_revalidated_owner_review_support(strategy)
+                self._has_revalidated_recovery_support(strategy, owner_user_id=owner_user_id)
+                or self._has_revalidated_owner_review_support(strategy, owner_user_id=owner_user_id)
             )
             or self._score(context, strategy) < self.min_relevance
         ):
             return None
         return strategy
 
-    def _has_revalidated_recovery_support(self, strategy: LearnedStrategy) -> bool:
+    def _owner_scope(self, context: dict[str, Any]) -> tuple[bool, str | None]:
+        if "task_id" not in context:
+            return False, None
+        task_id = context.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return True, None
+        try:
+            owner_user_id = self.store_backend.task_owner_user_id(task_id)
+        except (AttributeError, TypeError, ValueError):
+            return True, None
+        return True, owner_user_id if isinstance(owner_user_id, str) and owner_user_id else None
+
+    def _has_revalidated_recovery_support(
+        self, strategy: LearnedStrategy, *, owner_user_id: str | None = None,
+    ) -> bool:
         """Re-read each claimed support record before allowing a plan-time hint."""
         metadata = strategy.metadata if isinstance(strategy.metadata, dict) else {}
         condition = strategy.condition if isinstance(strategy.condition, dict) else {}
@@ -160,8 +180,17 @@ class SQLiteLearningMemory(LearningMemory):
 
         failed_tool = str(condition.get("failed_tool", ""))
         alternative_tool = str(condition.get("alternative_tool", ""))
-        failure_types = set(condition.get("failure_types", []))
-        condition_tools = set(condition.get("tools", []))
+        raw_failure_types = condition.get("failure_types")
+        raw_condition_tools = condition.get("tools")
+        if (
+            not isinstance(raw_failure_types, list)
+            or any(not isinstance(item, str) or not item for item in raw_failure_types)
+            or not isinstance(raw_condition_tools, list)
+            or any(not isinstance(item, str) or not item for item in raw_condition_tools)
+        ):
+            return False
+        failure_types = set(raw_failure_types)
+        condition_tools = set(raw_condition_tools)
         if (
             not failed_tool
             or not alternative_tool
@@ -175,6 +204,12 @@ class SQLiteLearningMemory(LearningMemory):
 
         now = datetime.now(timezone.utc)
         for experience_id in support_ids:
+            if owner_user_id is not None:
+                try:
+                    if self.store_backend.task_owner_user_id(experience_id) != owner_user_id:
+                        return False
+                except (AttributeError, TypeError, ValueError):
+                    return False
             row = self.store_backend.get_experience(experience_id)
             if not isinstance(row, dict):
                 return False
@@ -226,18 +261,18 @@ class SQLiteLearningMemory(LearningMemory):
             ]
             if (
                 len(named_actions) < 2
-                or named_actions[0].get("tool_name") != failed_tool
                 or named_actions[-1].get("tool_name") != alternative_tool
             ):
                 return False
-            diagnoses = {
-                str(action.get("diagnosis", {}).get("failure_type"))
-                for action in named_actions
-                if isinstance(action.get("diagnosis"), dict) and action["diagnosis"].get("failure_type")
-            }
-            if not failure_types.issubset(diagnoses):
-                return False
             final_action = named_actions[-1]
+            if not self._has_verified_change_tool_transition(
+                named_actions,
+                failed_tool=failed_tool,
+                alternative_tool=alternative_tool,
+                failure_types=failure_types,
+                final_action=final_action,
+            ):
+                return False
             verification = final_action.get("verification")
             evidence = verification.get("evidence") if isinstance(verification, dict) else None
             if (
@@ -251,7 +286,58 @@ class SQLiteLearningMemory(LearningMemory):
                 return False
         return True
 
-    def _has_revalidated_owner_review_support(self, strategy: LearnedStrategy) -> bool:
+    @staticmethod
+    def _has_verified_change_tool_transition(
+        actions: list[dict[str, Any]],
+        *,
+        failed_tool: str,
+        alternative_tool: str,
+        failure_types: set[Any],
+        final_action: dict[str, Any],
+    ) -> bool:
+        for index, action in enumerate(actions):
+            diagnosis = action.get("diagnosis")
+            recovery = action.get("recovery")
+            step_id = action.get("step_id")
+            if (
+                action.get("tool_name") != failed_tool
+                or not isinstance(step_id, str)
+                or not step_id
+                or not isinstance(diagnosis, dict)
+                or diagnosis.get("failure_type") not in failure_types
+                or not isinstance(recovery, dict)
+                or recovery.get("strategy") != "CHANGE_TOOL"
+                or recovery.get("original_tool") != failed_tool
+                or recovery.get("replacement_tool") != alternative_tool
+                or recovery.get("step_id") != step_id
+            ):
+                continue
+            subsequent = next(
+                (
+                    later for later in actions[index + 1:]
+                    if later.get("step_id") == step_id
+                    and later.get("tool_name") == alternative_tool
+                ),
+                None,
+            )
+            if subsequent is not final_action:
+                continue
+            verification = final_action.get("verification")
+            evidence = verification.get("evidence") if isinstance(verification, dict) else None
+            if (
+                final_action.get("execution_status") == "success"
+                and isinstance(verification, dict)
+                and verification.get("status") == "VERIFIED"
+                and verification.get("verified") is True
+                and isinstance(evidence, list)
+                and any(isinstance(item, dict) for item in evidence)
+            ):
+                return True
+        return False
+
+    def _has_revalidated_owner_review_support(
+        self, strategy: LearnedStrategy, *, owner_user_id: str | None = None,
+    ) -> bool:
         """Retain owner-reviewed context without making it tool-selection guidance."""
         metadata = strategy.metadata if isinstance(strategy.metadata, dict) else {}
         condition = strategy.condition if isinstance(strategy.condition, dict) else {}
@@ -296,6 +382,16 @@ class SQLiteLearningMemory(LearningMemory):
             or review.evidence_sha256 != evidence_sha256
         ):
             return False
+        if owner_user_id is not None:
+            try:
+                if (
+                    review.owner_user_id != owner_user_id
+                    or review.actor_user_id != owner_user_id
+                    or self.store_backend.task_owner_user_id(review.task_id) != owner_user_id
+                ):
+                    return False
+            except (AttributeError, TypeError, ValueError):
+                return False
         try:
             timestamp = datetime.fromisoformat(review.created_at.replace("Z", "+00:00"))
         except (AttributeError, ValueError):

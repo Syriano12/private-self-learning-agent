@@ -90,6 +90,16 @@ class SQLiteReflectionMemory(ReflectionMemory):
         return ReflectionInsight.from_dict(payload) if isinstance(payload, dict) else None
 
     def list_relevant(self, context: dict[str, Any], *, limit: int = 5) -> list[ReflectionInsight]:
+        scoped = "task_id" in context
+        owned_experience_ids: set[str] = set()
+        if scoped:
+            task_id = context.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                return []
+            owner_user_id = self.store_backend.task_owner_user_id(task_id)
+            if not owner_user_id:
+                return []
+            owned_experience_ids = self.store_backend.experience_task_ids_for_owner(owner_user_id)
         candidates: list[tuple[float, ReflectionInsight]] = []
         for row in self.store_backend.all_reflections():
             try:
@@ -97,11 +107,40 @@ class SQLiteReflectionMemory(ReflectionMemory):
                 insight = ReflectionInsight.from_dict(payload)
             except (KeyError, TypeError, ValueError):
                 continue
+            if scoped and not self._supports_are_owned(insight, owned_experience_ids):
+                continue
             score = self._score(context, insight)
             if score > 0:
                 candidates.append((score, insight))
         candidates.sort(key=lambda item: (-item[0], -item[1].confidence, item[1].insight_id))
         return [insight for _, insight in candidates[: max(1, limit)]]
+
+    @staticmethod
+    def _supports_are_owned(insight: ReflectionInsight, owned_experience_ids: set[str]) -> bool:
+        support_ids = insight.supporting_experience_ids
+        if (
+            not isinstance(support_ids, list)
+            or not support_ids
+            or any(not isinstance(item, str) or not item or item not in owned_experience_ids for item in support_ids)
+            or len(set(support_ids)) != len(support_ids)
+        ):
+            return False
+        evidence_ids: list[str] = []
+        for evidence in insight.evidence:
+            if not isinstance(evidence, dict):
+                return False
+            experience_id = evidence.get("experience_id")
+            if not isinstance(experience_id, str) or experience_id not in support_ids:
+                return False
+            evidence_ids.append(experience_id)
+        if not evidence_ids or not set(evidence_ids).issubset(owned_experience_ids):
+            return False
+        metadata = insight.metadata if isinstance(insight.metadata, dict) else {}
+        conflicts = metadata.get("conflicting_experience_ids")
+        return (
+            isinstance(conflicts, list)
+            and all(isinstance(item, str) and item in owned_experience_ids for item in conflicts)
+        )
 
     @staticmethod
     def _score(context: dict[str, Any], insight: ReflectionInsight) -> float:
@@ -161,6 +200,7 @@ class ReflectionEngine:
             constraints=dict(identity.get("constraints", {})),
             failure_type=failure_types[0] if failure_types else "",
             recovery_strategy=recovery_strategies[0] if recovery_strategies else "",
+            task_id=experience.task_id,
         )
         return self.reflect(query)
 
@@ -187,39 +227,67 @@ class ReflectionEngine:
         )
 
     def _recovery_patterns(self, candidates: list[RetrievedExperience], query: ExperienceQuery) -> list[ReflectionInsight]:
-        groups: dict[tuple[Any, ...], list[RetrievedExperience]] = {}
+        groups: dict[tuple[Any, ...], dict[str, RetrievedExperience]] = {}
         for candidate in candidates:
-            if not self._has_verified_completed_outcome(candidate) or len(candidate.strategy_used) < 2:
+            if not self._has_verified_completed_outcome(candidate):
                 continue
-            failed_tool, alternative_tool = candidate.strategy_used[0], candidate.strategy_used[-1]
-            if not failed_tool or not alternative_tool or failed_tool == alternative_tool:
-                continue
-            if not candidate.failure_diagnosis:
-                continue
-            key = (query.task_type, failed_tool, alternative_tool, tuple(sorted(candidate.failure_diagnosis)))
-            groups.setdefault(key, []).append(candidate)
+            identity = candidate.identity if isinstance(candidate.identity, dict) else {}
+            final_tool = identity.get("verified_final_action_tool")
+            for transition in candidate.recovery_transitions:
+                if not isinstance(transition, dict):
+                    continue
+                failed_tool = transition.get("failed_tool")
+                alternative_tool = transition.get("alternative_tool")
+                failure_type = transition.get("failure_type")
+                if (
+                    transition.get("recovery_strategy") != "CHANGE_TOOL"
+                    or transition.get("alternative_verified") is not True
+                    or not isinstance(failed_tool, str)
+                    or not failed_tool
+                    or not isinstance(alternative_tool, str)
+                    or not alternative_tool
+                    or failed_tool == alternative_tool
+                    or alternative_tool != final_tool
+                    or not isinstance(failure_type, str)
+                    or not failure_type
+                ):
+                    continue
+                key = (query.task_type, failed_tool, alternative_tool, (failure_type,))
+                groups.setdefault(key, {})[candidate.experience_id] = candidate
         insights = []
         for key, supporting in sorted(groups.items(), key=lambda item: str(item[0])):
             if len(supporting) < self.min_supporting_experiences:
                 continue
             task_type, failed_tool, alternative_tool, failures = key
-            conflicts = [
-                candidate
-                for candidate in candidates
-                if candidate.strategy_used
-                and candidate.strategy_used[0] == failed_tool
-                and (
-                    (
-                        candidate.outcome != "COMPLETED"
-                        and (
-                            set(failures).intersection(candidate.failure_diagnosis)
-                            or alternative_tool in candidate.strategy_used
-                        )
-                    )
-                    or (self._has_verified_completed_outcome(candidate) and len(candidate.strategy_used) == 1)
+            supporting_items = list(supporting.values())
+            support_ids = set(supporting)
+            conflict_by_id: dict[str, RetrievedExperience] = {}
+            for candidate in candidates:
+                if not candidate.experience_id or candidate.experience_id in support_ids:
+                    continue
+                failure_matches = any(
+                    isinstance(item, dict)
+                    and item.get("tool_name") == failed_tool
+                    and item.get("failure_type") in failures
+                    for item in candidate.failure_actions
                 )
-            ]
-            ids = _ids(supporting)
+                failed_recovery_matches = any(
+                    isinstance(item, dict)
+                    and item.get("failed_tool") == failed_tool
+                    and item.get("alternative_tool") == alternative_tool
+                    and item.get("failure_type") in failures
+                    and item.get("alternative_verified") is not True
+                    for item in candidate.recovery_transitions
+                )
+                identity = candidate.identity if isinstance(candidate.identity, dict) else {}
+                verified_original = (
+                    self._has_verified_completed_outcome(candidate)
+                    and identity.get("verified_final_action_tool") == failed_tool
+                )
+                if failure_matches or failed_recovery_matches or verified_original:
+                    conflict_by_id[candidate.experience_id] = candidate
+            conflicts = list(conflict_by_id.values())
+            ids = _ids(supporting_items)
             insights.append(
                 self._make_insight(
                     query=query,
@@ -227,23 +295,29 @@ class ReflectionEngine:
                     condition={"task_type": task_type, "failed_tool": failed_tool, "alternative_tool": alternative_tool, "failure_types": list(failures)},
                     observed_behavior=f"{failed_tool} failed under {', '.join(failures)}; {alternative_tool} later produced a verified outcome.",
                     derived_strategy=f"Consider {alternative_tool} as an alternative to {failed_tool} under the same condition.",
-                    supporting=supporting,
+                    supporting=supporting_items,
                     conflicts=conflicts,
                     failure_types=list(failures),
-                    recovery_strategies=_strategies(supporting),
+                    recovery_strategies=_strategies(supporting_items),
                     metadata={"pattern_type": "recovery", "conflicting_experience_ids": _ids(conflicts), "alternative_success": True},
                 )
             )
         return insights
 
     def _repeated_failure_patterns(self, candidates: list[RetrievedExperience], query: ExperienceQuery) -> list[ReflectionInsight]:
-        groups: dict[tuple[Any, ...], list[RetrievedExperience]] = {}
+        groups: dict[tuple[Any, ...], dict[str, RetrievedExperience]] = {}
         for candidate in candidates:
             if candidate.outcome == "COMPLETED" or not candidate.failure_diagnosis:
                 continue
-            tool = candidate.strategy_used[0] if candidate.strategy_used else "unknown_tool"
-            key = (query.task_type, tool, tuple(sorted(candidate.failure_diagnosis)))
-            groups.setdefault(key, []).append(candidate)
+            for failure in candidate.failure_actions:
+                if not isinstance(failure, dict):
+                    continue
+                tool = failure.get("tool_name")
+                failure_type = failure.get("failure_type")
+                if not isinstance(tool, str) or not tool or not isinstance(failure_type, str) or not failure_type:
+                    continue
+                key = (query.task_type, tool, (failure_type,))
+                groups.setdefault(key, {})[candidate.experience_id] = candidate
         insights = []
         for key, supporting in sorted(groups.items(), key=lambda item: str(item[0])):
             if len(supporting) < max(2, self.min_supporting_experiences):
@@ -253,21 +327,21 @@ class ReflectionEngine:
                 candidate
                 for candidate in candidates
                 if self._has_verified_completed_outcome(candidate)
-                and candidate.strategy_used
-                and candidate.strategy_used[0] == failed_tool
-                and set(failures).intersection(candidate.failure_diagnosis)
+                and isinstance(candidate.identity, dict)
+                and candidate.identity.get("verified_final_action_tool") == failed_tool
             ]
+            supporting_items = list(supporting.values())
             insights.append(
                 self._make_insight(
                     query=query,
                     pattern="repeated_failure_warning",
                     condition={"task_type": task_type, "failed_tool": failed_tool, "failure_types": list(failures)},
-                    observed_behavior=f"{failed_tool} failed {len(supporting)} times under {', '.join(failures)}.",
+                    observed_behavior=f"{failed_tool} failed {len(supporting_items)} times under {', '.join(failures)}.",
                     derived_strategy=f"Treat {failed_tool} as unreliable under this condition and require an alternative or additional verification.",
-                    supporting=supporting,
+                    supporting=supporting_items,
                     conflicts=conflicts,
                     failure_types=list(failures),
-                    recovery_strategies=_strategies(supporting),
+                    recovery_strategies=_strategies(supporting_items),
                     metadata={"pattern_type": "repeated_failure", "conflicting_experience_ids": _ids(conflicts), "automatic_rule": False},
                 )
             )

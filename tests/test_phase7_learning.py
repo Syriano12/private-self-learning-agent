@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
+from private_agent.api import AgentAPIService, create_app
+from private_agent.auth import AuthManager
 from private_agent.core.execution import ExecutionContext
 from private_agent.core.learning import (
     LearnedStrategy,
@@ -26,6 +29,10 @@ from private_agent.bugbounty.reviews import FindingReview, FindingReviewReposito
 from private_agent.storage import Store
 from private_agent.tools.contracts import ToolResult
 from private_agent.tools.research import ToolRegistry
+from private_agent.worker import BackgroundWorker
+
+
+OWNER_PASSWORD = "phase7-learning-owner-password-123"
 
 
 class LearningMemoryDouble(LearningMemory):
@@ -451,6 +458,15 @@ def test_reflection_conflict_detection_covers_successful_original_and_failed_alt
                     [{"type": "proof"}],
                     ["goal"],
                     {"task_type": "research", "verification_status": "VERIFIED", "security_impact_verified": None, "verified_action_tools": ["tool_b"], "verified_final_action_tool": "tool_b"},
+                    recovery_transitions=[{
+                        "failed_tool": "tool_a",
+                        "alternative_tool": "tool_b",
+                        "failure_type": "NETWORK_ERROR",
+                        "recovery_strategy": "CHANGE_TOOL",
+                        "step_id": "step",
+                        "alternative_verified": True,
+                    }],
+                    failure_actions=[{"tool_name": "tool_a", "step_id": "step", "failure_type": "NETWORK_ERROR"}],
                 ),
                 RetrievedExperience(
                     "conflict-1",
@@ -475,6 +491,15 @@ def test_reflection_conflict_detection_covers_successful_original_and_failed_alt
                     [],
                     ["goal"],
                     {"task_type": "research"},
+                    recovery_transitions=[{
+                        "failed_tool": "tool_a",
+                        "alternative_tool": "tool_b",
+                        "failure_type": "NETWORK_ERROR",
+                        "recovery_strategy": "CHANGE_TOOL",
+                        "step_id": "step",
+                        "alternative_verified": False,
+                    }],
+                    failure_actions=[{"tool_name": "tool_a", "step_id": "step", "failure_type": "NETWORK_ERROR"}],
                 ),
             ]
 
@@ -507,15 +532,36 @@ def _train_two_verified_recovery_experiences(path: Path):
     tools = registry(tool_a, tool_b)
     store = Store(path)
     agent = Orchestrator(store, tools, planner=Planner(), max_attempts=2)
+    auth = AuthManager(store)
+    auth.initialize_owner(auth.owner_email, OWNER_PASSWORD)
     task_ids = []
-    for _ in range(2):
-        result = agent.run("research topic alpha")
-        assert result["final_status"] == "COMPLETED"
-        assert result["verification"]["status"] == "VERIFIED"
-        assert result["step_results"][0]["tool_name"] == "tool_a"
-        assert result["step_results"][-1]["tool_name"] == "tool_b"
-        assert result["verification"]["verified"] is True
-        task_ids.append(result["task_id"])
+    service = AgentAPIService(agent, token=None)
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"email": auth.owner_email, "password": OWNER_PASSWORD},
+        )
+        assert login.status_code == 200, login.text
+        csrf = str(client.cookies.get("vulnora_csrf"))
+        for index in range(2):
+            created = client.post(
+                "/api/v1/tasks",
+                json={"goal": "research topic alpha"},
+                headers={"X-CSRF-Token": csrf, "Idempotency-Key": f"phase7-learning-training-{index}"},
+            )
+            assert created.status_code == 201, created.text
+            task_id = str(created.json()["task_id"])
+            result = BackgroundWorker(agent, worker_id=f"phase7-learning-worker-{index}").run_once()
+            assert result["status"] == "COMPLETED", result
+            state = store.get_task_state(task_id)
+            assert state is not None
+            outcome = state["result"]
+            assert outcome["final_status"] == "COMPLETED"
+            assert outcome["verification"]["status"] == "VERIFIED"
+            assert outcome["step_results"][0]["tool_name"] == "tool_a"
+            assert outcome["step_results"][-1]["tool_name"] == "tool_b"
+            assert outcome["verification"]["verified"] is True
+            task_ids.append(task_id)
     learning = SQLiteLearningMemory(store)
     retrieved = learning.retrieve_relevant(
         {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"]}
@@ -554,23 +600,44 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
         )
         assert [item.strategy_id for item in retrieved] == [strategy_id]
 
-        future = Orchestrator(reopened, tools, planner=Planner(), max_attempts=2).run(
-            "research topic alpha follow-up"
-        )
+        future_agent = Orchestrator(reopened, tools, planner=Planner(), max_attempts=2)
+        future_service = AgentAPIService(future_agent, token=None)
+        with TestClient(create_app(service=future_service), raise_server_exceptions=False) as client:
+            login = client.post(
+                "/api/v1/auth/login",
+                json={"email": AuthManager(reopened).owner_email, "password": OWNER_PASSWORD},
+            )
+            assert login.status_code == 200, login.text
+            csrf = str(client.cookies.get("vulnora_csrf"))
+            created = client.post(
+                "/api/v1/tasks",
+                json={"goal": "research topic alpha follow-up"},
+                headers={"X-CSRF-Token": csrf, "Idempotency-Key": "phase7-learning-future"},
+            )
+            assert created.status_code == 201, created.text
+            future_task_id = str(created.json()["task_id"])
+            outcome = BackgroundWorker(future_agent, worker_id="phase7-learning-future-worker").run_once()
+            assert outcome["status"] == "COMPLETED", outcome
+            future_state = reopened.get_task_state(future_task_id)
+            assert future_state is not None
+            future = future_state["result"]
         assert future["learned_strategies_used"]
         assert future["learned_strategies_used"][0]["strategy_id"] == strategy_id
         assert future["step_results"][0]["tool_name"] == "tool_b"
         assert future["verification"]["status"] == "VERIFIED"
         assert future["verification"]["verified"] is True
         assert future["final_status"] == "COMPLETED"
-        assert _first_planned_tool(reopened, future["task_id"]) == "tool_b"
+        assert _first_planned_tool(reopened, future_task_id) == "tool_b"
         assert tool_a.calls == 4, "the future similar task must not execute the previously failing tool again"
         assert tool_b.calls == 3
     finally:
         reopened.close()
 
 
-@pytest.mark.parametrize("invalid_support", ["missing", "unverified", "stale", "conflicted"])
+@pytest.mark.parametrize(
+    "invalid_support",
+    ["missing", "unverified", "stale", "conflicted", "malformed_failure_types", "malformed_tools"],
+)
 def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invalid_support: str) -> None:
     store, tools, _, _, _, strategy = _train_two_verified_recovery_experiences(
         tmp_path / f"{invalid_support}.sqlite3"
@@ -597,10 +664,22 @@ def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invali
                 "UPDATE experiences SET experience_json = ?, created_at = ? WHERE task_id = ?",
                 (json.dumps(payload, ensure_ascii=False), payload["created_at"], support_id),
             )
-    else:
+    elif invalid_support == "conflicted":
         row = store.get_learned_strategy(strategy.strategy_id)
         payload = json.loads(row["strategy_json"])
         payload["metadata"]["conflicting_experience_ids"] = ["new-conflicting-experience"]
+        with store.db:
+            store.db.execute(
+                "UPDATE learned_strategies SET strategy_json = ? WHERE strategy_id = ?",
+                (json.dumps(payload, ensure_ascii=False), strategy.strategy_id),
+            )
+    else:
+        row = store.get_learned_strategy(strategy.strategy_id)
+        payload = json.loads(row["strategy_json"])
+        if invalid_support == "malformed_failure_types":
+            payload["condition"]["failure_types"] = ["NETWORK_ERROR", []]
+        else:
+            payload["condition"]["tools"] = ["tool_a", {"name": "tool_b"}]
         with store.db:
             store.db.execute(
                 "UPDATE learned_strategies SET strategy_json = ? WHERE strategy_id = ?",
