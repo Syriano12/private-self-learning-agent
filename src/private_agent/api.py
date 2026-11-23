@@ -13,6 +13,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
@@ -62,7 +63,7 @@ from private_agent.auth import (
 from private_agent.bugbounty.models import Finding, FindingState, ScopeDefinition, public_reference, reconcile_bug_bounty_metrics, safe_json, validate_confirmed_evidence
 from private_agent.bugbounty.learning import BugBountyLearningService
 from private_agent.bugbounty.local_evidence import normalize_research_input
-from private_agent.bugbounty.programs import ProgramAnalysisRepository, PublicPolicyRetriever, analyze_program
+from private_agent.bugbounty.programs import ProgramAnalysisRepository, PublicPolicyRetriever, analyze_program, scope_proposal_digest
 from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType, StageBudget
 from private_agent.bugbounty.reviews import FindingReview, FindingReviewDecision, FindingReviewRepository
 from private_agent.bugbounty.remote_worker import RemoteWorkerProtocol, WorkerAuthentication, WorkerProtocolError
@@ -332,12 +333,41 @@ class ProgramAnalysisRequest(APIModel):
         return self
 
 
+class ProgramAnalysisTaskRequest(APIModel):
+    proposal_digest: str = Field(min_length=64, max_length=64)
+    authorization_reference: str = Field(min_length=1, max_length=512)
+    authorization_attested: bool = False
+
+    @field_validator("proposal_digest")
+    @classmethod
+    def valid_proposal_digest(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError("proposal_digest_invalid")
+        return value.lower()
+
+    @field_validator("authorization_reference")
+    @classmethod
+    def valid_authorization_reference(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(char) < 32 for char in value):
+            raise ValueError("authorization_reference_invalid")
+        return value
+
+    @field_validator("authorization_attested", mode="before")
+    @classmethod
+    def strict_authorization_attestation(cls, value: Any) -> bool:
+        if type(value) is not bool:
+            raise ValueError("authorization_attestation_invalid")
+        return value
+
+
 class ProgramAnalysisResponse(APIModel):
     analysis_id: str
     program_url: str
     source: dict[str, Any]
     status: str
     scope_proposal: dict[str, Any] | None = None
+    proposal_digest: str = ""
     exclusions: list[str] = Field(default_factory=list)
     ambiguities: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
@@ -637,6 +667,7 @@ class BugBountyTaskResponse(APIModel):
     recovery_state: dict[str, Any] = Field(default_factory=dict)
     run: dict[str, Any] | None = None
     scan: dict[str, Any] | None = None
+    analysis_provenance: dict[str, Any] | None = None
     report: str = ""
     limitations: list[str] = Field(default_factory=list)
     api_version: str = API_VERSION
@@ -1300,6 +1331,8 @@ class AgentAPIService:
         )
         if payload is None:
             raise APIError(404, "program_analysis_not_found", "Program analysis was not found")
+        payload = dict(payload)
+        payload["proposal_digest"] = scope_proposal_digest(payload.get("scope_proposal"))
         return ProgramAnalysisResponse(**payload, request_id=request_id)
 
     def list_program_analyses(
@@ -1316,7 +1349,12 @@ class AgentAPIService:
             )
         except ValueError as exc:
             raise APIError(422, str(exc), "Program analysis limit is invalid") from exc
-        return [ProgramAnalysisResponse(**payload) for payload in payloads]
+        responses: list[ProgramAnalysisResponse] = []
+        for payload in payloads:
+            value = dict(payload)
+            value["proposal_digest"] = scope_proposal_digest(value.get("scope_proposal"))
+            responses.append(ProgramAnalysisResponse(**value))
+        return responses
 
     def create_research_stage(
         self,
@@ -2466,6 +2504,7 @@ class AgentAPIService:
         idempotency_key: str | None = None,
         request_id: str = "",
         principal: AuthenticatedPrincipal | None = None,
+        program_analysis_provenance: Mapping[str, Any] | None = None,
     ) -> TaskCreateResponse:
         execution_scope = dict(payload.scope)
         execution_scope["scope_reference"] = public_reference(execution_scope.pop("authorization_reference"))
@@ -2481,16 +2520,97 @@ class AgentAPIService:
             "source_documents": dict(payload.source_documents),
         }
         goal = f"Bug Bounty analysis for authorized program {payload.scope['program_id']}"
+        context: dict[str, Any] = {"task_kind": "bug_bounty", "bugbounty_request": request}
+        fingerprint_payload: dict[str, Any] = {"goal": goal, "request": request}
+        if program_analysis_provenance is not None:
+            provenance = safe_json(dict(program_analysis_provenance))
+            context["program_analysis_provenance"] = provenance
+            fingerprint_payload["program_analysis_provenance"] = {
+                key: value for key, value in provenance.items() if key != "scope_attested_at"
+            }
         fingerprint = hashlib.sha256(
-            json.dumps({"goal": goal, "request": request}, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         return self.create_task(
             goal,
             idempotency_key=idempotency_key,
             request_id=request_id,
-            context={"task_kind": "bug_bounty", "bugbounty_request": request},
+            context=context,
             request_fingerprint=fingerprint,
             principal=principal,
+        )
+
+    def create_bug_bounty_task_from_analysis(
+        self,
+        analysis_id: str,
+        payload: ProgramAnalysisTaskRequest,
+        *,
+        idempotency_key: str | None = None,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> TaskCreateResponse:
+        analysis_id = _safe_id(analysis_id, "analysis_id")
+        if principal is None or principal.is_legacy or principal.role != ROLE_OWNER:
+            raise APIError(403, "analysis_handoff_forbidden", "An authenticated owner is required to review and attest a program-analysis proposal")
+        if not payload.authorization_attested:
+            raise APIError(422, "authorization_attestation_required", "Explicit written-authorization attestation is required")
+
+        is_owner = principal.role == ROLE_OWNER
+        analysis = ProgramAnalysisRepository(self.store).get(
+            analysis_id,
+            owner_user_id=self._owner_user_id(principal),
+            is_owner=is_owner,
+        )
+        if analysis is None:
+            raise APIError(404, "program_analysis_not_found", "Program analysis was not found")
+        proposal = analysis.get("scope_proposal")
+        if analysis.get("status") != "READY_FOR_SCOPE_REVIEW" or not isinstance(proposal, Mapping):
+            raise APIError(409, "program_analysis_not_eligible", "Only a current server-returned scope proposal can be used")
+
+        source = analysis.get("source")
+        observations = analysis.get("observations")
+        if (
+            not isinstance(source, Mapping)
+            or source.get("source_type") == "hackerone_program"
+            or isinstance(observations, Mapping) and observations.get("authorization_derived") is False
+        ):
+            raise APIError(409, "public_policy_is_not_authorization", "Public-policy observations cannot authorize a Bug Bounty task")
+        source_digest = source.get("content_sha256") if isinstance(source, Mapping) else None
+        if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+            raise APIError(409, "program_analysis_provenance_invalid", "The stored analysis source provenance is invalid")
+
+        expected_proposal_digest = scope_proposal_digest(proposal)
+        if not expected_proposal_digest or payload.proposal_digest != expected_proposal_digest:
+            raise APIError(409, "program_analysis_stale", "The reviewed proposal changed; reload and review the latest server result")
+        stored_reference = proposal.get("authorization_reference")
+        if not isinstance(stored_reference, str) or not stored_reference.startswith("sha256:"):
+            raise APIError(409, "program_analysis_provenance_invalid", "The stored proposal does not contain a redacted authorization reference")
+
+        scope_payload = dict(proposal)
+        scope_payload["authorization_reference"] = payload.authorization_reference
+        try:
+            validated_scope = ScopeDefinition.from_dict(scope_payload)
+            task_payload = BugBountyCreateRequest(scope=validated_scope.to_dict(public=False), scanner="deterministic")
+        except (TypeError, ValueError) as exc:
+            raise APIError(409, "scope_proposal_no_longer_valid", "The server proposal is no longer valid for task creation") from exc
+
+        provenance = {
+            "analysis_id": analysis_id,
+            "analysis_status": "READY_FOR_SCOPE_REVIEW",
+            "source_content_sha256": source_digest,
+            "proposal_digest": expected_proposal_digest,
+            "scope_reference_digest": public_reference(payload.authorization_reference),
+            "scope_attestation": True,
+            "scope_attested_by_user_id": principal.user_id,
+            "scope_attested_at": datetime.now(timezone.utc).isoformat(),
+            "execution_mode": "deterministic_local",
+        }
+        return self.create_bug_bounty_task(
+            task_payload,
+            idempotency_key=idempotency_key,
+            request_id=request_id,
+            principal=principal,
+            program_analysis_provenance=provenance,
         )
 
     def bug_bounty_task(self, task_id: str, *, request_id: str = "", principal: AuthenticatedPrincipal | None = None) -> BugBountyTaskResponse:
@@ -2509,6 +2629,15 @@ class AgentAPIService:
             ]
         scan = output.get("scan") if isinstance(output.get("scan"), dict) else None
         safe_scan = self._sanitize_bug_bounty_scan(scan) if scan is not None else None
+        raw_provenance = state.context.get("program_analysis_provenance")
+        analysis_provenance = None
+        if isinstance(raw_provenance, Mapping):
+            expected_keys = (
+                "analysis_id", "analysis_status", "source_content_sha256", "proposal_digest",
+                "scope_reference_digest", "scope_attested_by_user_id", "scope_attested_at", "execution_mode",
+            )
+            analysis_provenance = {key: str(raw_provenance.get(key, ""))[:256] for key in expected_keys}
+            analysis_provenance["scope_attestation"] = raw_provenance.get("scope_attestation") is True
         limitations = list(safe_run.get("limitations", [])) if safe_run else []
         if safe_scan:
             limitations.extend(str(item) for item in safe_scan.get("limitations", [])[:50])
@@ -2519,6 +2648,7 @@ class AgentAPIService:
             recovery_state=self._capability_gap_recovery_state(state),
             run=safe_run,
             scan=safe_scan,
+            analysis_provenance=analysis_provenance,
             report="" if report_suppressed else str(output.get("report", "")),
             limitations=[str(item) for item in limitations[:50]],
             request_id=request_id,
@@ -3288,6 +3418,31 @@ def create_app(
         principal: AuthenticatedPrincipal = Depends(_principal),
     ) -> ProgramAnalysisResponse:
         return service.get_program_analysis(analysis_id, principal=principal, request_id=_request_id(request))
+
+    @router.post(
+        "/bug-bounty/programs/{analysis_id}/task",
+        response_model=TaskCreateResponse,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(_require_roles(ROLE_OWNER)), Depends(_csrf_protect)],
+    )
+    def create_bug_bounty_task_from_analysis(
+        request: Request,
+        payload: ProgramAnalysisTaskRequest,
+        analysis_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> TaskCreateResponse:
+        _require_worker_ready(request)
+        response = service.create_bug_bounty_task_from_analysis(
+            analysis_id,
+            payload,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(request),
+            principal=principal,
+        )
+        request.state.task_id = response.task_id
+        return response
 
     @router.post(
         "/bug-bounty/programs/{analysis_id}/stages",
