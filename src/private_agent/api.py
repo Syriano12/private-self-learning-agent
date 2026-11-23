@@ -91,6 +91,26 @@ _REDACTED_KEYS = {
     "authorization",
     "credentials",
 }
+_PUBLIC_RECOVERY_REASONS = frozenset({
+    "approval_required", "policy_blocked", "capability_unavailable",
+    "execution_interrupted_before_verified_result", "worker_lease_expired",
+    "worker_execution_interrupted", "ambiguous_execution_state_invalid_action_record",
+    "invalid_persisted_action_record", "ambiguous_execution_state_missing_action_record",
+    "ambiguous_execution_state_requires_observation", "unknown_execution_resolution_not_safe",
+    "resume_security_revalidation_blocked", "persisted_action_completion_conflict",
+    "persisted_verified_action_untrusted", "persisted_execution_result_corrupted",
+    "conversation_security_revalidation_error", "max_execution_age_exceeded",
+})
+_PUBLIC_RECOVERY_REASON_PREFIXES = frozenset({"persisted_plan_invalid", "resume_security_revalidation_error"})
+_PUBLIC_RECOVERY_STRATEGIES = frozenset({
+    "RETRY", "RETRY_WITH_MODIFIED_INPUT", "CHANGE_TOOL", "CHANGE_PARAMETERS",
+    "SKIP_OPTIONAL_STEP", "REPLAN", "ABORT",
+})
+_PUBLIC_FAILURE_TYPES = frozenset({
+    "TOOL_ERROR", "INVALID_INPUT", "MISSING_DEPENDENCY", "PERMISSION_BLOCKED",
+    "TIMEOUT", "RATE_LIMITED", "NETWORK_ERROR", "VERIFICATION_FAILED",
+    "INSUFFICIENT_RESULT", "INVALID_OUTPUT", "UNKNOWN_FAILURE",
+})
 _BEARER = HTTPBearer(auto_error=False)
 
 
@@ -839,6 +859,114 @@ def _public_value(value: Any, *, key: str = "") -> Any:
     if isinstance(value, tuple):
         return [_public_value(item, key=key) for item in value[:100]]
     return safe_metadata({"value": value}).get("value")
+
+
+def _recovery_identifier(value: Any) -> str:
+    if isinstance(value, str) and _REQUEST_ID_PATTERN.fullmatch(value):
+        return value
+    return ""
+
+
+def _recovery_identifier_list(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(
+        item for item in (_recovery_identifier(candidate) for candidate in value[:limit]) if item
+    ))
+
+
+def _public_recovery_state(value: Any) -> dict[str, Any]:
+    """Project task recovery data through a closed schema; omit raw diagnostics and inputs."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    reason = value.get("reason")
+    if isinstance(reason, str):
+        reason_code = reason.partition(":")[0]
+        if reason in _PUBLIC_RECOVERY_REASONS:
+            result["reason"] = reason
+        elif reason_code in _PUBLIC_RECOVERY_REASON_PREFIXES:
+            result["reason"] = reason_code
+        else:
+            result["reason"] = "recovery_required"
+
+    decision_value = value.get("decision")
+    if isinstance(decision_value, dict):
+        decision: dict[str, Any] = {}
+        strategy = decision_value.get("strategy")
+        if isinstance(strategy, str) and strategy in _PUBLIC_RECOVERY_STRATEGIES:
+            decision["strategy"] = strategy
+        for field in ("step_id", "original_tool", "replacement_tool"):
+            identifier = _recovery_identifier(decision_value.get(field))
+            if identifier:
+                decision[field] = identifier
+        terminal_status = decision_value.get("terminal_status")
+        if isinstance(terminal_status, str) and terminal_status in {"FAILED", "BLOCKED", "CANCELLED", "COMPLETED"}:
+            decision["terminal_status"] = terminal_status
+        if decision:
+            result["decision"] = decision
+
+    diagnosis_value = value.get("diagnosis")
+    if isinstance(diagnosis_value, dict):
+        diagnosis: dict[str, Any] = {}
+        failure_type = diagnosis_value.get("failure_type")
+        if isinstance(failure_type, str) and failure_type in _PUBLIC_FAILURE_TYPES:
+            diagnosis["failure_type"] = failure_type
+        for field in ("failed_step", "tool_name"):
+            identifier = _recovery_identifier(diagnosis_value.get(field))
+            if identifier:
+                diagnosis[field] = identifier
+        recoverable = diagnosis_value.get("recoverable")
+        if isinstance(recoverable, bool):
+            diagnosis["recoverable"] = recoverable
+        suggested_recovery = diagnosis_value.get("suggested_recovery")
+        if isinstance(suggested_recovery, str) and suggested_recovery in _PUBLIC_RECOVERY_STRATEGIES:
+            diagnosis["suggested_recovery"] = suggested_recovery
+        if diagnosis:
+            result["diagnosis"] = diagnosis
+
+    round_number = value.get("round")
+    if isinstance(round_number, int) and not isinstance(round_number, bool) and 0 <= round_number <= 1_000_000:
+        result["round"] = round_number
+
+    if value.get("external_side_effect_may_have_occurred") is True:
+        result["external_side_effect_may_have_occurred"] = True
+    for field in ("action_key", "step_id"):
+        identifier = _recovery_identifier(value.get(field))
+        if identifier:
+            result[field] = identifier
+    invalid_keys = value.get("invalid_action_record_keys")
+    if isinstance(invalid_keys, list):
+        result["invalid_action_record_count"] = min(len(invalid_keys), 100_000)
+
+    gap_value = value.get("capability_gap")
+    if isinstance(gap_value, dict):
+        gap: dict[str, Any] = {}
+        code = gap_value.get("code")
+        if isinstance(code, str) and code in {"UNREGISTERED_TOOL_REQUEST", "NO_REGISTERED_TOOLS"}:
+            gap["code"] = code
+        if gap_value.get("source") == "planner_registry_validation":
+            gap["source"] = "planner_registry_validation"
+        summary_by_code = {
+            "UNREGISTERED_TOOL_REQUEST": "The planner requested a tool that is not registered; no tool was executed or installed.",
+            "NO_REGISTERED_TOOLS": "No tools are registered for planning; no tool was executed or installed.",
+        }
+        if isinstance(code, str) and code in summary_by_code and gap_value.get("summary") == summary_by_code[code]:
+            gap["summary"] = summary_by_code[code]
+        for field, limit in (("requested_tools", 20), ("registered_tools", 50)):
+            identifiers = _recovery_identifier_list(gap_value.get(field), limit=limit)
+            if field in gap_value:
+                gap[field] = identifiers
+        unavailable_count = gap_value.get("unavailable_tool_count")
+        if isinstance(unavailable_count, int) and not isinstance(unavailable_count, bool) and 0 <= unavailable_count <= 1_000_000:
+            gap["unavailable_tool_count"] = unavailable_count
+        for field in ("execution_attempted", "acquisition_attempted", "permissions_granted"):
+            flag = gap_value.get(field)
+            if isinstance(flag, bool):
+                gap[field] = flag
+        if gap:
+            result["capability_gap"] = gap
+    return result
 
 
 def _safe_id(value: str, field: str) -> str:
@@ -2004,9 +2132,7 @@ class AgentAPIService:
         }
 
     def _capability_gap_recovery_state(self, state: TaskState) -> dict[str, Any]:
-        recovery = _public_value(state.recovery_state)
-        if not isinstance(recovery, dict):
-            return {}
+        recovery = _public_recovery_state(state.recovery_state)
         gap = recovery.get("capability_gap")
         if not isinstance(gap, dict):
             return recovery
