@@ -23,6 +23,7 @@ class ToolResult:
     output: Any = None
     error: ToolError | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    no_side_effects: bool = False
 
     @classmethod
     def success(cls, output: Any, *, metadata: dict[str, Any] | None = None) -> "ToolResult":
@@ -37,12 +38,20 @@ class ToolResult:
         output: Any = None,
         details: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        no_side_effects: bool = False,
     ) -> "ToolResult":
+        """Return a structured failure; true asserts no external effect was left behind.
+
+        The default is conservative. Set ``no_side_effects=True`` only when the
+        tool can guarantee that no side effect occurred, so uncertain outcomes
+        remain EXECUTION_UNKNOWN instead of being retried.
+        """
         return cls(
             "failed",
             output=output,
             error=ToolError(code, message, details or {}),
             metadata=metadata or {},
+            no_side_effects=no_side_effects,
         )
 
     @classmethod
@@ -53,11 +62,14 @@ class ToolResult:
         *,
         details: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        no_side_effects: bool = False,
     ) -> "ToolResult":
+        """Return a structured block; default conservatively assumes effects may exist."""
         return cls(
             "blocked",
             error=ToolError(code, message, details or {}),
             metadata=metadata or {},
+            no_side_effects=no_side_effects,
         )
 
 
@@ -177,6 +189,7 @@ class LegacyToolAdapter:
                 "no_sources",
                 "Legacy tool returned no sources",
                 output={"query": query, "sources": [], "errors": errors},
+                no_side_effects=True,
             )
         fetched: list[dict[str, Any]] = []
         for source in sources[:limit]:

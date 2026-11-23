@@ -448,7 +448,7 @@ def test_api_cannot_bypass_capability_or_quarantined_skill_boundaries(tmp_path: 
 
 
 def test_observability_timeline_metrics_failures_security_and_tools_are_read_only(tmp_path: Path) -> None:
-    tool = APITestTool("safe", [ToolResult.failed("tool_failed", "controlled failure")])
+    tool = APITestTool("safe", [ToolResult.failed("tool_failed", "controlled failure", no_side_effects=True)])
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)
     _, task_id = run_core_task(service, "complete a safe API task")
@@ -470,7 +470,7 @@ def test_observability_timeline_metrics_failures_security_and_tools_are_read_onl
 
 def test_task_failure_exposes_only_closed_reason_not_raw_error_or_event_metadata(tmp_path: Path) -> None:
     raw_detail = "RAW_TOOL_EXCEPTION_do_not_expose_9c2d"
-    repeated_failure = ToolResult.failed("tool_failed", raw_detail)
+    repeated_failure = ToolResult.failed("tool_failed", raw_detail, no_side_effects=True)
     tool = APITestTool("safe", [repeated_failure for _ in range(8)])
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)

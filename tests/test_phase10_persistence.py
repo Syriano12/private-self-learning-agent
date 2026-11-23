@@ -403,7 +403,7 @@ def test_resume_continues_from_last_verified_step_without_reexecuting_it(tmp_pat
 
 def test_resume_retry_from_failed_action_starts_with_clean_lifecycle_fields(tmp_path: Path) -> None:
     path = tmp_path / "failed-action-retry.sqlite3"
-    tool = DurableTool("safe", [ToolResult.failed("temporary", "retry after resume"), ToolResult.success({"result": "ok"})])
+    tool = DurableTool("safe", [ToolResult.failed("temporary", "retry after resume", no_side_effects=True), ToolResult.success({"result": "ok"})])
 
     def interrupt_after_failure(checkpoint: str, state: dict) -> None:
         if checkpoint == "AFTER_VERIFICATION" and state.get("current_step") == "step-1":
@@ -745,7 +745,7 @@ def test_capability_and_action_fingerprint_change_after_restart_fail_closed(tmp_
 
 def test_low_risk_resume_continues_after_restart_and_recovery_replanning_is_durable(tmp_path: Path) -> None:
     path = tmp_path / "low-recovery.sqlite3"
-    tool_a = DurableTool("a", [ToolResult.failed("tool_failed", "temporary")])
+    tool_a = DurableTool("a", [ToolResult.failed("tool_failed", "temporary", no_side_effects=True)])
     tool_b = DurableTool("b", [ToolResult.success({"result": "recovered"})])
 
     def interrupt(checkpoint: str, state: dict) -> None:

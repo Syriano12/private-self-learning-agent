@@ -158,7 +158,7 @@ class LocalTool:
     def execute(self, inputs: dict[str, Any], context: Any) -> ToolResult:
         self.calls.append({"task_id": context.task_id, "inputs": dict(inputs)})
         if self.name == "tool_a":
-            return ToolResult.failed("malformed_tool_result", "deterministic local invalid-output fixture")
+            return ToolResult.failed("malformed_tool_result", "deterministic local invalid-output fixture", no_side_effects=True)
         return ToolResult.success({"result": f"verified-local:{self.name}:{inputs['value']}:task={context.task_id}"})
 
 

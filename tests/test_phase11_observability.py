@@ -214,7 +214,7 @@ def test_tool_lifecycle_events_cover_success_and_failure(tmp_path: Path) -> None
     store = Store(tmp_path / "tools.sqlite3")
     monitor = ObservabilityMonitor(store)
     success_tool = DemoTool("success")
-    failure_tool = DemoTool("failure", [ToolResult.failed("tool_failed", "controlled failure")])
+    failure_tool = DemoTool("failure", [ToolResult.failed("tool_failed", "controlled failure", no_side_effects=True)])
     tools = registry(success_tool, failure_tool)
     controller = SecurityController(store=store)
     executor = GenericExecutor(tools, controller)
@@ -230,12 +230,14 @@ def test_tool_lifecycle_events_cover_success_and_failure(tmp_path: Path) -> None
 
 def test_verification_events_include_pass_and_failure_categories(tmp_path: Path) -> None:
     good = DemoTool("good")
-    bad = DemoTool("bad", [ToolResult.success({"wrong": "shape"})])
+    bad = DemoTool("bad", [ToolResult.success({"result": "valid output, insufficient evidence"})])
     store = Store(tmp_path / "verification.sqlite3")
     monitor = ObservabilityMonitor(store)
     good_agent = Orchestrator(store, registry(good), planner=PlannerStub([make_step("good")]), observability=monitor)
     good_result = good_agent.run("good verification")
-    bad_agent = Orchestrator(store, registry(bad), planner=PlannerStub([make_step("bad")]), observability=monitor)
+    bad_step = make_step("bad")
+    bad_step.success_criteria = {"required_fields": ["absent_from_valid_output"]}
+    bad_agent = Orchestrator(store, registry(bad), planner=PlannerStub([bad_step]), observability=monitor)
     bad_result = bad_agent.run("bad verification")
     assert good_result["final_status"] == "COMPLETED"
     assert bad_result["final_status"] != "COMPLETED"
@@ -245,7 +247,7 @@ def test_verification_events_include_pass_and_failure_categories(tmp_path: Path)
 
 
 def test_recovery_and_replanning_events_are_observable(tmp_path: Path) -> None:
-    first = DemoTool("first", [ToolResult.failed("tool_failed", "temporary")])
+    first = DemoTool("first", [ToolResult.failed("tool_failed", "temporary", no_side_effects=True)])
     replacement = DemoTool("replacement", [ToolResult.success({"result": "recovered"})])
     store = Store(tmp_path / "recovery.sqlite3")
     monitor = ObservabilityMonitor(store)

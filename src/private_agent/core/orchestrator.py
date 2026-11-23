@@ -164,6 +164,10 @@ class Orchestrator:
             tool = self.tools.get(step.tool)
         except KeyError:
             return None
+        except Exception:
+            # This is only an early preflight lookup; execute_step performs the
+            # authoritative lookup and authorization before any side effect.
+            return None
         if step.input_bindings:
             resolved_input, binding_error = self.executor._resolve_input_bindings(step, tool, context)
             if binding_error is not None:

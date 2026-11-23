@@ -76,19 +76,22 @@ class BugBountyAnalysisTool:
             openapi = inputs.get("openapi")
             if openapi is not None and not isinstance(openapi, Mapping):
                 raise ValueError("openapi_invalid")
-            run = BugBountyAgent(store=self.store).run(
-                scope,
-                fixture_variant=inputs.get("fixture") or None,
-                urls=tuple(urls),
-                openapi=dict(openapi) if isinstance(openapi, Mapping) else None,
-                source_documents=dict(source_documents),
-                mode="deterministic",
-                persist=True,
-            )
-            return ToolResult.success({"run": run.to_dict(public=True), "report": markdown_report(run)})
         except (TypeError, ValueError) as exc:
             return ToolResult.failed(
                 "bugbounty_invalid_input",
                 "Bug Bounty input was rejected by the bounded local workflow",
                 details={"error": str(exc)[:160]},
+                no_side_effects=True,
             )
+        # The deterministic run persists evidence; if it raises after beginning,
+        # let the executor preserve EXECUTION_UNKNOWN instead of claiming no effect.
+        run = BugBountyAgent(store=self.store).run(
+            scope,
+            fixture_variant=inputs.get("fixture") or None,
+            urls=tuple(urls),
+            openapi=dict(openapi) if isinstance(openapi, Mapping) else None,
+            source_documents=dict(source_documents),
+            mode="deterministic",
+            persist=True,
+        )
+        return ToolResult.success({"run": run.to_dict(public=True), "report": markdown_report(run)})

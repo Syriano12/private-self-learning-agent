@@ -185,7 +185,7 @@ def test_worker_result_events_distinguish_unknown_failure_and_do_not_auto_approv
     failed_dir.mkdir()
     failed_service, failed_store, _ = make_service(
         failed_dir,
-        APITestTool("safe", outcomes=[ToolResult.failed("test_failure", "private tool failure text") for _ in range(8)]),
+        APITestTool("safe", outcomes=[ToolResult.failed("test_failure", "private tool failure text", no_side_effects=True) for _ in range(8)]),
     )
     failed_owner, failed_principal = _owner_and_principal(failed_store, suffix="failed")
     failed_task = _make_owned_task(failed_store, failed_owner, "record failed execution")
