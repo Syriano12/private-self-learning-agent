@@ -612,6 +612,9 @@ class Orchestrator:
                         for key in ("scope", "fixture", "urls", "openapi", "source_documents")
                         if key in request
                     }
+                    provenance = state.context.get("program_analysis_provenance")
+                    if isinstance(provenance, dict):
+                        step_input["research_stage_refs"] = provenance.get("research_stage_refs", [])
                     objective = "Run bounded local Bug Bounty analysis"
                     reason = "Explicit API request routed to the registered local-only analysis contract"
                     required_fields = ["run", "report"]
@@ -781,11 +784,15 @@ class Orchestrator:
                 latest_outcomes = self._verified_outcomes_for_plan(state, current_plan)
                 terminal_status = "COMPLETED"
                 break
+            execution_metadata = {"attempt": rounds, "goal": current_plan.goal}
+            provenance = state.context.get("program_analysis_provenance")
+            if state.context.get("task_kind") == "bug_bounty" and isinstance(provenance, dict):
+                execution_metadata["program_analysis_provenance"] = provenance
             execution_context = ExecutionContext(
                 task_id=task_id,
                 previous_results={},
                 approved_permissions=set(self.approved_permissions),
-                metadata={"attempt": rounds, "goal": current_plan.goal},
+                metadata=execution_metadata,
                 security_controller=self.security,
                 approval_ids={**state.approval_ids, **approval_ids},
                 observability=self.observability,

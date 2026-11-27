@@ -744,6 +744,7 @@ class BugBountyRun:
     findings: list[Finding]
     tests: list[TestCaseResult]
     limitations: list[str] = field(default_factory=list)
+    research_stage_refs: list[dict[str, str]] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
 
     def metrics(self) -> dict[str, Any]:
@@ -778,6 +779,7 @@ class BugBountyRun:
             "plan": safe_json(self.plan),
             "findings": [item.to_dict(public=public) for item in self.findings],
             "tests": [item.to_dict(public=public) for item in self.tests],
+            "research_stage_refs": safe_json(self.research_stage_refs),
             "metrics": self.metrics(),
             "limitations": self.limitations[:50],
             "created_at": self.created_at,

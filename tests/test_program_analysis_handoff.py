@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -9,8 +10,11 @@ from fastapi.testclient import TestClient
 from private_agent.api import AgentAPIService, build_api_service, create_app
 from private_agent.auth import AuthManager, ROLE_OPERATOR
 from private_agent.bugbounty.models import public_reference
+from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType
+from private_agent.bugbounty.workflow import BugBountyRepository
 from private_agent.core.task_state import TaskState
 from private_agent.storage import Store
+from private_agent.tools.bugbounty import BugBountyAnalysisTool
 from private_agent.worker import BackgroundWorker
 from tests.test_phase12_api import APITestTool, make_service
 from tests.test_phase_auth_rbac import OWNER_EMAIL, OWNER_PASSWORD, _login
@@ -64,6 +68,20 @@ def handoff_body(analysis: dict, *, reference: str = "written-authorization-ref-
     }
 
 
+def create_inventory_stage(client: TestClient, csrf: str, analysis_id: str, *, content: str = '{"paths":{"/api/v1/orders":{"get":{}}}}') -> dict:
+    response = client.post(
+        f"/api/v1/bug-bounty/programs/{analysis_id}/stages",
+        json={
+            "stage_type": "INVENTORY",
+            "budget": {"max_items": 100, "timeout_seconds": 300},
+            "input_payload": {"artifacts": [{"name": "routes.json", "content_type": "application/json", "content": content}]},
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
 def test_handoff_uses_only_current_server_proposal_and_persists_redacted_provenance(tmp_path: Path) -> None:
     service, store, client, csrf = create_owner_client(tmp_path)
     analysis = create_analysis(client, csrf)
@@ -108,6 +126,7 @@ def test_handoff_uses_only_current_server_proposal_and_persists_redacted_provena
         "scope_attested_by_user_id": owner_user_id,
         "scope_attested_at": provenance["scope_attested_at"],
         "execution_mode": "deterministic_local",
+        "research_stage_refs": [],
     }
     assert provenance["scope_attested_by_user_id"] == owner_user_id
     assert provenance["scope_attested_at"]
@@ -127,6 +146,7 @@ def test_handoff_uses_only_current_server_proposal_and_persists_redacted_provena
     assert detail.json()["analysis_provenance"]["source_content_sha256"] == analysis["source"]["content_sha256"]
     assert detail.json()["analysis_provenance"]["proposal_digest"] == analysis["proposal_digest"]
     assert detail.json()["analysis_provenance"]["scope_reference_digest"] == public_reference(reference)
+    assert detail.json()["analysis_provenance"]["research_stage_refs"] == []
     assert reference not in detail.text
     store.close()
 
@@ -339,4 +359,144 @@ def test_handoff_rejects_review_required_analyses_and_foreign_operator_ids(tmp_p
     assert denied.status_code == 403
     assert denied.json()["error_code"] == "forbidden"
     assert owner_client.get("/api/v1/tasks").json()["items"] == []
+    store.close()
+
+
+def test_owner_selected_completed_stage_is_bound_executed_and_persisted_across_reopen(tmp_path: Path) -> None:
+    service, store, client, csrf = create_owner_client(tmp_path)
+    analysis = create_analysis(client, csrf)
+    stage = create_inventory_stage(client, csrf, analysis["analysis_id"])
+    stage_result = BackgroundWorker(service.orchestrator, worker_id="stage-lineage-source").run_once()
+    assert stage_result["status"] == "STAGE_COMPLETED", stage_result
+    fetched_stage = client.get(f"/api/v1/bug-bounty/research-stages/{stage['stage_id']}")
+    assert fetched_stage.status_code == 200, fetched_stage.text
+    assert fetched_stage.json()["stage_status"] == "COMPLETED"
+
+    row = store.db.execute(
+        "SELECT result_json FROM bugbounty_research_stages WHERE stage_id = ?", (stage["stage_id"],)
+    ).fetchone()
+    assert row is not None
+    expected_ref = {
+        "stage_id": stage["stage_id"],
+        "stage_type": "INVENTORY",
+        "result_sha256": hashlib.sha256(str(row["result_json"]).encode("utf-8")).hexdigest(),
+    }
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "stage-lineage-handoff"}
+    handoff = client.post(
+        f"/api/v1/bug-bounty/programs/{analysis['analysis_id']}/task",
+        json=handoff_body(analysis, source_stage_ids=[stage["stage_id"]]),
+        headers=headers,
+    )
+    assert handoff.status_code == 201, handoff.text
+    task_id = handoff.json()["task_id"]
+    assert service._state(task_id).context["program_analysis_provenance"]["research_stage_refs"] == [expected_ref]
+
+    replay = client.post(
+        f"/api/v1/bug-bounty/programs/{analysis['analysis_id']}/task",
+        json=handoff_body(analysis, source_stage_ids=[stage["stage_id"]]),
+        headers=headers,
+    )
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["task_id"] == task_id
+    assert replay.json()["idempotent_replay"] is True
+    changed_replay = client.post(
+        f"/api/v1/bug-bounty/programs/{analysis['analysis_id']}/task",
+        json=handoff_body(analysis, source_stage_ids=[]),
+        headers=headers,
+    )
+    assert changed_replay.status_code == 409
+
+    service.orchestrator.tools.register(BugBountyAnalysisTool(store))
+    completed = BackgroundWorker(service.orchestrator, worker_id="stage-lineage-run").run_once()
+    assert completed["status"] == "COMPLETED", completed
+    detail = client.get(f"/api/v1/bug-bounty/tasks/{task_id}")
+    assert detail.status_code == 200, detail.text
+    task_payload = detail.json()
+    assert task_payload["analysis_provenance"]["research_stage_refs"] == [expected_ref]
+    assert task_payload["run"]["research_stage_refs"] == [expected_ref]
+    assert "Supporting research-stage provenance" in task_payload["report"]
+    assert "/api/v1/orders" not in task_payload["report"]
+    run_id = task_payload["run"]["run_id"]
+    assert BugBountyRepository(store).get(run_id)["research_stage_refs"] == [expected_ref]
+
+    store.close()
+    reopened_store = Store(tmp_path / "api.sqlite3")
+    try:
+        reopened_run = BugBountyRepository(reopened_store).get(run_id)
+        assert reopened_run is not None
+        assert reopened_run["research_stage_refs"] == [expected_ref]
+    finally:
+        reopened_store.close()
+
+
+def test_handoff_rejects_incomplete_foreign_owner_and_foreign_analysis_stages(tmp_path: Path) -> None:
+    service, store, client, csrf = create_owner_client(tmp_path)
+    analysis = create_analysis(client, csrf)
+    queued = create_inventory_stage(client, csrf, analysis["analysis_id"])
+    repository = ResearchStageRepository(store)
+
+    def complete_directly(analysis_id: str, owner_user_id: str, stage_type: ResearchStageType = ResearchStageType.INVENTORY):
+        created = repository.create(analysis_id, stage_type, owner_user_id=owner_user_id)
+        running = repository.start(created.stage_id, owner_user_id=owner_user_id)
+        return repository.finish(
+            running.stage_id,
+            ResearchStageStatus.COMPLETED,
+            owner_user_id=owner_user_id,
+            result={"kind": "LOCAL_INVENTORY", "network_accessed": False},
+        )
+
+    owner_id = AuthManager(store).list_users()[0].user_id
+    foreign_owner_stage = complete_directly(analysis["analysis_id"], "different-owner")
+    other_analysis = create_analysis(client, csrf)
+    foreign_analysis_stage = complete_directly(other_analysis["analysis_id"], owner_id)
+    wrong_type_stage = complete_directly(analysis["analysis_id"], owner_id, ResearchStageType.PROGRAM_ANALYSIS)
+
+    candidates = [
+        queued["stage_id"],
+        foreign_owner_stage.stage_id,
+        foreign_analysis_stage.stage_id,
+        wrong_type_stage.stage_id,
+    ]
+    for index, source_stage_id in enumerate(candidates):
+        response = client.post(
+            f"/api/v1/bug-bounty/programs/{analysis['analysis_id']}/task",
+            json=handoff_body(analysis, source_stage_ids=[source_stage_id]),
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": f"stage-lineage-reject-{index}"},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["error_code"] == "program_analysis_research_stage_invalid"
+    assert client.get("/api/v1/tasks").json()["items"] == []
+    store.close()
+
+
+def test_corrupt_stage_digest_blocks_execution_before_any_run_is_saved(tmp_path: Path) -> None:
+    service, store, client, csrf = create_owner_client(tmp_path)
+    analysis = create_analysis(client, csrf)
+    stage = create_inventory_stage(client, csrf, analysis["analysis_id"])
+    stage_result = BackgroundWorker(service.orchestrator, worker_id="stage-lineage-corrupt-source").run_once()
+    assert stage_result["status"] == "STAGE_COMPLETED", stage_result
+    handoff = client.post(
+        f"/api/v1/bug-bounty/programs/{analysis['analysis_id']}/task",
+        json=handoff_body(analysis, source_stage_ids=[stage["stage_id"]]),
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "stage-lineage-corrupt-handoff"},
+    )
+    assert handoff.status_code == 201, handoff.text
+    task_id = handoff.json()["task_id"]
+
+    corrupted_result = json.dumps(
+        {"kind": "LOCAL_INVENTORY", "network_accessed": False, "endpoints": ["/api/v1/tampered"]},
+        sort_keys=True,
+    )
+    with store._db_lock, store.db:
+        store.db.execute(
+            "UPDATE bugbounty_research_stages SET result_json = ? WHERE stage_id = ?",
+            (corrupted_result, stage["stage_id"]),
+        )
+
+    blocked = BackgroundWorker(service.orchestrator, worker_id="stage-lineage-revalidation").run_once()
+    assert blocked["status"] != "COMPLETED", blocked
+    assert BugBountyRepository(store).list_runs() == []
+    detail = client.get(f"/api/v1/bug-bounty/tasks/{task_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["run"] is None
     store.close()

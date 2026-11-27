@@ -62,7 +62,7 @@ from private_agent.auth import (
 )
 from private_agent.bugbounty.models import Finding, FindingState, ScopeDefinition, public_reference, reconcile_bug_bounty_metrics, safe_json, validate_confirmed_evidence
 from private_agent.bugbounty.learning import BugBountyLearningService
-from private_agent.bugbounty.local_evidence import normalize_research_input
+from private_agent.bugbounty.local_evidence import normalize_execution_stage_ids, normalize_execution_stage_refs, normalize_research_input
 from private_agent.bugbounty.programs import ProgramAnalysisRepository, PublicPolicyRetriever, analyze_program, scope_proposal_digest
 from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType, StageBudget
 from private_agent.bugbounty.reviews import FindingReview, FindingReviewDecision, FindingReviewRepository
@@ -337,6 +337,7 @@ class ProgramAnalysisTaskRequest(APIModel):
     proposal_digest: str = Field(min_length=64, max_length=64)
     authorization_reference: str = Field(min_length=1, max_length=512)
     authorization_attested: bool = False
+    source_stage_ids: list[str] = Field(default_factory=list, max_length=4)
 
     @field_validator("proposal_digest")
     @classmethod
@@ -359,6 +360,11 @@ class ProgramAnalysisTaskRequest(APIModel):
         if type(value) is not bool:
             raise ValueError("authorization_attestation_invalid")
         return value
+
+    @field_validator("source_stage_ids")
+    @classmethod
+    def valid_source_stage_ids(cls, value: list[str]) -> list[str]:
+        return normalize_execution_stage_ids(value)
 
 
 class ProgramAnalysisResponse(APIModel):
@@ -2492,6 +2498,12 @@ class AgentAPIService:
                 }
                 findings.append(fallback)
         tests = run.get("tests", []) if isinstance(run.get("tests", []), list) else []
+        raw_stage_refs = run.get("research_stage_refs", [])
+        try:
+            sanitized["research_stage_refs"] = normalize_execution_stage_refs(raw_stage_refs)
+        except ValueError:
+            sanitized["research_stage_refs"] = []
+            downgraded = True
         sanitized["findings"] = findings
         sanitized["metrics"] = reconcile_bug_bounty_metrics(run.get("metrics") if isinstance(run.get("metrics"), dict) else {}, findings, [item for item in tests if isinstance(item, dict)])
         limitations = [str(item) for item in run.get("limitations", [])] if isinstance(run.get("limitations", []), list) else []
@@ -2597,6 +2609,19 @@ class AgentAPIService:
         except (TypeError, ValueError) as exc:
             raise APIError(409, "scope_proposal_no_longer_valid", "The server proposal is no longer valid for task creation") from exc
 
+        try:
+            research_stage_refs = ResearchStageRepository(self.store).resolve_execution_sources(
+                analysis_id,
+                owner_user_id=self._owner_user_id(principal),
+                stage_ids=payload.source_stage_ids,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise APIError(
+                409,
+                "program_analysis_research_stage_invalid",
+                "Selected research stages must be completed, owned by this analysis, and have valid persisted results",
+            ) from exc
+
         provenance = {
             "analysis_id": analysis_id,
             "analysis_status": "READY_FOR_SCOPE_REVIEW",
@@ -2607,6 +2632,7 @@ class AgentAPIService:
             "scope_attested_by_user_id": principal.user_id,
             "scope_attested_at": datetime.now(timezone.utc).isoformat(),
             "execution_mode": "deterministic_local",
+            "research_stage_refs": research_stage_refs,
         }
         return self.create_bug_bounty_task(
             task_payload,
@@ -2641,6 +2667,12 @@ class AgentAPIService:
             )
             analysis_provenance = {key: str(raw_provenance.get(key, ""))[:256] for key in expected_keys}
             analysis_provenance["scope_attestation"] = raw_provenance.get("scope_attestation") is True
+            try:
+                analysis_provenance["research_stage_refs"] = normalize_execution_stage_refs(
+                    raw_provenance.get("research_stage_refs", [])
+                )
+            except ValueError as exc:
+                raise APIError(409, "program_analysis_provenance_invalid", "The stored research-stage lineage is invalid", task_id=task_id) from exc
         limitations = list(safe_run.get("limitations", [])) if safe_run else []
         if safe_scan:
             limitations.extend(str(item) for item in safe_scan.get("limitations", [])[:50])
