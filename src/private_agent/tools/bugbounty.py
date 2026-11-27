@@ -130,11 +130,15 @@ class BugBountyAnalysisTool:
                     or provided_stage_refs != expected_stage_refs
                 ):
                     raise ValueError("bugbounty_research_lineage_binding_mismatch")
-                verified_stage_refs = ResearchStageRepository(self.store).verify_execution_sources(
+                resolved_stage_sources = ResearchStageRepository(self.store).resolve_execution_results(
                     analysis_id,
                     owner_user_id=owner_user_id,
                     source_stage_refs=expected_stage_refs,
                 )
+                verified_stage_refs = [
+                    {key: source[key] for key in ("stage_id", "stage_type", "result_sha256")}
+                    for source in resolved_stage_sources
+                ]
             except (KeyError, TypeError, ValueError) as exc:
                 return ToolResult.blocked(
                     "bugbounty_research_lineage_invalid",
@@ -151,6 +155,7 @@ class BugBountyAnalysisTool:
             openapi=dict(openapi) if isinstance(openapi, Mapping) else None,
             source_documents=dict(source_documents),
             research_stage_refs=verified_stage_refs,
+            research_stage_results=resolved_stage_sources if verified_stage_refs else [],
             mode="deterministic",
             persist=True,
         )

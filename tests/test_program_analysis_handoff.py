@@ -415,7 +415,22 @@ def test_owner_selected_completed_stage_is_bound_executed_and_persisted_across_r
     assert task_payload["analysis_provenance"]["research_stage_refs"] == [expected_ref]
     assert task_payload["run"]["research_stage_refs"] == [expected_ref]
     assert "Supporting research-stage provenance" in task_payload["report"]
-    assert "/api/v1/orders" not in task_payload["report"]
+    assert "Unverified inventory-stage route candidates" in task_payload["report"]
+    assert "/api/v1/orders" in task_payload["report"]
+    candidate_endpoints = [
+        endpoint for endpoint in task_payload["run"]["inventory"]["endpoints"]
+        if endpoint.get("source") == "research_stage_inventory"
+    ]
+    assert len(candidate_endpoints) == 1
+    assert candidate_endpoints[0]["method"] == "UNKNOWN"
+    assert candidate_endpoints[0]["candidate_only"] is True
+    assert candidate_endpoints[0]["provenance"]["source_stage_id"] == stage["stage_id"]
+    candidate_steps = [step for step in task_payload["run"]["plan"] if step.get("action") == "passive_inventory_candidate"]
+    assert len(candidate_steps) == 1
+    assert candidate_steps[0]["method"] == "UNKNOWN"
+    assert candidate_steps[0]["active"] is False
+    assert candidate_steps[0]["provenance"]["result_sha256"] == expected_ref["result_sha256"]
+    assert task_payload["run"]["findings"] == []
     run_id = task_payload["run"]["run_id"]
     assert BugBountyRepository(store).get(run_id)["research_stage_refs"] == [expected_ref]
 
@@ -499,4 +514,91 @@ def test_corrupt_stage_digest_blocks_execution_before_any_run_is_saved(tmp_path:
     detail = client.get(f"/api/v1/bug-bounty/tasks/{task_id}")
     assert detail.status_code == 200, detail.text
     assert detail.json()["run"] is None
+    store.close()
+
+
+def test_only_local_inventory_paths_feed_unknown_passive_plan_candidates(tmp_path: Path) -> None:
+    service, store, client, csrf = create_owner_client(tmp_path)
+    analysis = create_analysis(client, csrf)
+    owner_id = AuthManager(store).list_users()[0].user_id
+    repository = ResearchStageRepository(store)
+
+    def complete(stage_type: ResearchStageType, result: dict) -> str:
+        created = repository.create(analysis["analysis_id"], stage_type, owner_user_id=owner_id)
+        running = repository.start(created.stage_id, owner_user_id=owner_id)
+        finished = repository.finish(
+            running.stage_id,
+            ResearchStageStatus.COMPLETED,
+            owner_user_id=owner_id,
+            result=result,
+        )
+        return finished.stage_id
+
+    inventory_id = complete(
+        ResearchStageType.INVENTORY,
+        {
+            "kind": "LOCAL_INVENTORY",
+            "network_accessed": False,
+            "endpoints": [
+                "GET /api/v1/orders?token=do-not-leak",
+                "DELETE /admin",
+                "https://external.invalid/api/v1/users?api_key=do-not-leak",
+                "javascript:alert(1)",
+            ],
+            "urls_observed": ["https://external.invalid/next/path?session=do-not-leak"],
+            "limitations": [],
+        },
+    )
+    passive_id = complete(
+        ResearchStageType.PASSIVE_RESEARCH,
+        {
+            "kind": "LOCAL_PASSIVE_OBSERVATIONS",
+            "network_accessed": False,
+            "observations": [{"kind": "local_routes_observed", "routes": ["/must-remain-provenance-only"]}],
+            "limitations": [],
+        },
+    )
+    networked_inventory_id = complete(
+        ResearchStageType.INVENTORY,
+        {
+            "kind": "LOCAL_INVENTORY",
+            "network_accessed": True,
+            "endpoints": ["GET /must-not-be-consumed"],
+            "urls_observed": [],
+        },
+    )
+
+    handoff = client.post(
+        f"/api/v1/bug-bounty/programs/{analysis['analysis_id']}/task",
+        json=handoff_body(analysis, source_stage_ids=[inventory_id, passive_id, networked_inventory_id]),
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "inventory-stage-candidate-consumption"},
+    )
+    assert handoff.status_code == 201, handoff.text
+    service.orchestrator.tools.register(BugBountyAnalysisTool(store))
+    completed = BackgroundWorker(service.orchestrator, worker_id="inventory-stage-candidate-run").run_once()
+    assert completed["status"] == "COMPLETED", completed
+
+    detail = client.get(f"/api/v1/bug-bounty/tasks/{handoff.json()['task_id']}")
+    assert detail.status_code == 200, detail.text
+    payload = detail.json()
+    run = payload["run"]
+    candidates = [
+        step for step in run["plan"]
+        if step.get("action") == "passive_inventory_candidate"
+    ]
+    assert {step["path"] for step in candidates} == {
+        "/api/v1/orders", "/admin", "/api/v1/users", "/next/path",
+    }
+    assert all(step["method"] == "UNKNOWN" and step["active"] is False for step in candidates)
+    assert all(step["provenance"]["source_stage_id"] == inventory_id for step in candidates)
+    assert all(step["confidence"] == 0.2 for step in candidates)
+    assert "/must-remain-provenance-only" not in json.dumps(run)
+    assert "/must-not-be-consumed" not in json.dumps(run)
+    assert "external.invalid" not in json.dumps(run)
+    assert "do-not-leak" not in json.dumps(payload)
+    assert "research_inventory_stage_invalid_or_not_local" in run["limitations"]
+    assert run["findings"] == []
+    assert [ref["stage_id"] for ref in run["research_stage_refs"]] == [
+        inventory_id, passive_id, networked_inventory_id,
+    ]
     store.close()
