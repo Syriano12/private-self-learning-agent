@@ -11,6 +11,7 @@ from private_agent.core.planning_provenance import UNKNOWN, normalize_plan_versi
 from private_agent.storage import QueueLeaseLost
 from private_agent.tools.contracts import ToolError, ToolResult, contract_errors, validate_schema_value
 from private_agent.tools.research import ToolRegistry
+from private_agent.core.specialists import SpecialistRegistry
 
 
 _SUPPORTED_SCHEMA_TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
@@ -178,10 +179,12 @@ class GenericExecutor:
         security_controller: Any | None = None,
         *,
         lease_store: Any | None = None,
+        specialist_registry: SpecialistRegistry | None = None,
     ) -> None:
         self.tools = tools
         self.security_controller = security_controller
         self.lease_store = lease_store
+        self.specialist_registry = specialist_registry
 
     def execute_plan(
         self,
@@ -316,6 +319,24 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
+        if step.specialist_assignment and (
+            self.specialist_registry is None
+            or not self.specialist_registry.validate_assignment(
+                step.specialist_assignment,
+                tool=tool,
+                objective=step.objective,
+                inputs=step.input,
+            )
+        ):
+            return finish(StepResult.blocked(
+                step.id,
+                step.tool,
+                "specialist_assignment_untrusted",
+                "The server could not revalidate the specialist assignment against the current tool policy",
+                details={"step_id": step.id},
+                metadata=self._timed(base_metadata, started),
+            ))
+
         contract_problems = contract_errors(tool)
         if contract_problems:
             return finish(StepResult.failed(
@@ -395,13 +416,17 @@ class GenericExecutor:
                 metadata=self._timed(base_metadata, started),
             ))
 
-        security_action = None
+        action_kwargs: dict[str, Any] = {
+            "goal": str(execution_context.metadata.get("goal", "")),
+        }
+        if step.specialist_assignment:
+            action_kwargs["specialist_binding"] = step.specialist_assignment
         security_action = trusted_controller.action_for_tool(
             execution_context.task_id,
             step.id,
             tool,
             resolved_input,
-            goal=str(execution_context.metadata.get("goal", "")),
+            **action_kwargs,
         )
         security_decision = trusted_controller.authorize(
             security_action,

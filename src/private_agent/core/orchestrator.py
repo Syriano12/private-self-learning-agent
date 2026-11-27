@@ -25,6 +25,7 @@ from private_agent.core.planning_provenance import (
 from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
+from private_agent.core.specialists import SpecialistRegistry
 from private_agent.core.task_state import (
     MAX_TASK_GOAL_LENGTH,
     StateIntegrityError,
@@ -70,12 +71,16 @@ class Orchestrator:
         learning_memory: LearningMemory | None = None,
         learning_engine: LearningEngine | None = None,
         security_controller: SecurityController | None = None,
+        specialist_registry: SpecialistRegistry | None = None,
         checkpoint_hook: Any | None = None,
         observability: ObservabilityMonitor | None = None,
     ) -> None:
         self.store, self.tools, self.max_attempts = store, tools, max_attempts
         self.approved_permissions = approved_permissions or {"public_read"}
         self.planner = planner or Planner()
+        self.specialist_registry = specialist_registry
+        if isinstance(self.planner, Planner) and specialist_registry is not None:
+            self.planner.specialists = specialist_registry
         self.security = security_controller or SecurityController(store=store)
         if executor is not None:
             raise TypeError("unsupported_executor: production execution owns GenericExecutor")
@@ -83,6 +88,7 @@ class Orchestrator:
             tools,
             security_controller=self.security,
             lease_store=store,
+            specialist_registry=specialist_registry,
         )
         self.verifiers = verifiers or VerifierRegistry()
         self.diagnoser = diagnoser or FailureDiagnoser()
@@ -90,7 +96,13 @@ class Orchestrator:
             max_recovery_attempts=max_attempts if max_recovery_attempts is None else max_recovery_attempts,
             max_attempts_per_step=max_attempts_per_step,
         )
-        self.replanner = replanner or Replanner(getattr(self.planner, "provider", None))
+        self.replanner = replanner or Replanner(
+            getattr(self.planner, "provider", None),
+            specialists=specialist_registry,
+        )
+        if isinstance(self.replanner, Replanner) and specialist_registry is not None:
+            self.replanner.specialists = specialist_registry
+            self.replanner.planner.specialists = specialist_registry
         self.experience_memory = experience_memory or SQLiteExperienceMemory(store)
         self.reflection_memory = reflection_memory or SQLiteReflectionMemory(store)
         self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
@@ -182,13 +194,23 @@ class Orchestrator:
                 return None
         else:
             resolved_input = dict(step.input)
-        action = self.security.action_for_tool(
-            state.task_id,
-            step.id,
-            tool,
-            resolved_input,
-            goal=str(plan.goal),
-        )
+        if step.specialist_assignment:
+            action = self.security.action_for_tool(
+                state.task_id,
+                step.id,
+                tool,
+                resolved_input,
+                goal=str(plan.goal),
+                specialist_binding=step.specialist_assignment,
+            )
+        else:
+            action = self.security.action_for_tool(
+                state.task_id,
+                step.id,
+                tool,
+                resolved_input,
+                goal=str(plan.goal),
+            )
         supplied_approval_ids = approval_ids or {}
         approval_id = (
             supplied_approval_ids.get(step.id)
@@ -413,7 +435,13 @@ class Orchestrator:
             exact_matches: set[str] = set()
 
             def equivalent(left: PlanStep, right: PlanStep) -> bool:
-                return all(
+                left_assignment = {
+                    key: value for key, value in left.specialist_assignment.items() if key != "assignment_id"
+                }
+                right_assignment = {
+                    key: value for key, value in right.specialist_assignment.items() if key != "assignment_id"
+                }
+                return left_assignment == right_assignment and all(
                     getattr(left, name) == getattr(right, name)
                     for name in ("id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "input_bindings")
                 )
@@ -451,6 +479,7 @@ class Orchestrator:
                             }
                             for target, binding in step.input_bindings.items()
                         },
+                        specialist_assignment=dict(step.specialist_assignment),
                     )
                 )
             merged_steps = [step for step, _, _ in previous_completed] + new_steps
@@ -835,6 +864,7 @@ class Orchestrator:
                         step_id=step.id,
                         tool=step.tool,
                         inputs=step.input,
+                        specialist_assignment=step.specialist_assignment,
                     ),
                 )
                 state.context["attempts"] = rounds
@@ -860,6 +890,7 @@ class Orchestrator:
                         step_id=step.id,
                         tool=step.tool,
                         inputs=step.input,
+                        specialist_assignment=step.specialist_assignment,
                     ),
                     execution_status=step_result.status,
                     output=step_result.to_dict(),
@@ -913,6 +944,7 @@ class Orchestrator:
                             step_id=step.id,
                             tool=step.tool,
                             inputs=step.input,
+                            specialist_assignment=step.specialist_assignment,
                         ),
                         observation=outcome.observation.to_dict(),
                         verification=outcome.verification,
@@ -946,6 +978,7 @@ class Orchestrator:
                         step_id=step.id,
                         tool=step.tool,
                         inputs=step.input,
+                        specialist_assignment=step.specialist_assignment,
                     ),
                     observation=outcome.observation.to_dict(),
                     verification=outcome.verification,
@@ -1833,6 +1866,7 @@ class Orchestrator:
                             step_id=step.id,
                             tool=step.tool,
                             inputs=step.input,
+                            specialist_assignment=step.specialist_assignment,
                         ),
                         execution_status="",
                         output=None,
@@ -1861,6 +1895,7 @@ class Orchestrator:
                             step_id=step.id,
                             tool=step.tool,
                             inputs=step.input,
+                            specialist_assignment=step.specialist_assignment,
                         ),
                         execution_status=step_result.status,
                         output=step_result.to_dict(),
@@ -1907,6 +1942,7 @@ class Orchestrator:
                             step_id=step.id,
                             tool=step.tool,
                             inputs=step.input,
+                            specialist_assignment=step.specialist_assignment,
                         ),
                         observation=outcome.observation.to_dict(),
                         verification=outcome.verification,
@@ -1947,6 +1983,7 @@ class Orchestrator:
                         step_id=step.id,
                         tool=step.tool,
                         inputs=step.input,
+                        specialist_assignment=step.specialist_assignment,
                     ),
                     observation=outcome.observation.to_dict(),
                     verification=outcome.verification,
@@ -2188,7 +2225,7 @@ class Orchestrator:
     def _plan_from_payload(self, payload: dict[str, Any]) -> TaskPlan:
         if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
             raise StateIntegrityError("persisted_plan_missing")
-        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output", "input_bindings"}
+        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output", "input_bindings", "specialist_assignment"}
         steps = []
         for raw in payload["steps"]:
             if not isinstance(raw, dict) or not set(raw).issubset(allowed):
@@ -2199,6 +2236,7 @@ class Orchestrator:
                     reason=raw.get("reason", ""), depends_on=list(raw.get("depends_on", [])), verifier=raw.get("verifier", ""),
                     success_criteria=dict(raw.get("success_criteria", {})), status=raw.get("status", "pending"), output=dict(raw.get("output", {})),
                     input_bindings={key: dict(value) for key, value in raw.get("input_bindings", {}).items()},
+                    specialist_assignment=dict(raw.get("specialist_assignment", {})),
                 )
             )
         if not steps:
