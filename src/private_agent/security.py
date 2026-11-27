@@ -2620,7 +2620,24 @@ class SecurityController:
                 # an approval for this incomplete, raw plan input.
                 continue
             tool = tools.get(step.tool)
-            action = self.action_for_tool(task_id, step.id, tool, step.input, goal=str(plan.goal))
+            specialist_binding = getattr(step, "specialist_assignment", None)
+            if specialist_binding:
+                action = self.action_for_tool(
+                    task_id,
+                    step.id,
+                    tool,
+                    step.input,
+                    goal=str(plan.goal),
+                    specialist_binding=specialist_binding,
+                )
+            else:
+                action = self.action_for_tool(
+                    task_id,
+                    step.id,
+                    tool,
+                    step.input,
+                    goal=str(plan.goal),
+                )
             approval_id = approval_ids.get(step.id) or approval_ids.get(step.tool, "")
             decisions.append(self.preflight(action, approval_id=approval_id))
         return decisions
@@ -2633,6 +2650,7 @@ class SecurityController:
         inputs: dict[str, Any],
         *,
         goal: str = "",
+        specialist_binding: dict[str, Any] | None = None,
     ) -> ActionRequest:
         capabilities = list(getattr(tool, "required_capabilities", []) or [])
         permission = str(getattr(tool, "permission_level", ""))
@@ -2640,6 +2658,11 @@ class SecurityController:
             capabilities.append("WRITE_WORKSPACE")
         declared_value = getattr(tool, "declared_capabilities", None)
         declared = list(capabilities) if declared_value is None else list(declared_value)
+        bound_input = (
+            inputs
+            if not specialist_binding
+            else {"inputs": inputs, "specialist_assignment": specialist_binding}
+        )
         return ActionRequest(
             task_id=task_id,
             action_id=action_id,
@@ -2652,7 +2675,7 @@ class SecurityController:
             filesystem_required=bool(getattr(tool, "filesystem_required", False)),
             reason=f"Execute registered tool {getattr(tool, 'name', tool.__class__.__name__)}",
             planned_effect=str(getattr(tool, "planned_effect", "Registered tool execution")),
-            input_fingerprint=input_fingerprint(inputs),
+            input_fingerprint=input_fingerprint(bound_input),
             action_type="tool_execution",
             goal=goal,
         )

@@ -159,15 +159,23 @@ def _contains_redacted(value: Any) -> bool:
     return isinstance(value, str) and "[REDACTED]" in value
 
 
-def action_fingerprint(*, plan_version: int, step_id: str, tool: str, inputs: dict[str, Any]) -> str:
-    return canonical_fingerprint(
-        {
-            "plan_version": int(plan_version),
-            "step_id": step_id,
-            "tool": tool,
-            "input": inputs,
-        }
-    )
+def action_fingerprint(
+    *,
+    plan_version: int,
+    step_id: str,
+    tool: str,
+    inputs: dict[str, Any],
+    specialist_assignment: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "plan_version": int(plan_version),
+        "step_id": step_id,
+        "tool": tool,
+        "input": inputs,
+    }
+    if specialist_assignment:
+        payload["specialist_assignment"] = specialist_assignment
+    return canonical_fingerprint(payload)
 
 
 def plan_actions(plan: dict[str, Any], plan_version: int) -> list[str]:
@@ -180,7 +188,18 @@ def plan_actions(plan: dict[str, Any], plan_version: int) -> list[str]:
         inputs = raw.get("input")
         if not isinstance(step_id, str) or not step_id or not isinstance(tool, str) or not isinstance(inputs, dict):
             raise StateIntegrityError("plan_step_missing_identity")
-        actions.append(action_fingerprint(plan_version=plan_version, step_id=step_id, tool=tool, inputs=inputs))
+        assignment = raw.get("specialist_assignment", {})
+        if not isinstance(assignment, dict):
+            raise StateIntegrityError("plan_step_specialist_assignment_invalid")
+        actions.append(
+            action_fingerprint(
+                plan_version=plan_version,
+                step_id=step_id,
+                tool=tool,
+                inputs=inputs,
+                specialist_assignment=assignment,
+            )
+        )
     return actions
 
 
@@ -412,6 +431,7 @@ class TaskState:
             step_id=str(step.id),
             tool=str(step.tool),
             inputs=dict(step.input),
+            specialist_assignment=getattr(step, "specialist_assignment", None),
         )
 
     def action_record(self, key: str) -> dict[str, Any]:
@@ -546,6 +566,7 @@ class TaskState:
                 step_id=raw["id"],
                 tool=raw["tool"],
                 inputs=raw["input"],
+                specialist_assignment=raw.get("specialist_assignment"),
             )
             if key not in completed:
                 result.append(raw)

@@ -2977,15 +2977,18 @@ def build_orchestrator(*, database_path: str | None = None) -> Orchestrator:
     from private_agent.tools.repository import register_repository_tools
 
     register_repository_tools(registry)
+    from private_agent.core.specialists import SpecialistRegistry
+
+    specialist_registry = SpecialistRegistry.for_local_repository_tools(registry)
     planner = None
     if os.getenv("GEMINI_API_KEY", "").strip():
         from private_agent.core.planner import Planner
 
-        planner = Planner(build_provider())
+        planner = Planner(build_provider(), specialists=specialist_registry)
     else:
         from private_agent.core.planner import Planner
 
-        planner = Planner()
+        planner = Planner(specialists=specialist_registry)
     return Orchestrator(
         store,
         registry,
@@ -2995,6 +2998,7 @@ def build_orchestrator(*, database_path: str | None = None) -> Orchestrator:
         # private_write tools remain excluded from the default permission set.
         approved_permissions={"public_read", "isolated_write"},
         security_controller=SecurityController(store=store),
+        specialist_registry=specialist_registry,
     )
 
 
