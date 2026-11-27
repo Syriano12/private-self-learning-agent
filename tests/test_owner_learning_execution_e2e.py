@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
-
 from private_agent.api import AgentAPIService, build_api_service, create_app
-from private_agent.auth import AuthManager
+from private_agent.auth import AuthManager, ROLE_OPERATOR
+from private_agent.core.knowledge import KnowledgeClaim, KnowledgeConflict
 from private_agent.core.observation import Observation
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import Planner
@@ -126,7 +126,8 @@ class FixtureASTVerifier:
                 expected_call_line = int(node.lineno)
                 break
 
-        findings = output.get("findings") if isinstance(output.get("findings"), list) else []
+        raw_findings = output.get("findings")
+        findings: list[Any] = raw_findings if isinstance(raw_findings, list) else []
         matching_findings = [
             item for item in findings
             if isinstance(item, dict)
@@ -141,7 +142,11 @@ class FixtureASTVerifier:
             and ref.get("sha256") == digest
             and ref.get("line_start") == expected_call_line
             for finding in matching_findings
-            for ref in finding.get("evidence_refs", [])
+            for ref in (
+                finding["evidence_refs"]
+                if isinstance(finding.get("evidence_refs"), list)
+                else []
+            )
         )
         passed = (
             observed_bad_call
@@ -196,6 +201,7 @@ class FixtureVerificationPlanner(Planner):
         retrieved_experiences: list[dict[str, Any]] | None = None,
         reflection_insights: list[dict[str, Any]] | None = None,
         learned_strategies: list[dict[str, Any]] | None = None,
+        task_id: str = "",
     ):
         plan = super().create(
             goal,
@@ -206,6 +212,7 @@ class FixtureVerificationPlanner(Planner):
             retrieved_experiences=retrieved_experiences,
             reflection_insights=reflection_insights,
             learned_strategies=learned_strategies,
+            task_id=task_id,
         )
         if plan.steps and plan.steps[0].tool == "investigate_repository_bug":
             plan.steps[0].verifier = FixtureASTVerifier.name
@@ -225,10 +232,11 @@ def _local_registry(repository_root: Path, repository_name: str = "sample/orders
 def _assert_invalid_memory_does_not_select_investigator(
     planner: Planner,
     registry: ToolRegistry,
-    claim: dict[str, Any],
+    claim: dict[str, Any] | list[dict[str, Any]],
     permissions: dict[str, str],
 ) -> None:
-    plan = planner.create(FUTURE_GOAL, registry, [claim], permissions=permissions)
+    claims = [claim] if isinstance(claim, dict) else claim
+    plan = planner.create(FUTURE_GOAL, registry, claims, permissions=permissions)
     assert plan.steps[0].tool == "inspect_repository_structure"
 
 
@@ -251,7 +259,13 @@ def test_owner_reviewed_knowledge_changes_future_local_plan_after_database_reope
 
     # Stage 1: real authenticated owner review through the existing API and worker.
     first_service = build_api_service(token=None, database_path=str(database))
-    AuthManager(first_service.store).initialize_owner(OWNER_EMAIL, OWNER_PASSWORD)
+    owner_user = AuthManager(first_service.store).initialize_owner(OWNER_EMAIL, OWNER_PASSWORD)
+    other_user = AuthManager(first_service.store).create_user(
+        "owner-learning-other@example.test",
+        "owner-learning-other-password-123",
+        ROLE_OPERATOR,
+        actor_user_id=owner_user.user_id,
+    )
     first_worker = BackgroundWorker(
         first_service.orchestrator,
         worker_id="owner-learning-source",
@@ -476,5 +490,88 @@ def test_owner_reviewed_knowledge_changes_future_local_plan_after_database_reope
             if expected_decision == "REQUIRE_APPROVAL":
                 assert guarded_result["approval_requests"]
                 assert guarded_result["approval_requests"][0]["status"] == "PENDING"
+
+        # Read-path negative controls: the real SQLite retrieval boundary must
+        # keep owner-bound, stale, and conflicted claims from steering planning.
+        ownerless_task_id = reopened.create_queued_task(FUTURE_GOAL)["task_id"]
+        other_owner_task_id = reopened.create_queued_task(
+            FUTURE_GOAL, owner_user_id=other_user.user_id
+        )["task_id"]
+        for task_id in (ownerless_task_id, other_owner_task_id):
+            rejected_claims = reopened.search_knowledge_claims(FUTURE_GOAL, task_id=task_id)
+            assert rejected_claims == []
+            _assert_invalid_memory_does_not_select_investigator(
+                Planner(), registry, rejected_claims, permissions
+            )
+
+        stale_claims = reopened.search_knowledge_claims(
+            FUTURE_GOAL,
+            task_id=future_task_id,
+            as_of=(datetime.now(timezone.utc) + timedelta(days=31)).isoformat(),
+        )
+        assert stale_claims == []
+        _assert_invalid_memory_does_not_select_investigator(
+            Planner(), registry, stale_claims, permissions
+        )
+
+        evidence_rows = reopened.list_knowledge_evidence(claim["claim_id"])
+        assert evidence_rows
+        contradictory_claim = reopened.save_knowledge_claim(KnowledgeClaim(
+            claim_id="claim-owner-learning-e2e-contradiction",
+            domain="cybersecurity.bugbounty",
+            subject="owner-refuted IDOR/BOLA fixture",
+            predicate="contradicts",
+            object_text="A local owner review rejected the IDOR/BOLA claim",
+            knowledge_type="reviewed_security_finding",
+        ))
+        conflict_id = "conflict-owner-learning-e2e"
+        reopened.save_knowledge_conflict(KnowledgeConflict(
+            conflict_id=conflict_id,
+            claim_id=claim["claim_id"],
+            conflicting_claim_id=contradictory_claim.claim_id,
+            conflict_type="owner_refutation",
+            evidence_ids=[evidence_rows[0]["evidence_id"]],
+        ))
+        saved_conflicts = reopened.list_knowledge_conflicts(claim["claim_id"])
+        assert any(
+            item["conflict_id"] == conflict_id and item["status"] == "OPEN"
+            for item in saved_conflicts
+        )
+        inactive_claims = reopened.search_knowledge_claims(
+            FUTURE_GOAL, task_id=future_task_id, include_unverified=True
+        )
+        inactive_claim = next(
+            (item for item in inactive_claims if item["claim_id"] == claim["claim_id"]),
+            None,
+        )
+        assert inactive_claim is not None
+        assert inactive_claim["is_active"] is False
+        assert conflict_id in inactive_claim["conflict_suppression_ids"]
+
+        # Conflict persistence and its signed suppression survive another reopen.
+        reopened.close()
+        reopened = Store(database, knowledge_attestation_key=ATTESTATION_KEY.encode("utf-8"))
+        reopened_conflicts = reopened.list_knowledge_conflicts(claim["claim_id"])
+        assert any(
+            item["conflict_id"] == conflict_id and item["status"] == "OPEN"
+            for item in reopened_conflicts
+        )
+        reopened_inactive_claims = reopened.search_knowledge_claims(
+            FUTURE_GOAL, task_id=future_task_id, include_unverified=True
+        )
+        reopened_inactive_claim = next(
+            (item for item in reopened_inactive_claims if item["claim_id"] == claim["claim_id"]),
+            None,
+        )
+        assert reopened_inactive_claim is not None
+        assert reopened_inactive_claim["is_active"] is False
+        assert conflict_id in reopened_inactive_claim["conflict_suppression_ids"]
+        conflicted_claims = reopened.search_knowledge_claims(
+            FUTURE_GOAL, task_id=future_task_id
+        )
+        assert conflicted_claims == []
+        _assert_invalid_memory_does_not_select_investigator(
+            Planner(), registry, conflicted_claims, permissions
+        )
     finally:
         reopened.close()
