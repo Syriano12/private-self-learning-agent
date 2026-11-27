@@ -70,8 +70,34 @@ class PassiveRecon:
     MAX_URL_INPUTS = 100
     MAX_SOURCE_DOCUMENTS = 50
     MAX_SOURCE_BYTES = 2_000_000
+    MAX_RESEARCH_STAGE_RESULTS = 4
+    MAX_RESEARCH_STAGE_ENDPOINTS = 100
     _URL_RE = re.compile(r"https?://[A-Za-z0-9._:-]{1,255}(?:/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%{}-]*)?")
     _ROUTE_RE = re.compile(r"(?:app|router|route)\.(?:get|post|put|patch|delete)\(['\"]([^'\"]+)")
+
+    @staticmethod
+    def _inventory_candidate_path(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+            return None
+        candidate = value.strip()
+        if any(ord(char) < 32 for char in candidate):
+            return None
+        if candidate.startswith(("http://", "https://")):
+            try:
+                parsed = urlparse(candidate)
+            except ValueError:
+                return None
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(char.isspace() for char in parsed.hostname):
+                return None
+            candidate = parsed.path or "/"
+        elif " " in candidate:
+            method, candidate = candidate.split(None, 1)
+            if method.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"}:
+                return None
+        path = candidate.split("?", 1)[0].split("#", 1)[0]
+        if not path.startswith("/") or len(path) > 512 or any(ord(char) < 32 for char in path):
+            return None
+        return path
 
     def analyze(
         self,
@@ -80,6 +106,7 @@ class PassiveRecon:
         openapi: Mapping[str, Any] | None = None,
         source_documents: Mapping[str, str] | None = None,
         fixture: DeterministicFixtureApp | None = None,
+        research_stage_results: Sequence[Mapping[str, Any]] = (),
     ) -> AttackSurfaceInventory:
         assets: set[str] = set()
         endpoints: list[dict[str, Any]] = []
@@ -106,6 +133,82 @@ class PassiveRecon:
             asset = parsed.hostname.lower()
             endpoints.append({"method": "GET", "path": parsed.path or "/", "source": "supplied_url", "asset": asset})
             add("url", raw, asset, {"method": "GET", "path": parsed.path or "/"}, 0.8)
+
+        stage_endpoint_count = 0
+        if len(research_stage_results) > self.MAX_RESEARCH_STAGE_RESULTS:
+            limitations.append("research_inventory_stage_result_limit_reached")
+        for stage_source in research_stage_results[:self.MAX_RESEARCH_STAGE_RESULTS]:
+            if not isinstance(stage_source, Mapping) or stage_source.get("stage_type") != "INVENTORY":
+                continue
+            stage_id = stage_source.get("stage_id")
+            result_digest = stage_source.get("result_sha256")
+            result = stage_source.get("result")
+            if (
+                not isinstance(stage_id, str) or not stage_id or len(stage_id) > 128
+                or not isinstance(result_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", result_digest)
+                or not isinstance(result, Mapping) or result.get("kind") != "LOCAL_INVENTORY"
+                or result.get("network_accessed") is not False
+            ):
+                limitations.append("research_inventory_stage_invalid_or_not_local")
+                continue
+            stage_entries: list[tuple[str, str]] = []
+            malformed_collection = False
+            for field_name in ("endpoints", "urls_observed"):
+                entries = result.get(field_name, [])
+                if not isinstance(entries, list):
+                    malformed_collection = True
+                    break
+                if len(entries) > self.MAX_RESEARCH_STAGE_ENDPOINTS:
+                    limitations.append("research_inventory_endpoint_limit_reached")
+                stage_entries.extend((field_name, entry) for entry in entries[:self.MAX_RESEARCH_STAGE_ENDPOINTS]
+                                     if isinstance(entry, str))
+                if any(not isinstance(entry, str) for entry in entries[:self.MAX_RESEARCH_STAGE_ENDPOINTS]):
+                    limitations.append("research_inventory_non_text_candidate_ignored")
+            if malformed_collection:
+                limitations.append("research_inventory_stage_shape_invalid")
+                continue
+            if len(stage_entries) > self.MAX_RESEARCH_STAGE_ENDPOINTS:
+                stage_entries = stage_entries[:self.MAX_RESEARCH_STAGE_ENDPOINTS]
+                limitations.append("research_inventory_endpoint_limit_reached")
+            seen_stage_paths: set[str] = set()
+            for field_name, raw_candidate in stage_entries:
+                if stage_endpoint_count >= self.MAX_RESEARCH_STAGE_ENDPOINTS:
+                    limitations.append("research_inventory_endpoint_limit_reached")
+                    break
+                path = self._inventory_candidate_path(raw_candidate)
+                if path is None:
+                    limitations.append("research_inventory_invalid_path_ignored")
+                    continue
+                if path in seen_stage_paths:
+                    continue
+                seen_stage_paths.add(path)
+                stage_endpoint_count += 1
+                provenance = {
+                    "mode": "passive",
+                    "source": "completed_local_inventory_stage",
+                    "source_stage_id": stage_id,
+                    "result_sha256": result_digest,
+                    "source_field": field_name,
+                    "trust": "unverified_candidate",
+                }
+                endpoint = {
+                    "method": "UNKNOWN",
+                    "path": path,
+                    "asset": "",
+                    "source": "research_stage_inventory",
+                    "candidate_only": True,
+                    "confidence": 0.2,
+                    "provenance": provenance,
+                }
+                endpoints.append(endpoint)
+                add(
+                    "research_stage_route_candidate",
+                    "research_stage_inventory",
+                    "",
+                    {"path": path, "trust": "unverified_candidate", "source_stage_id": stage_id,
+                     "result_sha256": result_digest, "source_field": field_name},
+                    0.2,
+                )
 
         if openapi is not None:
             paths = openapi.get("paths") if isinstance(openapi, Mapping) else None
@@ -177,16 +280,20 @@ class DeterministicPlanner:
         plan: list[dict[str, Any]] = []
         for index, endpoint in enumerate(inventory.endpoints[:100], start=1):
             method = str(endpoint.get("method", "GET"))
-            plan.append({
+            step = {
                 "step_id": f"plan-{index:03d}",
-                "action": "passive_inventory" if method == "UNKNOWN" else "authorization_matrix_candidate",
+                "action": "passive_inventory_candidate" if endpoint.get("candidate_only") else "passive_inventory" if method == "UNKNOWN" else "authorization_matrix_candidate",
                 "method": method,
                 "path": str(endpoint.get("path", "")),
                 "asset": str(endpoint.get("asset", "")),
                 "authorization_required": True,
-                "active": method in {"GET", "HEAD", "OPTIONS"} and scope.active_testing,
-                "reason": "deterministic plan from supplied evidence; no unbounded scan",
-            })
+                "active": False if endpoint.get("candidate_only") else method in {"GET", "HEAD", "OPTIONS"} and scope.active_testing,
+                "reason": "unverified local inventory candidate; not authorization and never an active request" if endpoint.get("candidate_only") else "deterministic plan from supplied evidence; no unbounded scan",
+            }
+            if endpoint.get("candidate_only"):
+                step["confidence"] = endpoint.get("confidence", 0.2)
+                step["provenance"] = endpoint.get("provenance", {})
+            plan.append(step)
         return plan
 
 

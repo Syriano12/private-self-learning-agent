@@ -245,6 +245,51 @@ class ResearchStageRepository:
                 )
         return references
 
+    def resolve_execution_results(
+        self,
+        analysis_id: str,
+        *,
+        owner_user_id: str | None,
+        source_stage_refs: Any,
+    ) -> list[dict[str, Any]]:
+        """Return bounded, digest-verified results for server-side analysis only."""
+        if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+            raise ValueError("execution_source_owner_required")
+        owner = owner_user_id.strip()
+        references = normalize_execution_stage_refs(source_stage_refs)
+        resolved: list[dict[str, Any]] = []
+        total_bytes = 0
+        with self.store._db_lock:
+            for ref in references:
+                row = self.store.db.execute(
+                    "SELECT stage_id, analysis_id, owner_user_id, stage_type, stage_status, result_json "
+                    "FROM bugbounty_research_stages WHERE stage_id = ?",
+                    (ref["stage_id"],),
+                ).fetchone()
+                stage_id, stage_type, result_json = self._verified_report_source_json(
+                    row, analysis_id=analysis_id, owner_user_id=owner, ref=ref
+                )
+                if stage_type != ResearchStageType.INVENTORY.value:
+                    resolved.append({
+                        "stage_id": stage_id,
+                        "stage_type": stage_type,
+                        "result_sha256": ref["result_sha256"],
+                        "result": None,
+                    })
+                    continue
+                result_bytes = len(result_json.encode("utf-8"))
+                total_bytes += result_bytes
+                if result_bytes > MAX_STAGE_RESULT_BYTES or total_bytes > MAX_STAGE_RESULT_BYTES * 4:
+                    raise ValueError("execution_source_results_too_large")
+                result = json.loads(result_json)
+                resolved.append({
+                    "stage_id": stage_id,
+                    "stage_type": stage_type,
+                    "result_sha256": ref["result_sha256"],
+                    "result": safe_json(result),
+                })
+        return resolved
+
     @staticmethod
     def _row_to_stage(row: Any) -> ResearchStage:
         input_payload = json.loads(row["input_json"]) if "input_json" in row.keys() else {}

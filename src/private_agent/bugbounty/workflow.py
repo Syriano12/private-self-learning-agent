@@ -227,6 +227,7 @@ class BugBountyAgent:
         openapi: Mapping[str, Any] | None = None,
         source_documents: Mapping[str, str] | None = None,
         research_stage_refs: list[dict[str, str]] | None = None,
+        research_stage_results: list[dict[str, Any]] | None = None,
         mode: str = "deterministic",
         persist: bool = True,
     ) -> BugBountyRun:
@@ -235,7 +236,10 @@ class BugBountyAgent:
         normalized_stage_refs = normalize_execution_stage_refs(research_stage_refs or [])
         scope = ScopeDefinition.from_dict(scope_payload)
         fixture = DeterministicFixtureApp(fixture_variant) if fixture_variant else None
-        inventory = self.recon.analyze(urls=urls, openapi=openapi, source_documents=source_documents, fixture=fixture)
+        inventory = self.recon.analyze(
+            urls=urls, openapi=openapi, source_documents=source_documents, fixture=fixture,
+            research_stage_results=research_stage_results or (),
+        )
         plan = self.planner.build(inventory, scope)
         findings = []
         tests = []
@@ -250,7 +254,14 @@ class BugBountyAgent:
                 limitations.append("active_fixture_testing_not_run_without_explicit_active_scope")
         if source_documents:
             findings.extend(self.static_analyzer.analyze(source_documents, scope.authorization_reference))
-        if not fixture and not source_documents and not urls and openapi is None:
+        has_local_stage_result = any(
+            isinstance(item, Mapping)
+            and item.get("stage_type") == "INVENTORY"
+            and isinstance(item.get("result"), Mapping)
+            and item["result"].get("kind") == "LOCAL_INVENTORY"
+            for item in (research_stage_results or [])
+        )
+        if not fixture and not source_documents and not urls and openapi is None and not has_local_stage_result:
             limitations.append("no_local_target_artifact_or_fixture_supplied")
         for finding in findings:
             if finding.state in {FindingState.CONFIRMED, FindingState.REPORT_READY, FindingState.HUMAN_REVIEWED}:
@@ -347,9 +358,28 @@ def markdown_report(run: BugBountyRun) -> str:
         lines.extend([
             "## Supporting research-stage provenance",
             "",
-            "These digest-bound references document owner-selected completed stages. Their claims are not promoted to findings or authorization, and raw stage results are not copied into this run.",
+            "These digest-bound references document owner-selected completed stages. Only validated local INVENTORY routes are consumed as low-confidence UNKNOWN-method candidates; every other stage remains provenance-only. No stage claim grants authorization or confirms a vulnerability, and raw stage results are not copied into this run.",
             "",
             *[f"- `{ref['stage_type']}` `{ref['stage_id']}` result sha256=`{ref['result_sha256']}`" for ref in run.research_stage_refs],
+            "",
+        ])
+    candidate_steps = [
+        step for step in run.plan
+        if isinstance(step, Mapping)
+        and isinstance(step.get("provenance"), Mapping)
+        and step["provenance"].get("source") == "completed_local_inventory_stage"
+    ]
+    if candidate_steps:
+        lines.extend([
+            "## Unverified inventory-stage route candidates",
+            "",
+            "These paths came from sanitized local artifacts. They are passive observations only: method and target are unresolved, active requests are disabled, and they do not establish scope or a finding.",
+            "",
+            *[
+                f"- `{step['path']}` from stage `{step['provenance'].get('source_stage_id', '')}` "
+                f"(sha256=`{step['provenance'].get('result_sha256', '')}`, confidence={step.get('confidence', 0.2):.2f})"
+                for step in candidate_steps[:100]
+            ],
             "",
         ])
     lines.extend(["## Plan", "", "```json", json.dumps(run.plan, ensure_ascii=False, indent=2), "```", "", "## Limitations", "", *[f"- {item}" for item in run.limitations], ""])
