@@ -228,6 +228,7 @@ class BugBountyAgent:
         source_documents: Mapping[str, str] | None = None,
         research_stage_refs: list[dict[str, str]] | None = None,
         research_stage_results: list[dict[str, Any]] | None = None,
+        learned_review_advisories: list[dict[str, Any]] | None = None,
         mode: str = "deterministic",
         persist: bool = True,
     ) -> BugBountyRun:
@@ -240,7 +241,14 @@ class BugBountyAgent:
             urls=urls, openapi=openapi, source_documents=source_documents, fixture=fixture,
             research_stage_results=research_stage_results or (),
         )
-        plan = self.planner.build(inventory, scope)
+        if learned_review_advisories:
+            plan = self.planner.build(
+                inventory,
+                scope,
+                learned_review_advisories=learned_review_advisories,
+            )
+        else:
+            plan = self.planner.build(inventory, scope)
         findings = []
         tests = []
         limitations = list(inventory.limitations)
@@ -277,7 +285,24 @@ class BugBountyAgent:
             "observation_ids": [item["observation_id"] for item in inventory_payload["observations"][:25]],
             "limitations": inventory_payload["limitations"][:25],
         }
-        run_id = "RUN-" + stable_digest({"scope": scope.to_dict(), "mode": mode, "fixture": fixture_variant, "inventory": run_identity_inventory, "research_stage_refs": normalized_stage_refs})[:16].upper()
+        learned_strategy_ids = sorted({
+            str(step["provenance"]["strategy_id"])
+            for step in plan
+            if isinstance(step, Mapping)
+            and isinstance(step.get("provenance"), Mapping)
+            and step["provenance"].get("source") == "fresh_owner_reviewed_evidence"
+            and isinstance(step["provenance"].get("strategy_id"), str)
+        })
+        run_identity = {
+            "scope": scope.to_dict(),
+            "mode": mode,
+            "fixture": fixture_variant,
+            "inventory": run_identity_inventory,
+            "research_stage_refs": normalized_stage_refs,
+        }
+        if learned_strategy_ids:
+            run_identity["learned_strategy_ids"] = learned_strategy_ids
+        run_id = "RUN-" + stable_digest(run_identity)[:16].upper()
         run = BugBountyRun(
             run_id, scope, status, mode, inventory_payload, plan, findings, tests,
             sorted(set(limitations)), research_stage_refs=normalized_stage_refs,

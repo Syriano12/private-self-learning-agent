@@ -217,7 +217,8 @@ class PassiveRecon:
                 server_url = ""
                 if isinstance(servers, list) and servers and isinstance(servers[0], Mapping):
                     server_url = str(servers[0].get("url", ""))
-                server_host = urlparse(server_url).hostname.lower() if urlparse(server_url).hostname else "fixture.local"
+                hostname = urlparse(server_url).hostname
+                server_host = hostname.lower() if hostname else "fixture.local"
                 for path_index, (path, operations) in enumerate(paths.items()):
                     if path_index >= 500:
                         limitations.append("openapi_path_limit_reached")
@@ -228,7 +229,12 @@ class PassiveRecon:
                         method_upper = str(method).upper()
                         if method_upper not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
                             continue
-                        entry = {"method": method_upper, "path": path, "asset": server_host, "source": "openapi"}
+                        entry: dict[str, Any] = {
+                            "method": method_upper,
+                            "path": path,
+                            "asset": server_host,
+                            "source": "openapi",
+                        }
                         if isinstance(operation, Mapping):
                             entry["operation_id"] = str(operation.get("operationId", ""))[:256]
                             entry["security"] = bool(operation.get("security"))
@@ -276,7 +282,13 @@ class PassiveRecon:
 class DeterministicPlanner:
     """No-LLM planner used for reproducible local evaluation."""
 
-    def build(self, inventory: AttackSurfaceInventory, scope: ScopeDefinition) -> list[dict[str, Any]]:
+    def build(
+        self,
+        inventory: AttackSurfaceInventory,
+        scope: ScopeDefinition,
+        *,
+        learned_review_advisories: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         plan: list[dict[str, Any]] = []
         for index, endpoint in enumerate(inventory.endpoints[:100], start=1):
             method = str(endpoint.get("method", "GET"))
@@ -294,6 +306,60 @@ class DeterministicPlanner:
                 step["confidence"] = endpoint.get("confidence", 0.2)
                 step["provenance"] = endpoint.get("provenance", {})
             plan.append(step)
+        seen_strategies: set[str] = set()
+        for advisory in (learned_review_advisories or [])[:5]:
+            if not isinstance(advisory, dict):
+                continue
+            strategy_id = advisory.get("strategy_id")
+            vulnerability_class = advisory.get("vulnerability_class")
+            review_id = advisory.get("review_id")
+            finding_id = advisory.get("finding_id")
+            evidence_sha256 = advisory.get("evidence_sha256")
+            confidence = advisory.get("confidence")
+            if (
+                not isinstance(strategy_id, str)
+                or not strategy_id.startswith("strategy-")
+                or strategy_id in seen_strategies
+                or not isinstance(vulnerability_class, str)
+                or not vulnerability_class
+                or len(vulnerability_class) > 256
+                or not isinstance(review_id, str)
+                or not review_id
+                or not isinstance(finding_id, str)
+                or not finding_id
+                or not isinstance(evidence_sha256, str)
+                or len(evidence_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in evidence_sha256)
+                or not isinstance(confidence, (int, float))
+                or isinstance(confidence, bool)
+                or not 0.70 <= float(confidence) <= 1.0
+                or advisory.get("requirement") != "prioritize_owner_review_before_confirmation"
+                or advisory.get("non_authoritative") is not True
+            ):
+                continue
+            seen_strategies.add(strategy_id)
+            plan.append(
+                {
+                    "step_id": f"learned-owner-review-{strategy_id.removeprefix('strategy-')}",
+                    "action": "prioritize_owner_review_before_confirmation",
+                    "vulnerability_class": vulnerability_class,
+                    "active": False,
+                    "external_access": False,
+                    "non_executable": True,
+                    "non_authoritative": True,
+                    "provenance": {
+                        "source": "fresh_owner_reviewed_evidence",
+                        "strategy_id": strategy_id,
+                        "review_id": review_id,
+                        "finding_id": finding_id,
+                        "evidence_sha256": evidence_sha256,
+                    },
+                    "reason": (
+                        "Recent owner-reviewed verified evidence recommends prioritizing the existing "
+                        "owner-review gate; memory does not authorize testing or verify a new finding."
+                    ),
+                }
+            )
         return plan
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -114,6 +115,8 @@ class SQLiteLearningMemory(LearningMemory):
                 or self._has_revalidated_owner_review_support(strategy, owner_user_id=owner_user_id)
             ):
                 continue
+            if self._has_revalidated_owner_review_conflict(strategy, owner_user_id=owner_user_id):
+                continue
             score = self._score(context, strategy)
             if score >= self.min_relevance:
                 candidates.append((score, strategy))
@@ -139,6 +142,7 @@ class SQLiteLearningMemory(LearningMemory):
                 self._has_revalidated_recovery_support(strategy, owner_user_id=owner_user_id)
                 or self._has_revalidated_owner_review_support(strategy, owner_user_id=owner_user_id)
             )
+            or self._has_revalidated_owner_review_conflict(strategy, owner_user_id=owner_user_id)
             or self._score(context, strategy) < self.min_relevance
         ):
             return None
@@ -400,6 +404,70 @@ class SQLiteLearningMemory(LearningMemory):
             return False
         age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
         return -300 <= age <= self.max_support_age_seconds
+
+    def _has_revalidated_owner_review_conflict(
+        self, strategy: LearnedStrategy, *, owner_user_id: str | None = None,
+    ) -> bool:
+        """Suppress positive Bug Bounty guidance when this owner has a fresh contrary review.
+
+        A conflicting review only suppresses advisory reuse; it never creates a
+        negative finding or changes verification, authorization, or scope.
+        """
+        condition = strategy.condition if isinstance(strategy.condition, dict) else {}
+        vulnerability_class = condition.get("vulnerability_class")
+        if (
+            owner_user_id is None
+            or condition.get("task_type") != "bug_bounty"
+            or not isinstance(vulnerability_class, str)
+            or not vulnerability_class
+        ):
+            return False
+
+        try:
+            from private_agent.bugbounty.reviews import FindingReviewRepository
+
+            reviews = FindingReviewRepository(self.store_backend)
+            other_strategies = self.list()
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            return True
+
+        now = datetime.now(timezone.utc)
+        for candidate in other_strategies:
+            candidate_condition = candidate.condition if isinstance(candidate.condition, dict) else {}
+            metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+            decision = candidate_condition.get("review_decision")
+            review_id = metadata.get("review_id")
+            if (
+                candidate.strategy_id == strategy.strategy_id
+                or metadata.get("source_patterns") != ["bugbounty_review_feedback"]
+                or candidate_condition.get("task_type") != "bug_bounty"
+                or candidate_condition.get("vulnerability_class") != vulnerability_class
+                or decision not in {"REFUTE", "INCONCLUSIVE", "DUPLICATE"}
+                or not isinstance(review_id, str)
+                or not review_id
+            ):
+                continue
+            try:
+                review = reviews.get_by_id(review_id)
+                if (
+                    review is None
+                    or review.decision != decision
+                    or review.owner_user_id != owner_user_id
+                    or review.actor_user_id != owner_user_id
+                    or self.store_backend.task_owner_user_id(review.task_id) != owner_user_id
+                ):
+                    continue
+                timestamp = datetime.fromisoformat(review.created_at.replace("Z", "+00:00"))
+            except sqlite3.Error:
+                return True
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if timestamp.tzinfo is None:
+                continue
+            age = (now - timestamp.astimezone(timezone.utc)).total_seconds()
+            if -300 <= age <= self.max_support_age_seconds:
+                return True
+        return False
 
     def list(self) -> list[LearnedStrategy]:
         strategies: list[LearnedStrategy] = []

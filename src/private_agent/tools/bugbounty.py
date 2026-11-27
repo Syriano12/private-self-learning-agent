@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from private_agent.bugbounty.learning import BugBountyLearningService
 from private_agent.bugbounty.local_evidence import normalize_execution_stage_refs
 from private_agent.bugbounty.research import ResearchStageRepository
 from private_agent.bugbounty.workflow import BugBountyAgent, markdown_report
@@ -101,6 +103,8 @@ class BugBountyAnalysisTool:
         metadata = getattr(context, "metadata", None)
         metadata = metadata if isinstance(metadata, Mapping) else {}
         provenance = metadata.get("program_analysis_provenance")
+        learned_review_advisories: list[dict[str, Any]] = []
+        resolved_stage_sources: list[dict[str, Any]] = []
         verified_stage_refs: list[dict[str, str]] = []
         if provenance is None:
             if provided_stage_refs:
@@ -146,6 +150,22 @@ class BugBountyAnalysisTool:
                     details={"error": str(exc)[:160]},
                     no_side_effects=True,
                 )
+        task_id = getattr(context, "task_id", "")
+        goal = metadata.get("goal")
+        if isinstance(task_id, str) and task_id and isinstance(goal, str) and goal.strip():
+            try:
+                # The task identity comes from ExecutionContext, never tool input.
+                # The learning memory independently resolves the task owner and
+                # revalidates each source review and its evidence digest.
+                if self.store.task_owner_user_id(task_id):
+                    learned_review_advisories = BugBountyLearningService(self.store).planning_advisories(
+                        task_id=task_id,
+                        goal=goal,
+                    )
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                # Learning is optional guidance; any ownership or storage error
+                # disables it without changing the ordinary bounded analysis.
+                learned_review_advisories = []
         # The deterministic run persists evidence; if it raises after beginning,
         # let the executor preserve EXECUTION_UNKNOWN instead of claiming no effect.
         run = BugBountyAgent(store=self.store).run(
@@ -156,6 +176,7 @@ class BugBountyAnalysisTool:
             source_documents=dict(source_documents),
             research_stage_refs=verified_stage_refs,
             research_stage_results=resolved_stage_sources if verified_stage_refs else [],
+            learned_review_advisories=learned_review_advisories,
             mode="deterministic",
             persist=True,
         )
