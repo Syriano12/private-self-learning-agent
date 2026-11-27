@@ -192,6 +192,20 @@ def normalize_report_stage_ids(value: Any) -> list[str]:
     return stage_ids
 
 
+def normalize_execution_stage_ids(value: Any) -> list[str]:
+    """Normalize an optional, owner-selected set of completed-stage IDs."""
+    if not isinstance(value, list) or len(value) > MAX_REPORT_SOURCE_STAGES:
+        raise ValueError("execution_source_stage_ids_invalid")
+    stage_ids: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not _STAGE_ID_RE.fullmatch(raw):
+            raise ValueError("execution_source_stage_id_invalid")
+        if raw in stage_ids:
+            raise ValueError("execution_source_stage_id_duplicate")
+        stage_ids.append(raw)
+    return stage_ids
+
+
 def normalize_report_stage_refs(value: Any) -> list[dict[str, str]]:
     if not isinstance(value, list):
         raise ValueError("report_source_stage_refs_invalid")
@@ -210,6 +224,18 @@ def normalize_report_stage_refs(value: Any) -> list[dict[str, str]]:
             raise ValueError("report_source_result_digest_invalid")
         normalized.append({"stage_id": stage_ids[len(normalized)], "stage_type": stage_type, "result_sha256": digest.lower()})
     return normalized
+
+
+def normalize_execution_stage_refs(value: Any) -> list[dict[str, str]]:
+    """Validate digest-bound execution lineage while permitting no sources."""
+    if not isinstance(value, list) or len(value) > MAX_REPORT_SOURCE_STAGES:
+        raise ValueError("execution_source_stage_refs_invalid")
+    if not value:
+        return []
+    try:
+        return normalize_report_stage_refs(value)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("report_source", "execution_source")) from exc
 
 
 def normalize_research_input(stage_type: str, value: Mapping[str, Any] | None) -> dict[str, Any]:

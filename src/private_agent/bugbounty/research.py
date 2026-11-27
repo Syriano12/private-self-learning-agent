@@ -13,7 +13,12 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Mapping
 
-from .local_evidence import normalize_report_stage_refs, normalize_research_input
+from .local_evidence import (
+    normalize_execution_stage_ids,
+    normalize_execution_stage_refs,
+    normalize_report_stage_refs,
+    normalize_research_input,
+)
 from .models import safe_json, utc_now
 
 
@@ -185,6 +190,60 @@ class ResearchStageRepository:
         if not isinstance(result, Mapping) or result.get("kind") not in expected_kinds:
             raise ValueError("report_source_result_kind_mismatch")
         return stage_id, stage_type, result_json
+
+    def resolve_execution_sources(
+        self,
+        analysis_id: str,
+        *,
+        owner_user_id: str | None,
+        stage_ids: Any,
+    ) -> list[dict[str, str]]:
+        """Bind owner-selected completed stage IDs to current persisted result digests."""
+        if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+            raise ValueError("execution_source_owner_required")
+        owner = owner_user_id.strip()
+        normalized_ids = normalize_execution_stage_ids(stage_ids)
+        references: list[dict[str, str]] = []
+        with self.store._db_lock:
+            for stage_id in normalized_ids:
+                row = self.store.db.execute(
+                    "SELECT stage_id, analysis_id, owner_user_id, stage_type, stage_status, result_json "
+                    "FROM bugbounty_research_stages WHERE stage_id = ?",
+                    (stage_id,),
+                ).fetchone()
+                bound_id, bound_type, result_json = self._verified_report_source_json(
+                    row, analysis_id=analysis_id, owner_user_id=owner
+                )
+                references.append({
+                    "stage_id": bound_id,
+                    "stage_type": bound_type,
+                    "result_sha256": hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
+                })
+        return references
+
+    def verify_execution_sources(
+        self,
+        analysis_id: str,
+        *,
+        owner_user_id: str | None,
+        source_stage_refs: Any,
+    ) -> list[dict[str, str]]:
+        """Fail closed if a handoff's digest-bound stage lineage has changed."""
+        if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+            raise ValueError("execution_source_owner_required")
+        owner = owner_user_id.strip()
+        references = normalize_execution_stage_refs(source_stage_refs)
+        with self.store._db_lock:
+            for ref in references:
+                row = self.store.db.execute(
+                    "SELECT stage_id, analysis_id, owner_user_id, stage_type, stage_status, result_json "
+                    "FROM bugbounty_research_stages WHERE stage_id = ?",
+                    (ref["stage_id"],),
+                ).fetchone()
+                self._verified_report_source_json(
+                    row, analysis_id=analysis_id, owner_user_id=owner, ref=ref
+                )
+        return references
 
     @staticmethod
     def _row_to_stage(row: Any) -> ResearchStage:

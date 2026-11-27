@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from private_agent.bugbounty.local_evidence import normalize_execution_stage_refs
 from private_agent.bugbounty.engines import AttackSurfaceInventory, DeterministicPlanner, IDORBOLAEngine, PassiveRecon, StaticSecurityAnalyzer
 from private_agent.bugbounty.fixtures import DeterministicFixtureApp
 from private_agent.bugbounty.models import BugBountyRun, Finding, FindingState, ScopeDefinition, public_reference, reconcile_bug_bounty_metrics, stable_digest, utc_now, validate_confirmed_evidence
@@ -27,7 +28,7 @@ class BugBountyRepository:
                   run_id TEXT PRIMARY KEY, program_id TEXT NOT NULL, status TEXT NOT NULL,
                   mode TEXT NOT NULL, scope_json TEXT NOT NULL, inventory_json TEXT NOT NULL,
                   plan_json TEXT NOT NULL, metrics_json TEXT NOT NULL, limitations_json TEXT NOT NULL,
-                  created_at TEXT NOT NULL
+                  created_at TEXT NOT NULL, research_stage_refs_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE TABLE IF NOT EXISTS bugbounty_findings (
                   finding_id TEXT NOT NULL, run_id TEXT NOT NULL, state TEXT NOT NULL,
@@ -52,6 +53,8 @@ class BugBountyRepository:
             columns = {str(row["name"]) for row in self.store.db.execute("PRAGMA table_info(bugbounty_runs)").fetchall()}
             if "tests_json" not in columns:
                 self.store.db.execute("ALTER TABLE bugbounty_runs ADD COLUMN tests_json TEXT NOT NULL DEFAULT '[]'")
+            if "research_stage_refs_json" not in columns:
+                self.store.db.execute("ALTER TABLE bugbounty_runs ADD COLUMN research_stage_refs_json TEXT NOT NULL DEFAULT '[]'")
 
     def save(self, run: BugBountyRun) -> None:
         payload = run.to_dict(public=True)
@@ -59,8 +62,8 @@ class BugBountyRepository:
             self.store.db.execute(
                 """INSERT OR REPLACE INTO bugbounty_runs
                    (run_id, program_id, status, mode, scope_json, inventory_json,
-                    plan_json, metrics_json, limitations_json, tests_json, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    plan_json, metrics_json, limitations_json, tests_json, created_at, research_stage_refs_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run.run_id,
                     run.scope.program_id,
@@ -73,6 +76,7 @@ class BugBountyRepository:
                     json.dumps(payload["limitations"], ensure_ascii=False, sort_keys=True),
                     json.dumps(payload["tests"], ensure_ascii=False, sort_keys=True),
                     run.created_at,
+                    json.dumps(payload["research_stage_refs"], ensure_ascii=False, sort_keys=True),
                 ),
             )
             self.store.db.execute("DELETE FROM bugbounty_findings WHERE run_id = ?", (run.run_id,))
@@ -124,6 +128,12 @@ class BugBountyRepository:
         except (TypeError, ValueError):
             parsed_tests = []
         result["tests"] = [item for item in parsed_tests[:100] if isinstance(item, dict)] if isinstance(parsed_tests, list) else []
+        raw_stage_refs = result.pop("research_stage_refs_json", "[]")
+        try:
+            parsed_stage_refs = json.loads(raw_stage_refs)
+            result["research_stage_refs"] = normalize_execution_stage_refs(parsed_stage_refs)
+        except (TypeError, ValueError):
+            result["research_stage_refs"] = []
         loaded_findings: list[dict[str, Any]] = []
         for item in findings:
             raw_finding = json.loads(item["finding_json"])
@@ -216,11 +226,13 @@ class BugBountyAgent:
         urls: tuple[str, ...] = (),
         openapi: Mapping[str, Any] | None = None,
         source_documents: Mapping[str, str] | None = None,
+        research_stage_refs: list[dict[str, str]] | None = None,
         mode: str = "deterministic",
         persist: bool = True,
     ) -> BugBountyRun:
         if mode != "deterministic":
             raise ValueError("only_deterministic_provider_is_available")
+        normalized_stage_refs = normalize_execution_stage_refs(research_stage_refs or [])
         scope = ScopeDefinition.from_dict(scope_payload)
         fixture = DeterministicFixtureApp(fixture_variant) if fixture_variant else None
         inventory = self.recon.analyze(urls=urls, openapi=openapi, source_documents=source_documents, fixture=fixture)
@@ -254,8 +266,11 @@ class BugBountyAgent:
             "observation_ids": [item["observation_id"] for item in inventory_payload["observations"][:25]],
             "limitations": inventory_payload["limitations"][:25],
         }
-        run_id = "RUN-" + stable_digest({"scope": scope.to_dict(), "mode": mode, "fixture": fixture_variant, "inventory": run_identity_inventory})[:16].upper()
-        run = BugBountyRun(run_id, scope, status, mode, inventory_payload, plan, findings, tests, sorted(set(limitations)))
+        run_id = "RUN-" + stable_digest({"scope": scope.to_dict(), "mode": mode, "fixture": fixture_variant, "inventory": run_identity_inventory, "research_stage_refs": normalized_stage_refs})[:16].upper()
+        run = BugBountyRun(
+            run_id, scope, status, mode, inventory_payload, plan, findings, tests,
+            sorted(set(limitations)), research_stage_refs=normalized_stage_refs,
+        )
         if persist and self.store is not None:
             BugBountyRepository(self.store).save(run)
         return run
@@ -326,6 +341,15 @@ def markdown_report(run: BugBountyRun) -> str:
             "#### Limitations",
             "",
             *[f"- {item}" for item in finding.limitations],
+            "",
+        ])
+    if run.research_stage_refs:
+        lines.extend([
+            "## Supporting research-stage provenance",
+            "",
+            "These digest-bound references document owner-selected completed stages. Their claims are not promoted to findings or authorization, and raw stage results are not copied into this run.",
+            "",
+            *[f"- `{ref['stage_type']}` `{ref['stage_id']}` result sha256=`{ref['result_sha256']}`" for ref in run.research_stage_refs],
             "",
         ])
     lines.extend(["## Plan", "", "```json", json.dumps(run.plan, ensure_ascii=False, indent=2), "```", "", "## Limitations", "", *[f"- {item}" for item in run.limitations], ""])
