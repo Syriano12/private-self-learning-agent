@@ -13,6 +13,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
@@ -25,8 +26,28 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from private_agent.core.llm import build_provider
+from private_agent.core.knowledge import (
+    KnowledgeClaim,
+    KnowledgeEvidence,
+    KnowledgeSource,
+    KnowledgeValidationError,
+    sha256_hex,
+)
 from private_agent.core.orchestrator import Orchestrator
-from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH, TASK_STATUSES, StateIntegrityError, TaskState
+from private_agent.core.planning_provenance import (
+    UNKNOWN,
+    normalize_plan_version,
+    normalize_planning_mode,
+    planning_mode_from_plan,
+)
+from private_agent.core.task_state import (
+    MAX_TASK_GOAL_LENGTH,
+    TASK_STATUSES,
+    StateIntegrityError,
+    TaskState,
+    TaskStopReason,
+    TaskStopReasonCode,
+)
 from private_agent.auth import (
     ACTIVE,
     CSRF_COOKIE_NAME,
@@ -41,15 +62,17 @@ from private_agent.auth import (
 )
 from private_agent.bugbounty.models import Finding, FindingState, ScopeDefinition, public_reference, reconcile_bug_bounty_metrics, safe_json, validate_confirmed_evidence
 from private_agent.bugbounty.learning import BugBountyLearningService
-from private_agent.bugbounty.local_evidence import normalize_research_input
-from private_agent.bugbounty.programs import ProgramAnalysisRepository, PublicPolicyRetriever, analyze_program
+from private_agent.bugbounty.local_evidence import normalize_execution_stage_ids, normalize_execution_stage_refs, normalize_research_input
+from private_agent.bugbounty.programs import ProgramAnalysisRepository, PublicPolicyRetriever, analyze_program, scope_proposal_digest
 from private_agent.bugbounty.research import ResearchStageRepository, ResearchStageStatus, ResearchStageType, StageBudget
 from private_agent.bugbounty.reviews import FindingReview, FindingReviewDecision, FindingReviewRepository
 from private_agent.bugbounty.remote_worker import RemoteWorkerProtocol, WorkerAuthentication, WorkerProtocolError
 from private_agent.observability import ObservabilityMonitor, safe_metadata
 from private_agent.security import ApprovalRequest, SecurityController
+from private_agent.skills.lifecycle import CapabilityCandidateAssessor, CapabilityCandidateAssessmentError, SkillCandidate
+from private_agent.skills.registry import SkillRegistry
 from private_agent.skills.runtime_preflight import run_host_preflight
-from private_agent.storage import QueueLeaseLost, Store
+from private_agent.storage import MAX_TASK_MESSAGE_LENGTH, QueueLeaseLost, Store
 from private_agent.bugbounty.trusted_tools import load_tool_spec_from_environment
 from private_agent.tools.research import ToolRegistry
 from private_agent.tools.scanners import HttpxReconTool, NucleiScanTool, build_scanner_limits
@@ -57,7 +80,7 @@ from private_agent.worker import BackgroundWorker
 
 
 API_VERSION = "v1"
-API_SCHEMA_VERSION = 1
+API_SCHEMA_VERSION = 3
 SERVICE_NAME = "private-agent"
 LOGGER = logging.getLogger(__name__)
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -75,6 +98,26 @@ _REDACTED_KEYS = {
     "authorization",
     "credentials",
 }
+_PUBLIC_RECOVERY_REASONS = frozenset({
+    "approval_required", "policy_blocked", "capability_unavailable",
+    "execution_interrupted_before_verified_result", "worker_lease_expired",
+    "worker_execution_interrupted", "ambiguous_execution_state_invalid_action_record",
+    "invalid_persisted_action_record", "ambiguous_execution_state_missing_action_record",
+    "ambiguous_execution_state_requires_observation", "unknown_execution_resolution_not_safe",
+    "resume_security_revalidation_blocked", "persisted_action_completion_conflict",
+    "persisted_verified_action_untrusted", "persisted_execution_result_corrupted",
+    "conversation_security_revalidation_error", "max_execution_age_exceeded",
+})
+_PUBLIC_RECOVERY_REASON_PREFIXES = frozenset({"persisted_plan_invalid", "resume_security_revalidation_error"})
+_PUBLIC_RECOVERY_STRATEGIES = frozenset({
+    "RETRY", "RETRY_WITH_MODIFIED_INPUT", "CHANGE_TOOL", "CHANGE_PARAMETERS",
+    "SKIP_OPTIONAL_STEP", "REPLAN", "ABORT",
+})
+_PUBLIC_FAILURE_TYPES = frozenset({
+    "TOOL_ERROR", "INVALID_INPUT", "MISSING_DEPENDENCY", "PERMISSION_BLOCKED",
+    "TIMEOUT", "RATE_LIMITED", "NETWORK_ERROR", "VERIFICATION_FAILED",
+    "INSUFFICIENT_RESULT", "INVALID_OUTPUT", "UNKNOWN_FAILURE",
+})
 _BEARER = HTTPBearer(auto_error=False)
 
 
@@ -111,6 +154,92 @@ class TaskCreateRequest(APIModel):
         value = value.strip()
         if not value:
             raise ValueError("goal_required")
+        return value
+
+
+class CapabilityCandidateAssessmentRequest(APIModel):
+    target_tool: str = Field(min_length=1, max_length=128)
+    version: int = Field(ge=1, le=1_000_000)
+    description: str = Field(default="", max_length=1024)
+    source: str = Field(min_length=1, max_length=65_536)
+    entry_point: str = Field(min_length=1, max_length=128)
+    declared_capabilities: list[str] = Field(default_factory=list, max_length=64)
+    allowed_imports: list[str] = Field(default_factory=list, max_length=64)
+    allowed_network_domains: list[str] = Field(default_factory=list, max_length=64)
+    expected_inputs: dict[str, Any] = Field(default_factory=dict)
+    expected_outputs: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target_tool")
+    @classmethod
+    def valid_target_tool(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+            raise ValueError("candidate_target_tool_invalid")
+        return value
+
+    @field_validator("entry_point")
+    @classmethod
+    def valid_entry_point(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,127}", value):
+            raise ValueError("candidate_entry_point_invalid")
+        return value
+
+    @field_validator("source")
+    @classmethod
+    def bounded_source_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > CapabilityCandidateAssessor.MAX_SOURCE_BYTES:
+            raise ValueError("candidate_source_too_large")
+        return value
+
+    @field_validator("declared_capabilities", "allowed_imports", "allowed_network_domains")
+    @classmethod
+    def bounded_manifest_strings(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() or len(item) > 128 or any(ord(char) < 32 for char in item) for item in value):
+            raise ValueError("candidate_manifest_value_invalid")
+        return value
+
+    @field_validator("expected_inputs", "expected_outputs")
+    @classmethod
+    def bounded_contract_objects(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, RecursionError):
+            raise ValueError("candidate_contract_invalid") from None
+        if len(encoded) > 8_192:
+            raise ValueError("candidate_contract_too_large")
+        return value
+
+
+class CapabilityCandidateAssessmentResponse(APIModel):
+    candidate_id: str
+    capability_gap_task_id: str
+    target_tool: str
+    version: int
+    status: str
+    review_status: str
+    promotion_status: str = "BLOCKED"
+    can_promote: bool = False
+    blocking_gates: list[str] = Field(default_factory=list)
+    gate_statuses: dict[str, str] = Field(default_factory=dict)
+    source_sha256: str
+    contract: dict[str, Any]
+    analysis: dict[str, Any]
+    execution_attempted: bool
+    installation_attempted: bool
+    registration_attempted: bool
+    permissions_granted: bool
+    created_at: str
+    request_id: str = ""
+
+
+class TaskMessageRequest(APIModel):
+    content: str = Field(min_length=1, max_length=MAX_TASK_MESSAGE_LENGTH)
+
+    @field_validator("content")
+    @classmethod
+    def non_blank_content(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("task_message_required")
         return value
 
 
@@ -204,12 +333,47 @@ class ProgramAnalysisRequest(APIModel):
         return self
 
 
+class ProgramAnalysisTaskRequest(APIModel):
+    proposal_digest: str = Field(min_length=64, max_length=64)
+    authorization_reference: str = Field(min_length=1, max_length=512)
+    authorization_attested: bool = False
+    source_stage_ids: list[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("proposal_digest")
+    @classmethod
+    def valid_proposal_digest(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError("proposal_digest_invalid")
+        return value.lower()
+
+    @field_validator("authorization_reference")
+    @classmethod
+    def valid_authorization_reference(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(char) < 32 for char in value):
+            raise ValueError("authorization_reference_invalid")
+        return value
+
+    @field_validator("authorization_attested", mode="before")
+    @classmethod
+    def strict_authorization_attestation(cls, value: Any) -> bool:
+        if type(value) is not bool:
+            raise ValueError("authorization_attestation_invalid")
+        return value
+
+    @field_validator("source_stage_ids")
+    @classmethod
+    def valid_source_stage_ids(cls, value: list[str]) -> list[str]:
+        return normalize_execution_stage_ids(value)
+
+
 class ProgramAnalysisResponse(APIModel):
     analysis_id: str
     program_url: str
     source: dict[str, Any]
     status: str
     scope_proposal: dict[str, Any] | None = None
+    proposal_digest: str = ""
     exclusions: list[str] = Field(default_factory=list)
     ambiguities: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
@@ -258,6 +422,7 @@ class ResearchStageResponse(APIModel):
     stage_type: str
     stage_status: str
     budget: dict[str, int]
+    source_stage_refs: list[dict[str, str]] = Field(default_factory=list)
     partial_result: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] = Field(default_factory=dict)
     error_code: str = ""
@@ -300,6 +465,14 @@ class FindingReviewResponse(APIModel):
     request_id: str = ""
 
 
+class FindingKnowledgeAttestationResponse(APIModel):
+    review_id: str
+    attestation: dict[str, Any]
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
+
+
 class ApprovalActionRequest(APIModel):
     """No client-controlled binding fields are accepted for approval actions."""
 
@@ -319,6 +492,7 @@ class ErrorResponse(APIModel):
 
 class TaskCreateResponse(APIModel):
     task_id: str
+    conversation_id: str
     status: str
     created_at: str
     current_phase: str
@@ -326,6 +500,119 @@ class TaskCreateResponse(APIModel):
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
     idempotent_replay: bool = False
+
+
+class TaskMessageResponse(APIModel):
+    message_id: str
+    conversation_id: str
+    task_id: str
+    sequence: int
+    role: str
+    message_kind: str
+    content: str
+    status: str
+    created_at: str
+    consumed_at: str = ""
+    consumed_checkpoint: str = ""
+    idempotent_replay: bool = False
+    request_id: str = ""
+
+
+class TaskResultEventResponse(APIModel):
+    event_id: str
+    conversation_id: str
+    task_id: str
+    sequence: int
+    role: str
+    message_kind: str
+    task_status: str
+    verification_status: str
+    planning_mode: str
+    plan_version: int
+    result_available: bool
+    verified_action_count: int
+    failed_action_count: int
+    blocked_action_count: int
+    pending_action_count: int
+    approval_pending_count: int
+    approval_approved_count: int
+    approval_denied_count: int
+    approval_expired_count: int
+    approval_cancelled_count: int
+    result_digest: str
+    created_at: str
+
+
+class TaskConversationItemResponse(APIModel):
+    item_type: str
+    sequence: int
+    message: TaskMessageResponse | None = None
+    result_event: TaskResultEventResponse | None = None
+
+    @model_validator(mode="after")
+    def validate_item(self) -> "TaskConversationItemResponse":
+        if self.item_type == "USER_MESSAGE":
+            if self.message is None or self.result_event is not None or self.message.sequence != self.sequence:
+                raise ValueError("task_conversation_item_invalid")
+        elif self.item_type == "SYSTEM_RESULT":
+            if self.result_event is None or self.message is not None or self.result_event.sequence != self.sequence:
+                raise ValueError("task_conversation_item_invalid")
+        else:
+            raise ValueError("task_conversation_item_invalid")
+        return self
+
+
+class TaskAssistantReplyResponse(APIModel):
+    reply_id: str
+    conversation_id: str
+    task_id: str
+    source_event_id: str
+    source_sequence: int
+    role: str
+    message_kind: str
+    reply_code: str
+    content: str
+    created_at: str
+
+
+class TaskConversationResponse(APIModel):
+    conversation_id: str
+    task_id: str
+    task_status: str
+    queue_status: str
+    items: list[TaskConversationItemResponse] = Field(default_factory=list)
+    messages: list[TaskMessageResponse]
+    result_events: list[TaskResultEventResponse] = Field(default_factory=list)
+    assistant_replies: list[TaskAssistantReplyResponse] = Field(default_factory=list)
+    assistant_reply_supported: bool = False
+    next_cursor: int | None = None
+    has_more: bool = False
+    api_version: str = API_VERSION
+    schema_version: int = API_SCHEMA_VERSION
+    request_id: str = ""
+
+    @model_validator(mode="after")
+    def validate_ordered_items(self) -> "TaskConversationResponse":
+        sequences = [item.sequence for item in self.items]
+        if any(sequence < 1 for sequence in sequences) or any(
+            left >= right for left, right in zip(sequences, sequences[1:])
+        ):
+            raise ValueError("task_conversation_sequence_invalid")
+        message_ids = [item.message.message_id for item in self.items if item.message is not None]
+        result_ids = [item.result_event.event_id for item in self.items if item.result_event is not None]
+        if message_ids != [message.message_id for message in self.messages] or result_ids != [
+            event.event_id for event in self.result_events
+        ]:
+            raise ValueError("task_conversation_items_mismatch")
+        event_bindings = {(event.event_id, event.sequence) for event in self.result_events}
+        if any((reply.source_event_id, reply.source_sequence) not in event_bindings for reply in self.assistant_replies):
+            raise ValueError("task_conversation_assistant_reply_mismatch")
+        if self.has_more:
+            if not sequences or self.next_cursor != sequences[-1]:
+                raise ValueError("task_conversation_cursor_invalid")
+        elif self.next_cursor is not None:
+            raise ValueError("task_conversation_cursor_invalid")
+        return self
 
 
 class TaskStatusFilter(str, Enum):
@@ -341,6 +628,14 @@ class TaskStatusFilter(str, Enum):
     BLOCKED = "BLOCKED"
     FAILED = "FAILED"
     COMPLETED = "COMPLETED"
+
+
+class TaskStopReasonResponse(APIModel):
+    """Closed public reason code and safe identifiers; no free-form detail."""
+
+    code: TaskStopReasonCode
+    step_id: str | None = None
+    action_id: str | None = None
 
 
 class TaskSummaryResponse(APIModel):
@@ -361,6 +656,7 @@ class TaskSummaryResponse(APIModel):
     last_error_code: str = ""
     waiting_for_approval: bool = False
     execution_unknown: bool = False
+    stop_reason: TaskStopReasonResponse | None = None
 
 
 class TaskListResponse(APIModel):
@@ -375,8 +671,10 @@ class BugBountyTaskResponse(APIModel):
     task_id: str
     status: str
     verification_status: str
+    recovery_state: dict[str, Any] = Field(default_factory=dict)
     run: dict[str, Any] | None = None
     scan: dict[str, Any] | None = None
+    analysis_provenance: dict[str, Any] | None = None
     report: str = ""
     limitations: list[str] = Field(default_factory=list)
     api_version: str = API_VERSION
@@ -406,6 +704,8 @@ class ActionSummary(APIModel):
     step_id: str = ""
     tool_name: str = ""
     execution_status: str = ""
+    planning_mode: str = UNKNOWN
+    plan_version: int = 0
     input_fingerprint: str = ""
     updated_at: str = ""
 
@@ -433,10 +733,12 @@ class ApprovalResponse(APIModel):
 class TaskStateResponse(APIModel):
     task_id: str
     goal: str
+    task_kind: str
     status: str
     current_phase: str
     current_step: str
     plan_version: int
+    planning_mode: str
     completed_actions: list[str]
     pending_actions: list[str]
     failed_actions: list[str]
@@ -448,6 +750,7 @@ class TaskStateResponse(APIModel):
     created_at: str
     updated_at: str
     queue_status: str = ""
+    stop_reason: TaskStopReasonResponse | None = None
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
@@ -653,6 +956,114 @@ def _public_value(value: Any, *, key: str = "") -> Any:
     return safe_metadata({"value": value}).get("value")
 
 
+def _recovery_identifier(value: Any) -> str:
+    if isinstance(value, str) and _REQUEST_ID_PATTERN.fullmatch(value):
+        return value
+    return ""
+
+
+def _recovery_identifier_list(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(
+        item for item in (_recovery_identifier(candidate) for candidate in value[:limit]) if item
+    ))
+
+
+def _public_recovery_state(value: Any) -> dict[str, Any]:
+    """Project task recovery data through a closed schema; omit raw diagnostics and inputs."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    reason = value.get("reason")
+    if isinstance(reason, str):
+        reason_code = reason.partition(":")[0]
+        if reason in _PUBLIC_RECOVERY_REASONS:
+            result["reason"] = reason
+        elif reason_code in _PUBLIC_RECOVERY_REASON_PREFIXES:
+            result["reason"] = reason_code
+        else:
+            result["reason"] = "recovery_required"
+
+    decision_value = value.get("decision")
+    if isinstance(decision_value, dict):
+        decision: dict[str, Any] = {}
+        strategy = decision_value.get("strategy")
+        if isinstance(strategy, str) and strategy in _PUBLIC_RECOVERY_STRATEGIES:
+            decision["strategy"] = strategy
+        for field in ("step_id", "original_tool", "replacement_tool"):
+            identifier = _recovery_identifier(decision_value.get(field))
+            if identifier:
+                decision[field] = identifier
+        terminal_status = decision_value.get("terminal_status")
+        if isinstance(terminal_status, str) and terminal_status in {"FAILED", "BLOCKED", "CANCELLED", "COMPLETED"}:
+            decision["terminal_status"] = terminal_status
+        if decision:
+            result["decision"] = decision
+
+    diagnosis_value = value.get("diagnosis")
+    if isinstance(diagnosis_value, dict):
+        diagnosis: dict[str, Any] = {}
+        failure_type = diagnosis_value.get("failure_type")
+        if isinstance(failure_type, str) and failure_type in _PUBLIC_FAILURE_TYPES:
+            diagnosis["failure_type"] = failure_type
+        for field in ("failed_step", "tool_name"):
+            identifier = _recovery_identifier(diagnosis_value.get(field))
+            if identifier:
+                diagnosis[field] = identifier
+        recoverable = diagnosis_value.get("recoverable")
+        if isinstance(recoverable, bool):
+            diagnosis["recoverable"] = recoverable
+        suggested_recovery = diagnosis_value.get("suggested_recovery")
+        if isinstance(suggested_recovery, str) and suggested_recovery in _PUBLIC_RECOVERY_STRATEGIES:
+            diagnosis["suggested_recovery"] = suggested_recovery
+        if diagnosis:
+            result["diagnosis"] = diagnosis
+
+    round_number = value.get("round")
+    if isinstance(round_number, int) and not isinstance(round_number, bool) and 0 <= round_number <= 1_000_000:
+        result["round"] = round_number
+
+    if value.get("external_side_effect_may_have_occurred") is True:
+        result["external_side_effect_may_have_occurred"] = True
+    for field in ("action_key", "step_id"):
+        identifier = _recovery_identifier(value.get(field))
+        if identifier:
+            result[field] = identifier
+    invalid_keys = value.get("invalid_action_record_keys")
+    if isinstance(invalid_keys, list):
+        result["invalid_action_record_count"] = min(len(invalid_keys), 100_000)
+
+    gap_value = value.get("capability_gap")
+    if isinstance(gap_value, dict):
+        gap: dict[str, Any] = {}
+        code = gap_value.get("code")
+        if isinstance(code, str) and code in {"UNREGISTERED_TOOL_REQUEST", "NO_REGISTERED_TOOLS"}:
+            gap["code"] = code
+        if gap_value.get("source") == "planner_registry_validation":
+            gap["source"] = "planner_registry_validation"
+        summary_by_code = {
+            "UNREGISTERED_TOOL_REQUEST": "The planner requested a tool that is not registered; no tool was executed or installed.",
+            "NO_REGISTERED_TOOLS": "No tools are registered for planning; no tool was executed or installed.",
+        }
+        if isinstance(code, str) and code in summary_by_code and gap_value.get("summary") == summary_by_code[code]:
+            gap["summary"] = summary_by_code[code]
+        for field, limit in (("requested_tools", 20), ("registered_tools", 50)):
+            identifiers = _recovery_identifier_list(gap_value.get(field), limit=limit)
+            if field in gap_value:
+                gap[field] = identifiers
+        unavailable_count = gap_value.get("unavailable_tool_count")
+        if isinstance(unavailable_count, int) and not isinstance(unavailable_count, bool) and 0 <= unavailable_count <= 1_000_000:
+            gap["unavailable_tool_count"] = unavailable_count
+        for field in ("execution_attempted", "acquisition_attempted", "permissions_granted"):
+            flag = gap_value.get(field)
+            if isinstance(flag, bool):
+                gap[field] = flag
+        if gap:
+            result["capability_gap"] = gap
+    return result
+
+
 def _safe_id(value: str, field: str) -> str:
     if not value or len(value) > 256 or not _REQUEST_ID_PATTERN.fullmatch(value):
         raise APIError(400, f"invalid_{field}", f"Invalid {field}")
@@ -717,8 +1128,12 @@ def _decode_task_cursor(cursor: str) -> tuple[str, str]:
 def _verification_status(state: TaskState) -> str:
     verification_status = "NOT_STARTED"
     statuses = [str(item.get("status", "")) for item in state.verification_results.values() if isinstance(item, dict)]
-    if any(item in {"FAILED", "BLOCKED", "INSUFFICIENT"} for item in statuses):
+    if "BLOCKED" in statuses:
+        verification_status = "BLOCKED"
+    elif "FAILED" in statuses:
         verification_status = "FAILED"
+    elif "INSUFFICIENT" in statuses:
+        verification_status = "INSUFFICIENT"
     elif statuses and all(item == "VERIFIED" for item in statuses):
         verification_status = "VERIFIED"
     elif statuses:
@@ -728,6 +1143,16 @@ def _verification_status(state: TaskState) -> str:
         if result_status:
             verification_status = str(result_status)
     return verification_status
+
+
+def _task_stop_reason_response(reason: TaskStopReason | None) -> TaskStopReasonResponse | None:
+    if reason is None:
+        return None
+    return TaskStopReasonResponse(
+        code=reason.code,
+        step_id=reason.step_id,
+        action_id=reason.action_id,
+    )
 
 
 def _request_id(request: Request) -> str:
@@ -785,9 +1210,19 @@ class AgentAPIService:
         self.auth_manager = AuthManager(self.store)
         self.public_policy_retriever = PublicPolicyRetriever()
         self.remote_worker_protocol = RemoteWorkerProtocol(self.store)
+        self.skill_registry = SkillRegistry(self.store)
+        self.capability_candidate_assessor = CapabilityCandidateAssessor(self.skill_registry, orchestrator.tools)
         self.require_owner_auth = os.getenv("AGENT_REQUIRE_OWNER_AUTH", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.auto_requeue_approvals = False
         self._lock = threading.RLock()
+
+    @property
+    def assistant_reply_supported(self) -> bool:
+        planner = getattr(self.orchestrator, "planner", None)
+        provider = getattr(planner, "provider", None)
+        if not callable(getattr(provider, "generate_json", None)):
+            return False
+        return getattr(provider, "is_configured", True) is not False
 
     @staticmethod
     def auth_user_response(user: AuthUser) -> AuthUserResponse:
@@ -904,6 +1339,8 @@ class AgentAPIService:
         )
         if payload is None:
             raise APIError(404, "program_analysis_not_found", "Program analysis was not found")
+        payload = dict(payload)
+        payload["proposal_digest"] = scope_proposal_digest(payload.get("scope_proposal"))
         return ProgramAnalysisResponse(**payload, request_id=request_id)
 
     def list_program_analyses(
@@ -920,7 +1357,12 @@ class AgentAPIService:
             )
         except ValueError as exc:
             raise APIError(422, str(exc), "Program analysis limit is invalid") from exc
-        return [ProgramAnalysisResponse(**payload) for payload in payloads]
+        responses: list[ProgramAnalysisResponse] = []
+        for payload in payloads:
+            value = dict(payload)
+            value["proposal_digest"] = scope_proposal_digest(value.get("scope_proposal"))
+            responses.append(ProgramAnalysisResponse(**value))
+        return responses
 
     def create_research_stage(
         self,
@@ -1077,6 +1519,202 @@ class AgentAPIService:
             }, requires_lease=False)
         return FindingReviewResponse(**review.to_dict(), request_id=request_id)
 
+    def issue_finding_knowledge_attestation(
+        self,
+        task_id: str,
+        review_id: str,
+        *,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str = "",
+    ) -> FindingKnowledgeAttestationResponse:
+        task_id = _safe_id(task_id, "task_id")
+        review_id = _safe_id(review_id, "review_id")
+        if (
+            principal is None
+            or principal.role != ROLE_OWNER
+            or principal.is_legacy
+            or principal.auth_type != "session"
+            or not principal.user_id
+            or not principal.session_id
+        ):
+            raise APIError(
+                403,
+                "authenticated_reviewer_session_required",
+                "A verified owner session is required to issue knowledge attestations",
+                task_id=task_id,
+            )
+        active_reviewer = next(
+            (user for user in self.auth_manager.list_users() if user.user_id == principal.user_id),
+            None,
+        )
+        if active_reviewer is None or active_reviewer.role != ROLE_OWNER or active_reviewer.status != ACTIVE:
+            raise APIError(403, "owner_review_required", "Only the active owner may issue knowledge attestations", task_id=task_id)
+
+        review_repository = FindingReviewRepository(self.store)
+        review = review_repository.get_by_id(review_id)
+        if review is None or review.task_id != task_id:
+            raise APIError(404, "finding_review_not_found", "Finding review was not found", task_id=task_id)
+        if review.owner_user_id != principal.user_id or review.actor_user_id != principal.user_id:
+            raise APIError(403, "reviewer_identity_mismatch", "The authenticated owner did not create this review", task_id=task_id)
+        if review.decision != FindingReviewDecision.CONFIRM.value or not review.evidence_validated:
+            raise APIError(409, "review_not_confirmed", "Only a confirmed review with validated evidence can be attested", task_id=task_id)
+
+        _state, _raw, finding = self._finding_for_review(task_id, review.finding_id, principal)
+        evidence_digest = finding._evidence_digest()
+        evidence_errors = validate_confirmed_evidence(finding, target_state=finding.state)
+        if (
+            finding.state not in {FindingState.REPORT_READY, FindingState.HUMAN_REVIEWED}
+            or evidence_errors
+            or finding.validation_status != "VALIDATED"
+            or not evidence_digest
+            or finding.validated_evidence_sha256 != evidence_digest
+            or review.evidence_sha256 != evidence_digest
+        ):
+            raise APIError(409, "review_evidence_stale", "The reviewed evidence no longer matches the validated finding", task_id=task_id)
+
+        source_id = f"source-review-{review.review_id}"
+        claim_id = f"claim-review-{review.review_id}"
+        evidence_id = f"evidence-review-{review.review_id}"
+        evidence_binding = {
+            "review_id": review.review_id,
+            "decision": review.decision,
+            "evidence_sha256": evidence_digest,
+        }
+        evidence_excerpt = json.dumps(
+            evidence_binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        source_document = {
+            "review": {
+                "review_id": review.review_id,
+                "task_id": review.task_id,
+                "finding_id": review.finding_id,
+                "owner_user_id": review.owner_user_id,
+                "actor_user_id": review.actor_user_id,
+                "decision": review.decision,
+                "evidence_validated": review.evidence_validated,
+                "evidence_sha256": evidence_digest,
+                "created_at": review.created_at,
+            },
+            "finding": {
+                "vulnerability_class": finding.vulnerability_class,
+                "state": finding.state.value,
+                "validation_status": finding.validation_status,
+                "evidence_count": len(finding.evidence),
+            },
+            "evidence_binding": evidence_binding,
+        }
+        source_content = json.dumps(
+            source_document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        source = KnowledgeSource(
+            source_id=source_id,
+            canonical_uri=f"local://bug-bounty/reviews/{review.review_id}",
+            source_type="local",
+            source_class="local_verified",
+            retrieved_at=review.created_at,
+            content_sha256=sha256_hex(source_content),
+            revision=review.evidence_sha256,
+            metadata={
+                "review_id": review.review_id,
+                "task_id": review.task_id,
+                "finding_id": review.finding_id,
+                "evidence_sha256": evidence_digest,
+            },
+            created_at=review.created_at,
+            content=source_content,
+        )
+        claim = KnowledgeClaim(
+            claim_id=claim_id,
+            domain="cybersecurity.bugbounty",
+            subject=f"finding:{finding.finding_id}",
+            predicate="owner_confirmed_after_evidence_gate",
+            object_text=(
+                f"Owner-confirmed {finding.vulnerability_class} finding "
+                f"{finding.finding_id} with validated evidence digest {evidence_digest}"
+            ),
+            knowledge_type="reviewed_security_finding",
+            verification_status="verified",
+            status="SUPPORTED",
+            confidence=finding.confidence,
+            observed_at=review.created_at,
+            last_verified_at=review.created_at,
+            version=1,
+            metadata={
+                "review_id": review.review_id,
+                "finding_id": review.finding_id,
+                "evidence_sha256": evidence_digest,
+            },
+            created_at=review.created_at,
+            updated_at=review.created_at,
+        )
+        evidence = [
+            KnowledgeEvidence(
+                evidence_id=evidence_id,
+                claim_id=claim_id,
+                source_id=source_id,
+                # Owner reviews are issued after the worker lease ends. Keep
+                # task_id bound in the signed source/metadata, but do not claim
+                # this control-plane write was made under the worker lease.
+                locator="persisted owner review and Evidence Gate digest",
+                excerpt=evidence_excerpt,
+                verification_status="verified",
+                observed_at=review.created_at,
+                metadata={
+                    "task_id": task_id,
+                    "review_id": review.review_id,
+                    "evidence_sha256": evidence_digest,
+                },
+                created_at=review.created_at,
+            )
+        ]
+
+        def authorize_issuer(
+            candidate_source: KnowledgeSource,
+            candidate_claim: KnowledgeClaim,
+            candidate_evidence: list[KnowledgeEvidence],
+        ) -> str | None:
+            current_review = review_repository.get_by_id(review_id)
+            if (
+                current_review != review
+                or current_review is None
+                or current_review.task_id != task_id
+                or current_review.decision != FindingReviewDecision.CONFIRM.value
+                or not current_review.evidence_validated
+                or current_review.owner_user_id != principal.user_id
+                or current_review.actor_user_id != principal.user_id
+                or current_review.evidence_sha256 != evidence_digest
+                or candidate_source.to_dict() != source.to_dict()
+                or candidate_source.content != source_content
+                or candidate_claim.to_dict() != claim.to_dict()
+                or candidate_evidence != evidence
+            ):
+                return None
+            return principal.user_id
+
+        try:
+            saved = self.store.issue_attested_knowledge_bundle(
+                source,
+                claim,
+                evidence,
+                issuer_authorizer=authorize_issuer,
+                verified_at=review.created_at,
+                attestation_id=f"attestation-{review.review_id}",
+            )
+        except KnowledgeValidationError as exc:
+            error_code = str(exc)
+            status_code = 503 if error_code == "knowledge_attestation_key_missing" else 409
+            raise APIError(
+                status_code,
+                error_code,
+                "Knowledge attestation could not be issued",
+                task_id=task_id,
+            ) from exc
+        return FindingKnowledgeAttestationResponse(
+            review_id=review.review_id,
+            attestation=saved["attestation"],
+            request_id=request_id,
+        )
+
     def list_finding_reviews(
         self, task_id: str, *, principal: AuthenticatedPrincipal | None = None, request_id: str = "",
     ) -> list[FindingReviewResponse]:
@@ -1152,6 +1790,7 @@ class AgentAPIService:
     def _task_response(self, state: TaskState, *, request_id: str = "", replay: bool = False) -> TaskCreateResponse:
         return TaskCreateResponse(
             task_id=state.task_id,
+            conversation_id=state.task_id,
             status=state.status,
             created_at=state.created_at,
             current_phase=state.current_phase,
@@ -1171,6 +1810,8 @@ class AgentAPIService:
                     step_id=str(raw.get("step_id", "")),
                     tool_name=str(raw.get("tool_name", "")),
                     execution_status=str(raw.get("execution_status", "")),
+                    planning_mode=normalize_planning_mode(raw.get("planning_mode", UNKNOWN)),
+                    plan_version=normalize_plan_version(raw.get("plan_version", 0)),
                     input_fingerprint=str(raw.get("input_fingerprint", "")),
                     updated_at=str(raw.get("updated_at", "")),
                 )
@@ -1184,15 +1825,17 @@ class AgentAPIService:
         return TaskStateResponse(
             task_id=state.task_id,
             goal=str(_public_value(state.goal)),
+            task_kind="BUG_BOUNTY" if state.context.get("task_kind") == "bug_bounty" else "GENERAL",
             status=state.status,
             current_phase=state.current_phase,
             current_step=state.current_step,
             plan_version=state.plan_version,
+            planning_mode=planning_mode_from_plan(state.plan),
             completed_actions=list(state.completed_actions),
             pending_actions=list(state.pending_actions),
             failed_actions=list(state.failed_actions),
             actions=actions,
-            recovery_state=_public_value(state.recovery_state),
+            recovery_state=self._capability_gap_recovery_state(state),
             verification_status=_verification_status(state),
             checkpoint=CheckpointResponse(
                 last_checkpoint_at=state.last_checkpoint_at,
@@ -1204,6 +1847,7 @@ class AgentAPIService:
             created_at=state.created_at,
             updated_at=state.updated_at,
             queue_status=str(queue.get("queue_status", "")),
+            stop_reason=_task_stop_reason_response(state.stop_reason),
             request_id=request_id,
         )
 
@@ -1230,6 +1874,7 @@ class AgentAPIService:
             try:
                 created = self.store.create_queued_task(
                     goal,
+                    initial_message=goal,
                     idempotency_key=key,
                     request_fingerprint=fingerprint if key else None,
                     context=context,
@@ -1294,6 +1939,7 @@ class AgentAPIService:
                     last_error_code=str(row["last_error_code"]),
                     waiting_for_approval=state.status == "WAITING_APPROVAL",
                     execution_unknown=state.status == "EXECUTION_UNKNOWN",
+                    stop_reason=_task_stop_reason_response(state.stop_reason),
                 )
             )
         next_cursor = None
@@ -1304,6 +1950,486 @@ class AgentAPIService:
     def get_task(self, task_id: str, *, request_id: str = "", principal: AuthenticatedPrincipal | None = None) -> TaskStateResponse:
         self._assert_task_access(task_id, principal)
         return self.task_state_response(self._state(task_id), request_id=request_id)
+
+    def get_task_conversation(
+        self,
+        task_id: str,
+        *,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> TaskConversationResponse:
+        task_id = _safe_id(task_id, "task_id")
+        self._assert_task_access(task_id, principal)
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int) or after_sequence < 0:
+            raise APIError(400, "invalid_conversation_cursor", "Invalid conversation cursor", task_id=task_id)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise APIError(400, "invalid_conversation_limit", "Invalid conversation page size", task_id=task_id)
+        state = self._state(task_id)
+        queue = self.store.task_queue_record(task_id) or {}
+        owner_user_id = (
+            principal.user_id
+            if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
+            else None
+        )
+        page = self.store.task_conversation_items(
+            task_id,
+            owner_user_id=owner_user_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+        messages: list[TaskMessageResponse] = []
+        result_events: list[TaskResultEventResponse] = []
+        items: list[TaskConversationItemResponse] = []
+        for item in page["items"]:
+            sequence = int(item["sequence"])
+            if item["item_type"] == "USER_MESSAGE":
+                source = item["message"]
+                message = TaskMessageResponse(
+                    message_id=str(source["message_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    sequence=sequence,
+                    role=str(source["role"]),
+                    message_kind=str(source["message_kind"]),
+                    content=str(source["content"]),
+                    status=str(source["status"]),
+                    created_at=str(source["created_at"]),
+                    consumed_at=str(source.get("consumed_at", "")),
+                    consumed_checkpoint=str(source.get("consumed_checkpoint", "")),
+                )
+                messages.append(message)
+                items.append(TaskConversationItemResponse(
+                    item_type="USER_MESSAGE", sequence=sequence, message=message,
+                ))
+            else:
+                source = item["result_event"]
+                result_event = TaskResultEventResponse(
+                    event_id=str(source["event_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    sequence=sequence,
+                    role=str(source["role"]),
+                    message_kind=str(source["message_kind"]),
+                    task_status=str(source["task_status"]),
+                    verification_status=str(source["verification_status"]),
+                    planning_mode=str(source.get("planning_mode", "UNKNOWN")),
+                    plan_version=int(source.get("plan_version", 0)),
+                    result_available=bool(source["result_available"]),
+                    verified_action_count=int(source["verified_action_count"]),
+                    failed_action_count=int(source["failed_action_count"]),
+                    blocked_action_count=int(source["blocked_action_count"]),
+                    pending_action_count=int(source["pending_action_count"]),
+                    approval_pending_count=int(source["approval_pending_count"]),
+                    approval_approved_count=int(source["approval_approved_count"]),
+                    approval_denied_count=int(source["approval_denied_count"]),
+                    approval_expired_count=int(source["approval_expired_count"]),
+                    approval_cancelled_count=int(source["approval_cancelled_count"]),
+                    result_digest=str(source["result_digest"]),
+                    created_at=str(source["created_at"]),
+                )
+                result_events.append(result_event)
+                items.append(TaskConversationItemResponse(
+                    item_type="SYSTEM_RESULT", sequence=sequence, result_event=result_event,
+                ))
+        included_event_ids = {event.event_id for event in result_events}
+        assistant_replies = self.store.task_assistant_replies(task_id, owner_user_id=owner_user_id)
+        return TaskConversationResponse(
+            conversation_id=task_id,
+            task_id=task_id,
+            task_status=state.status,
+            queue_status=str(queue.get("queue_status", "")),
+            items=items,
+            messages=messages,
+            result_events=result_events,
+            assistant_replies=[
+                TaskAssistantReplyResponse(
+                    reply_id=str(item["reply_id"]),
+                    conversation_id=task_id,
+                    task_id=task_id,
+                    source_event_id=str(item["event_id"]),
+                    source_sequence=int(item["source_sequence"]),
+                    role=str(item["role"]),
+                    message_kind=str(item["message_kind"]),
+                    reply_code=str(item["reply_code"]),
+                    content=str(item["content"]),
+                    created_at=str(item["created_at"]),
+                )
+                for item in assistant_replies
+                if str(item["event_id"]) in included_event_ids
+            ],
+            assistant_reply_supported=self.assistant_reply_supported,
+            next_cursor=page["next_cursor"],
+            has_more=page["has_more"],
+            request_id=request_id,
+        )
+
+    def append_task_message(
+        self,
+        task_id: str,
+        content: str,
+        *,
+        idempotency_key: str | None = None,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> TaskMessageResponse:
+        task_id = _safe_id(task_id, "task_id")
+        if principal is not None and not principal.is_legacy and principal.role not in {ROLE_OWNER, ROLE_OPERATOR}:
+            raise APIError(403, "role_forbidden", "This role cannot add task messages", task_id=task_id)
+        self._assert_task_access(task_id, principal)
+        key = None
+        if idempotency_key is not None:
+            if not _IDEMPOTENCY_PATTERN.fullmatch(idempotency_key):
+                raise APIError(400, "invalid_idempotency_key", "Invalid Idempotency-Key", task_id=task_id)
+            key = idempotency_key
+        fingerprint = hashlib.sha256(
+            json.dumps({"task_id": task_id, "content": content.strip()}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        try:
+            stored = self.store.append_task_message(
+                task_id,
+                content,
+                owner_user_id=(
+                    principal.user_id
+                    if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
+                    else None
+                ),
+                idempotency_key=key,
+                request_fingerprint=fingerprint if key else None,
+            )
+        except KeyError as exc:
+            raise APIError(404, "task_not_found", "Task was not found", task_id=task_id) from exc
+        except ValueError as exc:
+            code = str(exc)
+            if code in {"message_idempotency_conflict"}:
+                raise APIError(409, code, "Idempotency-Key was already used for another message", task_id=task_id) from exc
+            if code in {"conversation_execution_unknown", "conversation_terminal", "conversation_not_accepting_messages", "conversation_message_limit", "conversation_size_limit"}:
+                raise APIError(409, code, "Task cannot accept a follow-up message in its current state", task_id=task_id) from exc
+            status_code = 413 if code == "task_message_too_long" else 422
+            raise APIError(status_code, code, "Task message could not be stored", task_id=task_id) from exc
+        return TaskMessageResponse(
+            message_id=str(stored["message_id"]),
+            conversation_id=task_id,
+            task_id=task_id,
+            sequence=int(stored["sequence"]),
+            role=str(stored["role"]),
+            message_kind=str(stored["message_kind"]),
+            content=str(stored["content"]),
+            status=str(stored["status"]),
+            created_at=str(stored["created_at"]),
+            consumed_at=str(stored.get("consumed_at", "")),
+            consumed_checkpoint=str(stored.get("consumed_checkpoint", "")),
+            idempotent_replay=bool(stored.get("replayed", False)),
+            request_id=request_id,
+        )
+
+    @staticmethod
+    def _candidate_lifecycle_state(record: dict[str, Any]) -> dict[str, Any]:
+        contract = record.get("contract") if isinstance(record.get("contract"), dict) else {}
+        validation = contract.get("validation") if isinstance(contract.get("validation"), dict) else {}
+        analysis = record.get("analysis") if isinstance(record.get("analysis"), dict) else {}
+        mutation = record.get("mutation") if isinstance(record.get("mutation"), dict) else {}
+        runtime = record.get("runtime") if isinstance(record.get("runtime"), dict) else {}
+        sandbox = runtime.get("sandbox") if isinstance(runtime.get("sandbox"), dict) else {}
+        runtime_verification = runtime.get("verification") if isinstance(runtime.get("verification"), dict) else {}
+        cross = record.get("cross_verification") if isinstance(record.get("cross_verification"), dict) else {}
+        approval = record.get("approval") if isinstance(record.get("approval"), dict) else {}
+        checks = approval.get("required_checks") if isinstance(approval.get("required_checks"), dict) else {}
+        candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        assessment = metadata.get("capability_assessment") if isinstance(metadata.get("capability_assessment"), dict) else {}
+
+        def result_gate(value: Any) -> str:
+            return "PASSED" if value is True else "FAILED" if value is False else "NOT_RUN"
+
+        assessment_passed = (
+            assessment.get("mode") == "bounded_static_only"
+            and record.get("status") in {"CANDIDATE", "APPROVED", "ACTIVE"}
+            and validation.get("passed") is True
+            and analysis.get("passed") is True
+            and checks.get("candidate_assessment") is True
+        )
+        assessment_status = (
+            "NOT_RUN" if not assessment
+            else "PASSED" if assessment_passed
+            else "FAILED" if checks.get("candidate_assessment") is False or record.get("status") == "REJECTED"
+            else "NOT_REVIEWED"
+        )
+        is_capability_assessment = assessment.get("mode") == "bounded_static_only"
+        registered = str(record.get("status", "")) == "ACTIVE"
+        gate_statuses = {
+            "candidate_assessment": assessment_status,
+            "contract_validation": result_gate(validation.get("passed")),
+            "static_analysis": result_gate(analysis.get("passed")),
+            "independent_review": "PASSED" if checks.get("independent_review") is True else "NOT_REVIEWED",
+            "isolation_validation": "PASSED" if checks.get("isolation_validation") is True else "BLOCKED" if is_capability_assessment else "NOT_RUN",
+            "owner_approval": "PASSED" if checks.get("owner_approval") is True else "NOT_GRANTED",
+            "mutation_threshold": result_gate(mutation.get("passed")),
+            "sandbox_execution": "PASSED" if sandbox.get("status") == "PASSED" else "BLOCKED",
+            "runtime_verification": result_gate(runtime_verification.get("passed")) if runtime_verification else "BLOCKED",
+            "cross_verification": result_gate(cross.get("passed")),
+            "no_blocking_findings": "PASSED" if checks.get("no_blocking_findings") is True else "NOT_REVIEWED",
+            "security_authorization": "PASSED" if checks.get("security_authorization") is True else "NOT_GRANTED",
+        }
+        satisfied = {"PASSED"}
+        blocking_gates = [name for name, gate_status in gate_statuses.items() if gate_status not in satisfied]
+        status = str(record.get("status", ""))
+        required_for_promotion = {
+            "candidate_assessment", "contract_validation", "static_analysis", "independent_review",
+            "isolation_validation", "owner_approval",
+            "mutation_threshold", "sandbox_execution", "runtime_verification", "cross_verification",
+            "no_blocking_findings", "security_authorization",
+        }
+        can_promote = (
+            status == "APPROVED"
+            and approval.get("status") == "APPROVED"
+            and approval.get("approved") is True
+            and all(gate_statuses[name] == "PASSED" for name in required_for_promotion)
+        )
+        promotion_status = (
+            "PROMOTED" if registered
+            else "REJECTED" if status == "REJECTED"
+            else "READY" if can_promote
+            else "BLOCKED"
+        )
+        return {
+            "promotion_status": promotion_status,
+            "can_promote": can_promote,
+            "blocking_gates": blocking_gates,
+            "gate_statuses": gate_statuses,
+        }
+
+    @staticmethod
+    def _aggregate_capability_candidate_lifecycle(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+        active_count = sum(item.get("status") == "ACTIVE" for item in summaries)
+        ready_count = sum(item.get("can_promote") is True for item in summaries)
+        if summaries and active_count == len(summaries):
+            promotion_status = "PROMOTED"
+        elif active_count:
+            promotion_status = "PARTIALLY_PROMOTED"
+        elif ready_count == len(summaries) and ready_count:
+            promotion_status = "READY"
+        elif ready_count:
+            promotion_status = "PARTIALLY_READY"
+        elif summaries and all(item.get("status") == "REJECTED" for item in summaries):
+            promotion_status = "REJECTED"
+        else:
+            promotion_status = "BLOCKED"
+
+        isolation_states = [
+            (item.get("gate_statuses") or {}).get("isolation_validation", "NOT_RUN")
+            for item in summaries
+        ]
+        execution_states = [
+            (item.get("gate_statuses") or {}).get("sandbox_execution", "NOT_RUN")
+            for item in summaries
+        ]
+        if isolation_states and all(
+            isolation == "PASSED" and execution == "PASSED"
+            for isolation, execution in zip(isolation_states, execution_states)
+        ):
+            isolation_status = "PASSED"
+            isolation_reason = ""
+        elif "FAILED" in isolation_states or "FAILED" in execution_states:
+            isolation_status = "FAILED"
+            isolation_reason = (
+                "isolation_validation_failed_and_runtime_unavailable"
+                if "BLOCKED" in isolation_states or "BLOCKED" in execution_states
+                else "isolation_validation_failed"
+            )
+        elif "BLOCKED" in isolation_states or "BLOCKED" in execution_states or not summaries:
+            isolation_status = "UNAVAILABLE"
+            isolation_reason = "external_sandbox_unavailable"
+        else:
+            isolation_status = "NOT_VALIDATED"
+            isolation_reason = "isolation_validation_not_run"
+
+        blocking_gates = sorted({
+            gate
+            for item in summaries
+            if item.get("status") != "ACTIVE" and item.get("can_promote") is not True
+            for gate in item.get("blocking_gates", [])
+        })
+        outstanding = [item for item in summaries if item.get("status") != "ACTIVE"]
+        return {
+            "promotion_status": promotion_status,
+            "can_promote": bool(outstanding) and all(item.get("can_promote") is True for item in outstanding),
+            "isolation_status": isolation_status,
+            "isolation_reason": isolation_reason,
+            "execution_attempted": any(item.get("execution_attempted", False) for item in summaries),
+            "registration_attempted": any(
+                item.get("registration_attempted", False) or item.get("status") == "ACTIVE"
+                for item in summaries
+            ),
+            "permissions_granted": any(item.get("permissions_granted", False) for item in summaries),
+            "blocking_gates": blocking_gates,
+            "candidates": summaries,
+        }
+
+    def _capability_gap_recovery_state(self, state: TaskState) -> dict[str, Any]:
+        recovery = _public_recovery_state(state.recovery_state)
+        gap = recovery.get("capability_gap")
+        if not isinstance(gap, dict):
+            return recovery
+        requested = gap.get("requested_tools") if isinstance(gap.get("requested_tools"), list) else []
+        target_tools = [name for name in requested if isinstance(name, str)]
+        records = self.skill_registry.candidates_for_capability_gap(state.task_id, target_tools)
+        latest_by_tool: dict[str, dict[str, Any]] = {}
+        for record in records:
+            candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+            name = str(candidate.get("name", ""))
+            previous = latest_by_tool.get(name)
+            if previous is None or int(candidate.get("version", 0)) > int(previous.get("candidate", {}).get("version", 0)):
+                latest_by_tool[name] = record
+
+        summaries: list[dict[str, Any]] = []
+        for name in sorted(set(target_tools)):
+            record = latest_by_tool.get(name)
+            if record is None:
+                summaries.append({
+                    "target_tool": name,
+                    "candidate_id": "",
+                    "status": "NOT_PROPOSED",
+                    "review_status": "NOT_STARTED",
+                    "promotion_status": "BLOCKED",
+                    "can_promote": False,
+                    "blocking_gates": [
+                        "candidate_assessment", "contract_validation", "static_analysis", "independent_review",
+                        "isolation_validation", "owner_approval", "mutation_threshold", "sandbox_execution",
+                        "runtime_verification", "cross_verification", "no_blocking_findings", "security_authorization",
+                    ],
+                    "gate_statuses": {
+                        "candidate_assessment": "NOT_RUN",
+                        "contract_validation": "NOT_RUN",
+                        "static_analysis": "NOT_RUN",
+                        "independent_review": "NOT_REVIEWED",
+                        "isolation_validation": "BLOCKED",
+                        "owner_approval": "NOT_GRANTED",
+                        "mutation_threshold": "NOT_RUN",
+                        "sandbox_execution": "BLOCKED",
+                        "runtime_verification": "BLOCKED",
+                        "cross_verification": "NOT_RUN",
+                        "no_blocking_findings": "NOT_REVIEWED",
+                        "security_authorization": "NOT_GRANTED",
+                    },
+                    "execution_attempted": False,
+                    "registration_attempted": False,
+                    "permissions_granted": False,
+                })
+                continue
+            candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+            metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+            assessment = metadata.get("capability_assessment") if isinstance(metadata.get("capability_assessment"), dict) else {}
+            approval = record.get("approval") if isinstance(record.get("approval"), dict) else {}
+            summaries.append({
+                "target_tool": name,
+                "candidate_id": str(record.get("skill_id", "")),
+                "version": int(record.get("version", 0)),
+                "status": str(record.get("status", "")),
+                "review_status": str(approval.get("status", assessment.get("review_status", "NOT_REVIEWED"))),
+                **self._candidate_lifecycle_state(record),
+                "execution_attempted": bool(assessment.get("execution_attempted", False))
+                or bool((record.get("runtime") or {}).get("sandbox")),
+                "registration_attempted": bool(assessment.get("registration_attempted", False))
+                or str(record.get("status", "")) == "ACTIVE",
+                "permissions_granted": bool(assessment.get("permissions_granted", False)),
+            })
+        gap["candidate_lifecycle"] = self._aggregate_capability_candidate_lifecycle(summaries)
+        return recovery
+
+    @staticmethod
+    def _capability_candidate_response(
+        record: dict[str, Any], *, request_id: str = ""
+    ) -> CapabilityCandidateAssessmentResponse:
+        candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        assessment = metadata.get("capability_assessment") if isinstance(metadata.get("capability_assessment"), dict) else {}
+        if assessment.get("mode") != "bounded_static_only":
+            raise APIError(404, "capability_candidate_not_found", "Capability candidate assessment was not found")
+        return CapabilityCandidateAssessmentResponse(
+            candidate_id=str(record.get("skill_id", "")),
+            capability_gap_task_id=str(assessment.get("capability_gap_task_id", "")),
+            target_tool=str(assessment.get("target_tool", "")),
+            version=int(record.get("version", 0)),
+            status=str(record.get("status", "")),
+            review_status=str(record.get("approval", {}).get("status", assessment.get("review_status", "NOT_REVIEWED")))
+            if isinstance(record.get("approval"), dict) else str(assessment.get("review_status", "NOT_REVIEWED")),
+            **AgentAPIService._candidate_lifecycle_state(record),
+            source_sha256=str(assessment.get("source_sha256", "")),
+            contract=record.get("contract") if isinstance(record.get("contract"), dict) else {},
+            analysis=record.get("analysis") if isinstance(record.get("analysis"), dict) else {},
+            execution_attempted=bool(assessment.get("execution_attempted", False)),
+            installation_attempted=bool(assessment.get("installation_attempted", False)),
+            registration_attempted=bool(assessment.get("registration_attempted", False)),
+            permissions_granted=bool(assessment.get("permissions_granted", False)),
+            created_at=str(candidate.get("created_at", "")),
+            request_id=request_id,
+        )
+
+    def assess_capability_candidate(
+        self,
+        task_id: str,
+        payload: CapabilityCandidateAssessmentRequest,
+        *,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> CapabilityCandidateAssessmentResponse:
+        if principal is None or principal.role != ROLE_OWNER:
+            raise APIError(403, "forbidden", "Only the owner can assess capability candidates")
+        self._assert_task_access(task_id, principal)
+        candidate = SkillCandidate(
+            skill_id=str(uuid.uuid4()),
+            name=payload.target_tool,
+            version=payload.version,
+            description=payload.description,
+            source=payload.source,
+            entry_point=payload.entry_point,
+            declared_capabilities=list(payload.declared_capabilities),
+            allowed_imports=list(payload.allowed_imports),
+            allowed_network_domains=list(payload.allowed_network_domains),
+            expected_inputs=dict(payload.expected_inputs),
+            expected_outputs=dict(payload.expected_outputs),
+            metadata={},
+            provenance={},
+            status="CANDIDATE",
+        )
+        with self._lock:
+            try:
+                record = self.capability_candidate_assessor.assess_for_gap(
+                    candidate,
+                    gap_task_id=task_id,
+                    target_tool=payload.target_tool,
+                )
+            except CapabilityCandidateAssessmentError as exc:
+                if exc.code == "capability_gap_task_not_found":
+                    code, status_code = exc.code, 404
+                elif exc.code in {
+                    "candidate_version_conflict",
+                    "candidate_persistence_conflict",
+                    "candidate_not_bound_to_capability_gap",
+                    "capability_gap_resolved",
+                }:
+                    code, status_code = exc.code, 409
+                else:
+                    code, status_code = exc.code, 422
+                raise APIError(status_code, code, "Capability candidate assessment could not be completed") from exc
+        response = self._capability_candidate_response(record, request_id=request_id)
+        return response
+
+    def get_capability_candidate_assessment(
+        self,
+        candidate_id: str,
+        *,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> CapabilityCandidateAssessmentResponse:
+        if principal is None or principal.role != ROLE_OWNER:
+            raise APIError(403, "forbidden", "Only the owner can inspect capability candidates")
+        record = self.skill_registry.get_candidate(candidate_id)
+        if record is None:
+            raise APIError(404, "capability_candidate_not_found", "Capability candidate assessment was not found")
+        return self._capability_candidate_response(record, request_id=request_id)
 
     @staticmethod
     def _bug_bounty_output(state: TaskState) -> dict[str, Any] | None:
@@ -1372,6 +2498,12 @@ class AgentAPIService:
                 }
                 findings.append(fallback)
         tests = run.get("tests", []) if isinstance(run.get("tests", []), list) else []
+        raw_stage_refs = run.get("research_stage_refs", [])
+        try:
+            sanitized["research_stage_refs"] = normalize_execution_stage_refs(raw_stage_refs)
+        except ValueError:
+            sanitized["research_stage_refs"] = []
+            downgraded = True
         sanitized["findings"] = findings
         sanitized["metrics"] = reconcile_bug_bounty_metrics(run.get("metrics") if isinstance(run.get("metrics"), dict) else {}, findings, [item for item in tests if isinstance(item, dict)])
         limitations = [str(item) for item in run.get("limitations", [])] if isinstance(run.get("limitations", []), list) else []
@@ -1387,6 +2519,7 @@ class AgentAPIService:
         idempotency_key: str | None = None,
         request_id: str = "",
         principal: AuthenticatedPrincipal | None = None,
+        program_analysis_provenance: Mapping[str, Any] | None = None,
     ) -> TaskCreateResponse:
         execution_scope = dict(payload.scope)
         execution_scope["scope_reference"] = public_reference(execution_scope.pop("authorization_reference"))
@@ -1402,16 +2535,111 @@ class AgentAPIService:
             "source_documents": dict(payload.source_documents),
         }
         goal = f"Bug Bounty analysis for authorized program {payload.scope['program_id']}"
+        context: dict[str, Any] = {"task_kind": "bug_bounty", "bugbounty_request": request}
+        fingerprint_payload: dict[str, Any] = {"goal": goal, "request": request}
+        if program_analysis_provenance is not None:
+            provenance = safe_json(dict(program_analysis_provenance))
+            context["program_analysis_provenance"] = provenance
+            fingerprint_payload["program_analysis_provenance"] = {
+                key: value for key, value in provenance.items() if key != "scope_attested_at"
+            }
         fingerprint = hashlib.sha256(
-            json.dumps({"goal": goal, "request": request}, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         return self.create_task(
             goal,
             idempotency_key=idempotency_key,
             request_id=request_id,
-            context={"task_kind": "bug_bounty", "bugbounty_request": request},
+            context=context,
             request_fingerprint=fingerprint,
             principal=principal,
+        )
+
+    def create_bug_bounty_task_from_analysis(
+        self,
+        analysis_id: str,
+        payload: ProgramAnalysisTaskRequest,
+        *,
+        idempotency_key: str | None = None,
+        request_id: str = "",
+        principal: AuthenticatedPrincipal | None = None,
+    ) -> TaskCreateResponse:
+        analysis_id = _safe_id(analysis_id, "analysis_id")
+        if principal is None or principal.is_legacy or principal.role != ROLE_OWNER:
+            raise APIError(403, "analysis_handoff_forbidden", "An authenticated owner is required to review and attest a program-analysis proposal")
+        if not payload.authorization_attested:
+            raise APIError(422, "authorization_attestation_required", "Explicit written-authorization attestation is required")
+
+        is_owner = principal.role == ROLE_OWNER
+        analysis = ProgramAnalysisRepository(self.store).get(
+            analysis_id,
+            owner_user_id=self._owner_user_id(principal),
+            is_owner=is_owner,
+        )
+        if analysis is None:
+            raise APIError(404, "program_analysis_not_found", "Program analysis was not found")
+        proposal = analysis.get("scope_proposal")
+        if analysis.get("status") != "READY_FOR_SCOPE_REVIEW" or not isinstance(proposal, Mapping):
+            raise APIError(409, "program_analysis_not_eligible", "Only a current server-returned scope proposal can be used")
+
+        source = analysis.get("source")
+        observations = analysis.get("observations")
+        if (
+            not isinstance(source, Mapping)
+            or source.get("source_type") == "hackerone_program"
+            or isinstance(observations, Mapping) and observations.get("authorization_derived") is False
+        ):
+            raise APIError(409, "public_policy_is_not_authorization", "Public-policy observations cannot authorize a Bug Bounty task")
+        source_digest = source.get("content_sha256") if isinstance(source, Mapping) else None
+        if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+            raise APIError(409, "program_analysis_provenance_invalid", "The stored analysis source provenance is invalid")
+
+        expected_proposal_digest = scope_proposal_digest(proposal)
+        if not expected_proposal_digest or payload.proposal_digest != expected_proposal_digest:
+            raise APIError(409, "program_analysis_stale", "The reviewed proposal changed; reload and review the latest server result")
+        stored_reference = proposal.get("authorization_reference")
+        if not isinstance(stored_reference, str) or not stored_reference.startswith("sha256:"):
+            raise APIError(409, "program_analysis_provenance_invalid", "The stored proposal does not contain a redacted authorization reference")
+
+        scope_payload = dict(proposal)
+        scope_payload["authorization_reference"] = payload.authorization_reference
+        try:
+            validated_scope = ScopeDefinition.from_dict(scope_payload)
+            task_payload = BugBountyCreateRequest(scope=validated_scope.to_dict(public=False), scanner="deterministic")
+        except (TypeError, ValueError) as exc:
+            raise APIError(409, "scope_proposal_no_longer_valid", "The server proposal is no longer valid for task creation") from exc
+
+        try:
+            research_stage_refs = ResearchStageRepository(self.store).resolve_execution_sources(
+                analysis_id,
+                owner_user_id=self._owner_user_id(principal),
+                stage_ids=payload.source_stage_ids,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise APIError(
+                409,
+                "program_analysis_research_stage_invalid",
+                "Selected research stages must be completed, owned by this analysis, and have valid persisted results",
+            ) from exc
+
+        provenance = {
+            "analysis_id": analysis_id,
+            "analysis_status": "READY_FOR_SCOPE_REVIEW",
+            "source_content_sha256": source_digest,
+            "proposal_digest": expected_proposal_digest,
+            "scope_reference_digest": public_reference(payload.authorization_reference),
+            "scope_attestation": True,
+            "scope_attested_by_user_id": principal.user_id,
+            "scope_attested_at": datetime.now(timezone.utc).isoformat(),
+            "execution_mode": "deterministic_local",
+            "research_stage_refs": research_stage_refs,
+        }
+        return self.create_bug_bounty_task(
+            task_payload,
+            idempotency_key=idempotency_key,
+            request_id=request_id,
+            principal=principal,
+            program_analysis_provenance=provenance,
         )
 
     def bug_bounty_task(self, task_id: str, *, request_id: str = "", principal: AuthenticatedPrincipal | None = None) -> BugBountyTaskResponse:
@@ -1430,6 +2658,21 @@ class AgentAPIService:
             ]
         scan = output.get("scan") if isinstance(output.get("scan"), dict) else None
         safe_scan = self._sanitize_bug_bounty_scan(scan) if scan is not None else None
+        raw_provenance = state.context.get("program_analysis_provenance")
+        analysis_provenance = None
+        if isinstance(raw_provenance, Mapping):
+            expected_keys = (
+                "analysis_id", "analysis_status", "source_content_sha256", "proposal_digest",
+                "scope_reference_digest", "scope_attested_by_user_id", "scope_attested_at", "execution_mode",
+            )
+            analysis_provenance = {key: str(raw_provenance.get(key, ""))[:256] for key in expected_keys}
+            analysis_provenance["scope_attestation"] = raw_provenance.get("scope_attestation") is True
+            try:
+                analysis_provenance["research_stage_refs"] = normalize_execution_stage_refs(
+                    raw_provenance.get("research_stage_refs", [])
+                )
+            except ValueError as exc:
+                raise APIError(409, "program_analysis_provenance_invalid", "The stored research-stage lineage is invalid", task_id=task_id) from exc
         limitations = list(safe_run.get("limitations", [])) if safe_run else []
         if safe_scan:
             limitations.extend(str(item) for item in safe_scan.get("limitations", [])[:50])
@@ -1437,8 +2680,10 @@ class AgentAPIService:
             task_id=state.task_id,
             status=state.status,
             verification_status=_verification_status(state),
+            recovery_state=self._capability_gap_recovery_state(state),
             run=safe_run,
             scan=safe_scan,
+            analysis_provenance=analysis_provenance,
             report="" if report_suppressed else str(output.get("report", "")),
             limitations=[str(item) for item in limitations[:50]],
             request_id=request_id,
@@ -1496,6 +2741,10 @@ class AgentAPIService:
                         code = str(exc)
                         if code == "approval_not_approved":
                             raise APIError(409, "approval_not_approved", "Task approvals are not all approved", task_id=task_id) from exc
+                        if code == "approval_policy_stale":
+                            raise APIError(409, "approval_stale", "A task approval is no longer valid under the current security policy", task_id=task_id) from exc
+                        if code == "approval_policy_unavailable":
+                            raise APIError(503, "approval_policy_unavailable", "The current security policy could not be checked", task_id=task_id) from exc
                         raise APIError(409, "task_not_requeueable", "Task is not safely requeueable", task_id=task_id) from exc
                     return self.task_state_response(self._state(task_id), request_id=request_id)
                 raise APIError(
@@ -1547,6 +2796,23 @@ class AgentAPIService:
                 actor = "api-owner" if principal is None or principal.is_legacy else principal.user_id
                 approved = self.security.approval_gate.approve(request.approval_id, actor=actor)  # type: ignore[union-attr]
             except ValueError as exc:
+                error_code = str(exc).split(":", 1)[0]
+                if error_code == "approval_policy_stale":
+                    raise APIError(
+                        409,
+                        "approval_stale",
+                        "Approval was invalidated by a newer security policy",
+                        approval_id=request.approval_id,
+                        task_id=request.task_id,
+                    ) from exc
+                if error_code == "approval_policy_unavailable":
+                    raise APIError(
+                        503,
+                        "approval_policy_unavailable",
+                        "The current security policy could not be checked",
+                        approval_id=request.approval_id,
+                        task_id=request.task_id,
+                    ) from exc
                 raise APIError(409, "approval_not_pending", "Approval is no longer pending", approval_id=request.approval_id, task_id=request.task_id) from exc
             if self.auto_requeue_approvals:
                 try:
@@ -1557,6 +2823,23 @@ class AgentAPIService:
                     # bound to the current execution checks.
                     pass
                 except ValueError as exc:
+                    error_code = str(exc).split(":", 1)[0]
+                    if error_code == "approval_policy_stale":
+                        raise APIError(
+                            409,
+                            "approval_stale",
+                            "Approval was recorded but became stale before the task could be requeued",
+                            approval_id=approved.approval_id,
+                            task_id=approved.task_id,
+                        ) from exc
+                    if error_code == "approval_policy_unavailable":
+                        raise APIError(
+                            503,
+                            "approval_policy_unavailable",
+                            "Approval was recorded but the current policy could not be checked for requeue",
+                            approval_id=approved.approval_id,
+                            task_id=approved.task_id,
+                        ) from exc
                     if str(exc) not in {"approval_not_approved", "task_not_waiting_approval"}:
                         raise APIError(
                             409,
@@ -1695,7 +2978,7 @@ def build_orchestrator(*, database_path: str | None = None) -> Orchestrator:
 
     register_repository_tools(registry)
     planner = None
-    if os.getenv("GEMINI_API_KEY"):
+    if os.getenv("GEMINI_API_KEY", "").strip():
         from private_agent.core.planner import Planner
 
         planner = Planner(build_provider())
@@ -1948,6 +3231,7 @@ def create_app(
     async def request_correlation(request: Request, call_next: Callable[..., Any]) -> Any:
         supplied = request.headers.get("X-Request-ID", "")
         request_id = supplied if _REQUEST_ID_PATTERN.fullmatch(supplied) else uuid.uuid4().hex
+        timeline_read = request.method == "GET" and re.fullmatch(r"/(?:api/v1/)?tasks/[^/]+/timeline", request.url.path) is not None
         request.state.request_id = request_id
         current_service = getattr(application.state, "agent_api_service", None)
         if current_service is None and (request.url.path.startswith("/api/") or request.url.path == "/tasks/run"):
@@ -1967,7 +3251,7 @@ def create_app(
                 with current_service._lock:
                     current_service.observability.emit(
                         "API_REQUEST_FAILED",
-                        task_id=getattr(request.state, "task_id", ""),
+                        task_id="" if timeline_read else getattr(request.state, "task_id", ""),
                         correlation_id=request_id,
                         component="api",
                         severity="ERROR",
@@ -1979,7 +3263,7 @@ def create_app(
             with current_service._lock:
                 current_service.observability.emit(
                     "API_REQUEST_COMPLETED",
-                    task_id=getattr(request.state, "task_id", ""),
+                    task_id="" if timeline_read else getattr(request.state, "task_id", ""),
                     correlation_id=request_id,
                     component="api",
                     severity="ERROR" if response.status_code >= 500 else "INFO",
@@ -2171,6 +3455,31 @@ def create_app(
         return service.get_program_analysis(analysis_id, principal=principal, request_id=_request_id(request))
 
     @router.post(
+        "/bug-bounty/programs/{analysis_id}/task",
+        response_model=TaskCreateResponse,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(_require_roles(ROLE_OWNER)), Depends(_csrf_protect)],
+    )
+    def create_bug_bounty_task_from_analysis(
+        request: Request,
+        payload: ProgramAnalysisTaskRequest,
+        analysis_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> TaskCreateResponse:
+        _require_worker_ready(request)
+        response = service.create_bug_bounty_task_from_analysis(
+            analysis_id,
+            payload,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(request),
+            principal=principal,
+        )
+        request.state.task_id = response.task_id
+        return response
+
+    @router.post(
         "/bug-bounty/programs/{analysis_id}/stages",
         response_model=ResearchStageResponse,
         status_code=status.HTTP_201_CREATED,
@@ -2266,6 +3575,87 @@ def create_app(
         request.state.task_id = task_id
         return service.get_task(task_id, request_id=_request_id(request), principal=principal)
 
+    @router.get("/tasks/{task_id}/messages", response_model=TaskConversationResponse)
+    def get_task_conversation(
+        request: Request,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        after_sequence: int = Query(default=0, ge=0, le=9223372036854775807),
+        limit: int = Query(default=100, ge=1, le=100),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> TaskConversationResponse:
+        request.state.task_id = task_id
+        return service.get_task_conversation(
+            task_id,
+            request_id=_request_id(request),
+            principal=principal,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    @router.post(
+        "/tasks/{task_id}/messages",
+        response_model=TaskMessageResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(_require_roles(ROLE_OWNER, ROLE_OPERATOR)), Depends(_csrf_protect)],
+    )
+    def append_task_message(
+        request: Request,
+        payload: TaskMessageRequest,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> TaskMessageResponse:
+        request.state.task_id = task_id
+        return service.append_task_message(
+            task_id,
+            payload.content,
+            idempotency_key=idempotency_key,
+            request_id=_request_id(request),
+            principal=principal,
+        )
+
+    @router.post(
+        "/tasks/{task_id}/capability-candidates/assess",
+        response_model=CapabilityCandidateAssessmentResponse,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(_require_roles(ROLE_OWNER)), Depends(_csrf_protect)],
+    )
+    def assess_capability_candidate(
+        request: Request,
+        payload: CapabilityCandidateAssessmentRequest,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> CapabilityCandidateAssessmentResponse:
+        request.state.task_id = task_id
+        return service.assess_capability_candidate(
+            task_id,
+            payload,
+            request_id=_request_id(request),
+            principal=principal,
+        )
+
+    @router.get(
+        "/capability-candidates/{candidate_id}",
+        response_model=CapabilityCandidateAssessmentResponse,
+        dependencies=[Depends(_require_roles(ROLE_OWNER))],
+    )
+    def get_capability_candidate_assessment(
+        request: Request,
+        candidate_id: str = APIPath(..., min_length=1, max_length=128),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> CapabilityCandidateAssessmentResponse:
+        result = service.get_capability_candidate_assessment(
+            candidate_id,
+            request_id=_request_id(request),
+            principal=principal,
+        )
+        request.state.task_id = result.capability_gap_task_id
+        return result
+
     @router.post(
         "/tasks/{task_id}/resume",
         response_model=TaskStateResponse,
@@ -2316,6 +3706,23 @@ def create_app(
     ) -> FindingReviewResponse:
         request.state.task_id = task_id
         return service.review_bug_bounty_finding(task_id, finding_id, payload, principal=principal, request_id=_request_id(request))
+
+    @router.post(
+        "/bug-bounty/tasks/{task_id}/reviews/{review_id}/knowledge-attestation",
+        response_model=FindingKnowledgeAttestationResponse,
+        dependencies=[Depends(_require_roles(ROLE_OWNER)), Depends(_csrf_protect)],
+    )
+    def issue_finding_knowledge_attestation(
+        request: Request,
+        task_id: str = APIPath(..., min_length=1, max_length=256),
+        review_id: str = APIPath(..., min_length=1, max_length=256),
+        service: AgentAPIService = Depends(_service),
+        principal: AuthenticatedPrincipal = Depends(_principal),
+    ) -> FindingKnowledgeAttestationResponse:
+        request.state.task_id = task_id
+        return service.issue_finding_knowledge_attestation(
+            task_id, review_id, principal=principal, request_id=_request_id(request)
+        )
 
     @router.get("/bug-bounty/tasks/{task_id}/reviews", response_model=list[FindingReviewResponse])
     def list_finding_reviews(

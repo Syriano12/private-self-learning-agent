@@ -70,8 +70,34 @@ class PassiveRecon:
     MAX_URL_INPUTS = 100
     MAX_SOURCE_DOCUMENTS = 50
     MAX_SOURCE_BYTES = 2_000_000
+    MAX_RESEARCH_STAGE_RESULTS = 4
+    MAX_RESEARCH_STAGE_ENDPOINTS = 100
     _URL_RE = re.compile(r"https?://[A-Za-z0-9._:-]{1,255}(?:/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%{}-]*)?")
     _ROUTE_RE = re.compile(r"(?:app|router|route)\.(?:get|post|put|patch|delete)\(['\"]([^'\"]+)")
+
+    @staticmethod
+    def _inventory_candidate_path(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+            return None
+        candidate = value.strip()
+        if any(ord(char) < 32 for char in candidate):
+            return None
+        if candidate.startswith(("http://", "https://")):
+            try:
+                parsed = urlparse(candidate)
+            except ValueError:
+                return None
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(char.isspace() for char in parsed.hostname):
+                return None
+            candidate = parsed.path or "/"
+        elif " " in candidate:
+            method, candidate = candidate.split(None, 1)
+            if method.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"}:
+                return None
+        path = candidate.split("?", 1)[0].split("#", 1)[0]
+        if not path.startswith("/") or len(path) > 512 or any(ord(char) < 32 for char in path):
+            return None
+        return path
 
     def analyze(
         self,
@@ -80,6 +106,7 @@ class PassiveRecon:
         openapi: Mapping[str, Any] | None = None,
         source_documents: Mapping[str, str] | None = None,
         fixture: DeterministicFixtureApp | None = None,
+        research_stage_results: Sequence[Mapping[str, Any]] = (),
     ) -> AttackSurfaceInventory:
         assets: set[str] = set()
         endpoints: list[dict[str, Any]] = []
@@ -107,6 +134,82 @@ class PassiveRecon:
             endpoints.append({"method": "GET", "path": parsed.path or "/", "source": "supplied_url", "asset": asset})
             add("url", raw, asset, {"method": "GET", "path": parsed.path or "/"}, 0.8)
 
+        stage_endpoint_count = 0
+        if len(research_stage_results) > self.MAX_RESEARCH_STAGE_RESULTS:
+            limitations.append("research_inventory_stage_result_limit_reached")
+        for stage_source in research_stage_results[:self.MAX_RESEARCH_STAGE_RESULTS]:
+            if not isinstance(stage_source, Mapping) or stage_source.get("stage_type") != "INVENTORY":
+                continue
+            stage_id = stage_source.get("stage_id")
+            result_digest = stage_source.get("result_sha256")
+            result = stage_source.get("result")
+            if (
+                not isinstance(stage_id, str) or not stage_id or len(stage_id) > 128
+                or not isinstance(result_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", result_digest)
+                or not isinstance(result, Mapping) or result.get("kind") != "LOCAL_INVENTORY"
+                or result.get("network_accessed") is not False
+            ):
+                limitations.append("research_inventory_stage_invalid_or_not_local")
+                continue
+            stage_entries: list[tuple[str, str]] = []
+            malformed_collection = False
+            for field_name in ("endpoints", "urls_observed"):
+                entries = result.get(field_name, [])
+                if not isinstance(entries, list):
+                    malformed_collection = True
+                    break
+                if len(entries) > self.MAX_RESEARCH_STAGE_ENDPOINTS:
+                    limitations.append("research_inventory_endpoint_limit_reached")
+                stage_entries.extend((field_name, entry) for entry in entries[:self.MAX_RESEARCH_STAGE_ENDPOINTS]
+                                     if isinstance(entry, str))
+                if any(not isinstance(entry, str) for entry in entries[:self.MAX_RESEARCH_STAGE_ENDPOINTS]):
+                    limitations.append("research_inventory_non_text_candidate_ignored")
+            if malformed_collection:
+                limitations.append("research_inventory_stage_shape_invalid")
+                continue
+            if len(stage_entries) > self.MAX_RESEARCH_STAGE_ENDPOINTS:
+                stage_entries = stage_entries[:self.MAX_RESEARCH_STAGE_ENDPOINTS]
+                limitations.append("research_inventory_endpoint_limit_reached")
+            seen_stage_paths: set[str] = set()
+            for field_name, raw_candidate in stage_entries:
+                if stage_endpoint_count >= self.MAX_RESEARCH_STAGE_ENDPOINTS:
+                    limitations.append("research_inventory_endpoint_limit_reached")
+                    break
+                path = self._inventory_candidate_path(raw_candidate)
+                if path is None:
+                    limitations.append("research_inventory_invalid_path_ignored")
+                    continue
+                if path in seen_stage_paths:
+                    continue
+                seen_stage_paths.add(path)
+                stage_endpoint_count += 1
+                provenance = {
+                    "mode": "passive",
+                    "source": "completed_local_inventory_stage",
+                    "source_stage_id": stage_id,
+                    "result_sha256": result_digest,
+                    "source_field": field_name,
+                    "trust": "unverified_candidate",
+                }
+                endpoint = {
+                    "method": "UNKNOWN",
+                    "path": path,
+                    "asset": "",
+                    "source": "research_stage_inventory",
+                    "candidate_only": True,
+                    "confidence": 0.2,
+                    "provenance": provenance,
+                }
+                endpoints.append(endpoint)
+                add(
+                    "research_stage_route_candidate",
+                    "research_stage_inventory",
+                    "",
+                    {"path": path, "trust": "unverified_candidate", "source_stage_id": stage_id,
+                     "result_sha256": result_digest, "source_field": field_name},
+                    0.2,
+                )
+
         if openapi is not None:
             paths = openapi.get("paths") if isinstance(openapi, Mapping) else None
             if isinstance(paths, Mapping):
@@ -114,7 +217,8 @@ class PassiveRecon:
                 server_url = ""
                 if isinstance(servers, list) and servers and isinstance(servers[0], Mapping):
                     server_url = str(servers[0].get("url", ""))
-                server_host = urlparse(server_url).hostname.lower() if urlparse(server_url).hostname else "fixture.local"
+                hostname = urlparse(server_url).hostname
+                server_host = hostname.lower() if hostname else "fixture.local"
                 for path_index, (path, operations) in enumerate(paths.items()):
                     if path_index >= 500:
                         limitations.append("openapi_path_limit_reached")
@@ -125,7 +229,12 @@ class PassiveRecon:
                         method_upper = str(method).upper()
                         if method_upper not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
                             continue
-                        entry = {"method": method_upper, "path": path, "asset": server_host, "source": "openapi"}
+                        entry: dict[str, Any] = {
+                            "method": method_upper,
+                            "path": path,
+                            "asset": server_host,
+                            "source": "openapi",
+                        }
                         if isinstance(operation, Mapping):
                             entry["operation_id"] = str(operation.get("operationId", ""))[:256]
                             entry["security"] = bool(operation.get("security"))
@@ -173,20 +282,84 @@ class PassiveRecon:
 class DeterministicPlanner:
     """No-LLM planner used for reproducible local evaluation."""
 
-    def build(self, inventory: AttackSurfaceInventory, scope: ScopeDefinition) -> list[dict[str, Any]]:
+    def build(
+        self,
+        inventory: AttackSurfaceInventory,
+        scope: ScopeDefinition,
+        *,
+        learned_review_advisories: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         plan: list[dict[str, Any]] = []
         for index, endpoint in enumerate(inventory.endpoints[:100], start=1):
             method = str(endpoint.get("method", "GET"))
-            plan.append({
+            step = {
                 "step_id": f"plan-{index:03d}",
-                "action": "passive_inventory" if method == "UNKNOWN" else "authorization_matrix_candidate",
+                "action": "passive_inventory_candidate" if endpoint.get("candidate_only") else "passive_inventory" if method == "UNKNOWN" else "authorization_matrix_candidate",
                 "method": method,
                 "path": str(endpoint.get("path", "")),
                 "asset": str(endpoint.get("asset", "")),
                 "authorization_required": True,
-                "active": method in {"GET", "HEAD", "OPTIONS"} and scope.active_testing,
-                "reason": "deterministic plan from supplied evidence; no unbounded scan",
-            })
+                "active": False if endpoint.get("candidate_only") else method in {"GET", "HEAD", "OPTIONS"} and scope.active_testing,
+                "reason": "unverified local inventory candidate; not authorization and never an active request" if endpoint.get("candidate_only") else "deterministic plan from supplied evidence; no unbounded scan",
+            }
+            if endpoint.get("candidate_only"):
+                step["confidence"] = endpoint.get("confidence", 0.2)
+                step["provenance"] = endpoint.get("provenance", {})
+            plan.append(step)
+        seen_strategies: set[str] = set()
+        for advisory in (learned_review_advisories or [])[:5]:
+            if not isinstance(advisory, dict):
+                continue
+            strategy_id = advisory.get("strategy_id")
+            vulnerability_class = advisory.get("vulnerability_class")
+            review_id = advisory.get("review_id")
+            finding_id = advisory.get("finding_id")
+            evidence_sha256 = advisory.get("evidence_sha256")
+            confidence = advisory.get("confidence")
+            if (
+                not isinstance(strategy_id, str)
+                or not strategy_id.startswith("strategy-")
+                or strategy_id in seen_strategies
+                or not isinstance(vulnerability_class, str)
+                or not vulnerability_class
+                or len(vulnerability_class) > 256
+                or not isinstance(review_id, str)
+                or not review_id
+                or not isinstance(finding_id, str)
+                or not finding_id
+                or not isinstance(evidence_sha256, str)
+                or len(evidence_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in evidence_sha256)
+                or not isinstance(confidence, (int, float))
+                or isinstance(confidence, bool)
+                or not 0.70 <= float(confidence) <= 1.0
+                or advisory.get("requirement") != "prioritize_owner_review_before_confirmation"
+                or advisory.get("non_authoritative") is not True
+            ):
+                continue
+            seen_strategies.add(strategy_id)
+            plan.append(
+                {
+                    "step_id": f"learned-owner-review-{strategy_id.removeprefix('strategy-')}",
+                    "action": "prioritize_owner_review_before_confirmation",
+                    "vulnerability_class": vulnerability_class,
+                    "active": False,
+                    "external_access": False,
+                    "non_executable": True,
+                    "non_authoritative": True,
+                    "provenance": {
+                        "source": "fresh_owner_reviewed_evidence",
+                        "strategy_id": strategy_id,
+                        "review_id": review_id,
+                        "finding_id": finding_id,
+                        "evidence_sha256": evidence_sha256,
+                    },
+                    "reason": (
+                        "Recent owner-reviewed verified evidence recommends prioritizing the existing "
+                        "owner-review gate; memory does not authorize testing or verify a new finding."
+                    ),
+                }
+            )
         return plan
 
 

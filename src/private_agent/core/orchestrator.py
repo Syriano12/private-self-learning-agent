@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 import inspect
+import json
+import re
 from time import monotonic
 from typing import Any
 
@@ -11,7 +13,15 @@ from private_agent.core.experience import ExperienceAction, ExperienceRecord
 from private_agent.core.learning import LearningEngine, LearningMemory, SQLiteLearningMemory
 from private_agent.core.memory import ExperienceMemory, ExperienceQuery, SQLiteExperienceMemory
 from private_agent.core.observation import Observation, StepOutcome
-from private_agent.core.planner import PlanStep, Planner, TaskPlan
+from private_agent.core.planner import CapabilityUnavailableError, PlanStep, Planner, PlanValidationError, TaskPlan
+from private_agent.core.planning_provenance import (
+    DETERMINISTIC_ROUTE,
+    PLANNING_MODES,
+    UNKNOWN,
+    normalize_plan_version,
+    normalize_planning_mode,
+    planning_mode_from_plan,
+)
 from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
@@ -19,6 +29,7 @@ from private_agent.core.task_state import (
     MAX_TASK_GOAL_LENGTH,
     StateIntegrityError,
     TaskState,
+    TaskStopReasonCode,
     TERMINAL_STATUSES,
     action_fingerprint,
 )
@@ -28,9 +39,14 @@ from private_agent.storage import KnowledgeItem, Store
 from private_agent.security import PolicyDecision, SecurityController
 from private_agent.tools.research import ToolRegistry
 
+MAX_CONVERSATION_REPLANS = 32
+
 
 class TaskInterrupted(RuntimeError):
     """Internal deterministic interruption seam used to prove checkpoint resume behavior."""
+
+
+_SAFE_TOOL_REFERENCE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 class Orchestrator:
@@ -79,6 +95,8 @@ class Orchestrator:
         self.reflection_memory = reflection_memory or SQLiteReflectionMemory(store)
         self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
         self.learning_memory = learning_memory or SQLiteLearningMemory(store)
+        if isinstance(self.planner, Planner):
+            self.planner.set_learning_memory(self.learning_memory)
         self.learning_engine = learning_engine or LearningEngine(self.learning_memory)
         self.checkpoint_hook = checkpoint_hook
         self.observability = observability or ObservabilityMonitor(store)
@@ -103,6 +121,420 @@ class Orchestrator:
             component="orchestrator",
             metadata=metadata or {},
         )
+
+    @staticmethod
+    def _action_id_for_step(state: TaskState, step_id: str) -> str | None:
+        return next(
+            (
+                action_id
+                for action_id, record in state.action_records.items()
+                if record.get("step_id") == step_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _set_policy_stop_reason(state: TaskState, decisions: list[PolicyDecision]) -> None:
+        blocked = [decision for decision in decisions if not decision.allowed]
+        if not blocked:
+            state.set_stop_reason(None)
+            return
+        pending = next((decision for decision in blocked if decision.decision == "REQUIRE_APPROVAL"), None)
+        selected = pending or blocked[0]
+        action_record = state.action_records.get(selected.action_id, {})
+        step_id = action_record.get("step_id") if isinstance(action_record, dict) else None
+        state.set_stop_reason(
+            TaskStopReasonCode.APPROVAL_REQUIRED if pending else TaskStopReasonCode.POLICY_BLOCKED,
+            step_id=step_id,
+            action_id=selected.action_id,
+        )
+
+    def _preflight_bound_step(
+        self,
+        state: TaskState,
+        step: PlanStep,
+        context: ExecutionContext,
+        *,
+        plan: TaskPlan,
+        prior: list[dict[str, Any]],
+        learned_context: list[dict[str, Any]],
+        attempts: int,
+        step_results: list[StepResult],
+        outcomes: list[StepOutcome],
+        diagnoses: list[dict[str, Any]],
+        experience: ExperienceRecord,
+        approval_ids: dict[str, str] | None = None,
+        always: bool = False,
+    ) -> dict[str, Any] | None:
+        if self.security is None or (not step.input_bindings and not always):
+            return None
+        try:
+            tool = self.tools.get(step.tool)
+        except KeyError:
+            return None
+        except Exception:
+            # This is only an early preflight lookup; execute_step performs the
+            # authoritative lookup and authorization before any side effect.
+            return None
+        if step.input_bindings:
+            resolved_input, binding_error = self.executor._resolve_input_bindings(step, tool, context)
+            if binding_error is not None:
+                return None
+        else:
+            resolved_input = dict(step.input)
+        action = self.security.action_for_tool(
+            state.task_id,
+            step.id,
+            tool,
+            resolved_input,
+            goal=str(plan.goal),
+        )
+        supplied_approval_ids = approval_ids or {}
+        approval_id = (
+            supplied_approval_ids.get(step.id)
+            or state.approval_ids.get(step.id)
+            or supplied_approval_ids.get(step.tool)
+            or state.approval_ids.get(step.tool, "")
+        )
+        decision = self.security.preflight(action, approval_id=approval_id)
+        state.security_decisions[decision.action_id] = decision.to_dict()
+        if decision.approval_id:
+            state.approval_ids[decision.action_id] = decision.approval_id
+        self.store.save_event(
+            state.task_id,
+            "security_bound_action_preflight",
+            {"decision": decision.to_dict()},
+            step_id=step.id,
+        )
+        if decision.allowed:
+            return None
+
+        waiting = decision.decision == "REQUIRE_APPROVAL"
+        state.recovery_state = {
+            "reason": "approval_required" if waiting else "policy_blocked",
+            "decisions": [decision.to_dict()],
+        }
+        state.result = {"final_status": "BLOCKED", **self._plan_provenance(state)}
+        key = state.action_key_for_step(step)
+        # Authorization is pending, but no execution has started. Preserve the
+        # durable action as NOT_STARTED so resume validation cannot mistake a
+        # policy stop for a malformed execution record.
+        record = state.action_record(key)
+        record["step_id"] = step.id
+        record["approval_id"] = decision.approval_id
+        state.touch()
+        checkpoint = "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED"
+        state.checkpoint(
+            checkpoint,
+            status="WAITING_APPROVAL" if waiting else "BLOCKED",
+            phase="WAITING_APPROVAL" if waiting else "SECURITY_BLOCKED",
+            step_id=step.id,
+            successful=False,
+        )
+        self._set_policy_stop_reason(state, [decision])
+        self._save_checkpoint(state, checkpoint)
+        return self._security_blocked_result(
+            state.task_id,
+            state.goal,
+            plan,
+            prior,
+            learned_context,
+            [decision],
+            state=state,
+            attempts=attempts,
+            step_results=step_results,
+            outcomes=outcomes,
+            diagnoses=diagnoses,
+            experience=experience,
+        )
+
+    def _verified_outcomes_for_plan(self, state: TaskState, plan: TaskPlan) -> dict[str, StepOutcome]:
+        outcomes: dict[str, StepOutcome] = {}
+        for step in plan.steps:
+            key = state.action_key_for_step(step)
+            record = state.action_records.get(key)
+            observation_payload = state.observations.get(key)
+            verification = state.verification_results.get(key)
+            if (
+                key not in state.completed_actions
+                or not isinstance(record, dict)
+                or record.get("status") != "VERIFIED"
+                or record.get("step_id") != step.id
+                or not isinstance(observation_payload, dict)
+                or not isinstance(verification, dict)
+            ):
+                continue
+            try:
+                observation = Observation(**observation_payload)
+                outcome = StepOutcome(
+                    state.task_id,
+                    observation.step_id,
+                    observation.tool_name,
+                    observation.execution_status,
+                    str(verification.get("status", "FAILED")),
+                    observation,
+                    verification,
+                )
+            except (TypeError, KeyError):
+                continue
+            outcomes[step.id] = outcome
+        return outcomes
+
+    @staticmethod
+    def _plan_provenance(state: TaskState | None) -> dict[str, Any]:
+        if state is None or not state.plan:
+            return {"planning_mode": UNKNOWN, "plan_version": 0}
+        version = normalize_plan_version(state.plan_version)
+        if version < 1:
+            version = 0
+        return {"planning_mode": planning_mode_from_plan(state.plan), "plan_version": version}
+
+    @classmethod
+    def _bind_step_result_provenance(cls, result: StepResult, state: TaskState) -> None:
+        provenance = cls._plan_provenance(state)
+        result.planning_mode = provenance["planning_mode"]
+        result.plan_version = provenance["plan_version"]
+
+    def _block_conversation_replan(self, state: TaskState, reason: str) -> dict[str, Any]:
+        result = {
+            "task_id": state.task_id,
+            "goal": state.goal,
+            **self._plan_provenance(state),
+            "errors": [reason],
+            "verification": {"verified": False, "status": "BLOCKED"},
+            "final_status": "BLOCKED",
+        }
+        state.result = result
+        state.checkpoint(
+            "CONVERSATION_REPLAN_BLOCKED",
+            status="BLOCKED",
+            phase="CONVERSATION_REPLAN_BLOCKED",
+            successful=False,
+        )
+        self._save_checkpoint(state, "CONVERSATION_REPLAN_BLOCKED")
+        self.store.save_event(state.task_id, "conversation_replan_blocked", {"reason": reason})
+        return result
+
+    def _maybe_replan_from_followups(
+        self,
+        state: TaskState,
+        current_plan: TaskPlan,
+        *,
+        prior: list[dict[str, Any]],
+        retrieved: list[dict[str, Any]],
+        reflection_context: list[dict[str, Any]],
+        learned_context: list[dict[str, Any]],
+    ) -> tuple[TaskPlan, list[PolicyDecision], dict[str, Any] | None, bool]:
+        """Consume pending follow-ups only after a persisted verified-action checkpoint."""
+        if not self.store.has_active_lease_context(state.task_id):
+            return current_plan, list(state.security_decisions.values()), None, False
+        has_verified_current_step = any(
+            isinstance(record, dict)
+            and record.get("step_id") == state.current_step
+            and record.get("status") == "VERIFIED"
+            and key in state.completed_actions
+            for key, record in state.action_records.items()
+        )
+        if state.status != "READY" or not state.current_step or not has_verified_current_step:
+            return current_plan, list(state.security_decisions.values()), None, False
+        try:
+            pending = self.store.pending_task_messages_for_worker(state.task_id)
+        except ValueError as exc:
+            # A stale or non-verification checkpoint is a reason to leave messages pending,
+            # never to infer that an action completed.
+            if str(exc) in {
+                "conversation_safe_checkpoint_required",
+                "conversation_verified_action_required",
+            }:
+                return current_plan, list(state.security_decisions.values()), None, False
+            raise
+        if not pending:
+            return current_plan, list(state.security_decisions.values()), None, False
+        if state.context.get("task_kind") == "bug_bounty":
+            message_ids = tuple(
+                item["message_id"]
+                for item in pending
+                if isinstance(item, dict) and isinstance(item.get("message_id"), str) and item["message_id"]
+            )
+            if len(message_ids) != len(pending):
+                return current_plan, list(state.security_decisions.values()), None, False
+            checkpoint_type = "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED"
+            state.checkpoint(
+                checkpoint_type,
+                status="READY",
+                phase=checkpoint_type,
+                step_id=state.current_step,
+                successful=True,
+            )
+            self._save_checkpoint(state, checkpoint_type, consume_message_ids=message_ids)
+            return current_plan, list(state.security_decisions.values()), None, False
+
+        followups = [
+            str(item.get("content", "")).strip()
+            for item in pending
+            if isinstance(item, dict) and str(item.get("content", "")).strip()
+        ]
+        effective_goal = state.goal
+        if followups:
+            effective_goal += "\n\nUser follow-up messages:\n" + "\n".join(
+                f"- {content}" for content in followups
+            )
+        try:
+            proposed = self._create_plan(effective_goal, prior, retrieved, reflection_context, learned_context)
+            if not proposed.steps:
+                raise ValueError("conversation_plan_empty")
+            previous_completed: list[tuple[PlanStep, str, dict[str, Any]]] = []
+            for step in current_plan.steps:
+                old_key = state.action_key_for_step(step)
+                if old_key not in state.completed_actions:
+                    continue
+                record = state.action_records.get(old_key)
+                observation = state.observations.get(old_key)
+                verification = state.verification_results.get(old_key)
+                if (
+                    not isinstance(record, dict)
+                    or record.get("status") != "VERIFIED"
+                    or record.get("action_key") != old_key
+                    or record.get("input_fingerprint") != old_key
+                    or record.get("step_id") != step.id
+                    or record.get("tool_name") != step.tool
+                    or not isinstance(observation, dict)
+                    or record.get("observation") != observation
+                    or not isinstance(verification, dict)
+                    or verification.get("status") != "VERIFIED"
+                    or verification.get("verified") is not True
+                    or record.get("verification") != verification
+                ):
+                    raise ValueError("conversation_completed_action_untrusted")
+                previous_completed.append((step, old_key, record))
+
+            preserved_by_id = {step.id: step for step, _, _ in previous_completed}
+            candidate_to_id: dict[str, str] = {}
+            exact_matches: set[str] = set()
+
+            def equivalent(left: PlanStep, right: PlanStep) -> bool:
+                return all(
+                    getattr(left, name) == getattr(right, name)
+                    for name in ("id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "input_bindings")
+                )
+
+            for index, step in enumerate(proposed.steps, start=1):
+                existing = preserved_by_id.get(step.id)
+                if existing is not None and equivalent(existing, step):
+                    candidate_to_id[step.id] = existing.id
+                    exact_matches.add(step.id)
+                else:
+                    candidate_to_id[step.id] = f"conversation-{state.plan_version + 1}-{index}"
+
+            new_steps: list[PlanStep] = []
+            for step in proposed.steps:
+                if step.id in exact_matches:
+                    continue
+                new_id = candidate_to_id[step.id]
+                dependencies = [candidate_to_id.get(dep, dep) for dep in step.depends_on]
+                new_steps.append(
+                    PlanStep(
+                        id=new_id,
+                        objective=step.objective,
+                        tool=step.tool,
+                        input=dict(step.input),
+                        reason=step.reason,
+                        depends_on=dependencies,
+                        verifier=step.verifier,
+                        success_criteria=dict(step.success_criteria),
+                        status="pending",
+                        output={},
+                        input_bindings={
+                            target: {
+                                **binding,
+                                "source_step_id": candidate_to_id.get(binding["source_step_id"], binding["source_step_id"]),
+                            }
+                            for target, binding in step.input_bindings.items()
+                        },
+                    )
+                )
+            merged_steps = [step for step, _, _ in previous_completed] + new_steps
+            all_ids = [step.id for step in merged_steps]
+            if not merged_steps or len(merged_steps) > 64 or len(set(all_ids)) != len(all_ids):
+                raise ValueError("conversation_plan_shape_invalid")
+            id_set = set(all_ids)
+            if any(not set(step.depends_on).issubset(id_set) for step in merged_steps):
+                raise ValueError("conversation_plan_dependency_invalid")
+            merged_plan = TaskPlan(
+                goal=effective_goal,
+                steps=merged_steps,
+                rationale=f"{proposed.rationale}; previously verified actions retained",
+                planning_mode=proposed.planning_mode,
+            )
+        except Exception as exc:
+            blocked = self._block_conversation_replan(state, "conversation_replan_failed")
+            self.store.save_event(
+                state.task_id,
+                "conversation_replan_error",
+                {"error_category": type(exc).__name__},
+            )
+            return current_plan, list(state.security_decisions.values()), blocked, False
+
+        old_completed_keys = {old_key for _, old_key, _ in previous_completed}
+        old_observations = {key: state.observations.get(key) for _, key, _ in previous_completed}
+        old_verifications = {key: state.verification_results.get(key) for _, key, _ in previous_completed}
+        old_records = {key: dict(record) for _, key, record in previous_completed}
+        completed_before = list(state.completed_actions)
+        state.set_plan(self._plan_payload(merged_plan), version=state.plan_version + 1)
+        new_completed_keys: list[str] = []
+        for step, old_key, record in previous_completed:
+            new_key = state.action_key_for_step(step)
+            remapped = dict(old_records[old_key])
+            remapped["action_key"] = new_key
+            remapped["input_fingerprint"] = new_key
+            state.action_records[new_key] = remapped
+            if old_observations[old_key] is not None:
+                state.observations[new_key] = old_observations[old_key]
+            if old_verifications[old_key] is not None:
+                state.verification_results[new_key] = old_verifications[old_key]
+            if old_key != new_key:
+                state.action_records.pop(old_key, None)
+                state.observations.pop(old_key, None)
+                state.verification_results.pop(old_key, None)
+            new_completed_keys.append(new_key)
+        state.completed_actions = [key for key in completed_before if key not in old_completed_keys] + new_completed_keys
+        state.pending_actions = [
+            state.action_key_for_step(step)
+            for step in merged_plan.steps
+            if state.action_key_for_step(step) not in set(state.completed_actions)
+        ]
+        message_ids = [str(item["message_id"]) for item in pending]
+        state.context["conversation_replans"] = list(state.context.get("conversation_replans", [])) + [
+            {"message_ids": message_ids, "plan_version": state.plan_version}
+        ]
+        state.checkpoint(
+            "CONVERSATION_REPLANNED",
+            status="READY",
+            phase="CONVERSATION_REPLANNED",
+            successful=True,
+        )
+        self._save_checkpoint(state, "CONVERSATION_REPLANNED", consume_message_ids=message_ids)
+        self.store.save_event(
+            state.task_id,
+            "conversation_plan_updated",
+            {"message_ids": message_ids, "plan_version": state.plan_version, "step_count": len(merged_plan.steps)},
+        )
+        if self.security is not None:
+            try:
+                security_ok, decisions = self._revalidate_resume_security(state, merged_plan)
+            except (KeyError, StateIntegrityError, ValueError):
+                blocked = self._resume_blocked(state, "conversation_security_revalidation_error")
+                return merged_plan, list(state.security_decisions.values()), blocked, True
+            if not security_ok:
+                blocked = self._resume_blocked(
+                    state,
+                    "conversation_security_revalidation_blocked",
+                    decisions=decisions,
+                )
+                return merged_plan, decisions, blocked, True
+        else:
+            decisions = []
+        return merged_plan, decisions, None, True
 
     def run(
         self,
@@ -135,12 +567,14 @@ class Orchestrator:
         self._checkpoint(state, "TASK_CREATED", phase="TASK_CREATED", successful=True)
         state.checkpoint("TASK_PLANNING", status="PLANNING", phase="PLANNING", successful=True)
         self._save_checkpoint(state, "TASK_PLANNING")
-        prior = self.store.search_knowledge(goal)
-        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal))
+        # Legacy knowledge rows are advisory and have no source-bound trust
+        # record. Only signed, fresh typed claims may enter planning context.
+        prior = self.store.search_knowledge_claims(goal, task_id=task_id)
+        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal, task_id=task_id))
         retrieved_payload = [item.to_dict() for item in retrieved]
         reflection_context = [
             insight.to_dict()
-            for insight in self.reflection_memory.list_relevant({"goal": goal}, limit=5)
+            for insight in self.reflection_memory.list_relevant({"goal": goal, "task_id": task_id}, limit=5)
         ]
         learned_context = [
             strategy.to_dict()
@@ -149,6 +583,7 @@ class Orchestrator:
                     "goal": goal,
                     "task_type": "bug_bounty" if state.context.get("task_kind") == "bug_bounty" else "general",
                     "tools": [metadata["name"] for metadata in self.tools.available()],
+                    "task_id": task_id,
                 },
                 limit=5,
             )
@@ -177,6 +612,9 @@ class Orchestrator:
                         for key in ("scope", "fixture", "urls", "openapi", "source_documents")
                         if key in request
                     }
+                    provenance = state.context.get("program_analysis_provenance")
+                    if isinstance(provenance, dict):
+                        step_input["research_stage_refs"] = provenance.get("research_stage_refs", [])
                     objective = "Run bounded local Bug Bounty analysis"
                     reason = "Explicit API request routed to the registered local-only analysis contract"
                     required_fields = ["run", "report"]
@@ -193,6 +631,10 @@ class Orchestrator:
                     required_fields = ["scan"]
                 else:
                     raise ValueError("scanner_type_unsupported")
+                try:
+                    self.tools.get(tool_name)
+                except KeyError as exc:
+                    raise CapabilityUnavailableError([tool_name]) from exc
                 initial_plan = TaskPlan(
                     goal=goal,
                     steps=[PlanStep(
@@ -205,9 +647,28 @@ class Orchestrator:
                         success_criteria={"required_fields": required_fields},
                     )],
                     rationale="Specialized Bug Bounty route; normal plan validation and execution authorization remain authoritative",
+                    planning_mode=DETERMINISTIC_ROUTE,
                 )
             else:
-                initial_plan = self._create_plan(goal, prior, retrieved_payload, reflection_context, learned_context)
+                initial_plan = self._create_plan(
+                    goal, prior, retrieved_payload, reflection_context, learned_context, task_id=task_id,
+                )
+        except CapabilityUnavailableError as exc:
+            registered_names = [str(metadata["name"]) for metadata in self.tools.available()]
+            registered_set = set(registered_names)
+            if exc.reason == "no_registered_tools":
+                if registered_names:
+                    raise PlanValidationError(["capability_registry_changed_during_planning"]) from exc
+                unavailable_names: list[str] = []
+            else:
+                unavailable_names = [name for name in exc.unavailable_tools if name not in registered_set]
+                if not unavailable_names:
+                    raise PlanValidationError(["capability_registry_changed_during_planning"]) from exc
+            return self._capability_gap_result(
+                state,
+                unavailable_tool_names=unavailable_names,
+                registered_tool_names=registered_names,
+            )
         except Exception as exc:
             self._emit_observability(
                 "PLAN_REJECTED",
@@ -262,13 +723,14 @@ class Orchestrator:
                     "reason": "approval_required" if waiting else "policy_blocked",
                     "decisions": [decision.to_dict() for decision in blocked],
                 }
-                state.result = {"final_status": "BLOCKED"}
+                state.result = {"final_status": "BLOCKED", **self._plan_provenance(state)}
                 state.checkpoint(
                     "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED",
                     status="WAITING_APPROVAL" if waiting else "BLOCKED",
                     phase="WAITING_APPROVAL" if waiting else "SECURITY_BLOCKED",
                     successful=False,
                 )
+                self._set_policy_stop_reason(state, blocked)
                 self._save_checkpoint(state, "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED")
                 return self._security_blocked_result(
                     task_id,
@@ -297,9 +759,10 @@ class Orchestrator:
         diagnoses: list[dict[str, Any]] = []
         rounds = 0
         terminal_status = "FAILED"
+        verified_previous_results: dict[str, StepResult] = {}
 
         self.store.save_event(task_id, "plan_created", {"goal": goal, "steps": [step.__dict__ for step in current_plan.steps]})
-        max_rounds = 1 + self.recovery.max_recovery_attempts
+        max_rounds = 1 + self.recovery.max_recovery_attempts + MAX_CONVERSATION_REPLANS
         while rounds < max_rounds:
             rounds += 1
             if rounds > 1:
@@ -311,21 +774,48 @@ class Orchestrator:
             recovery_requested = False
             latest_outcomes = {}
             pending_steps = [
-                step for step in current_plan.steps
+                step for step in self._ordered_plan_steps(current_plan)
                 if state.action_key_for_step(step) not in set(state.completed_actions)
             ]
             if not pending_steps:
+                # A follow-up replan can retain only verified steps. Restore
+                # their outcomes before final verification instead of losing
+                # them when the next round resets latest_outcomes.
+                latest_outcomes = self._verified_outcomes_for_plan(state, current_plan)
                 terminal_status = "COMPLETED"
                 break
+            execution_metadata = {"attempt": rounds, "goal": current_plan.goal}
+            provenance = state.context.get("program_analysis_provenance")
+            if state.context.get("task_kind") == "bug_bounty" and isinstance(provenance, dict):
+                execution_metadata["program_analysis_provenance"] = provenance
             execution_context = ExecutionContext(
                 task_id=task_id,
+                previous_results={},
                 approved_permissions=set(self.approved_permissions),
-                metadata={"attempt": rounds, "goal": current_plan.goal},
+                metadata=execution_metadata,
                 security_controller=self.security,
                 approval_ids={**state.approval_ids, **approval_ids},
                 observability=self.observability,
             )
             for step in pending_steps:
+                step_context = self._isolated_execution_context(execution_context, verified_previous_results)
+                approval_block = self._preflight_bound_step(
+                    state,
+                    step,
+                    step_context,
+                    plan=current_plan,
+                    prior=prior,
+                    learned_context=learned_context,
+                    attempts=rounds,
+                    step_results=all_step_results,
+                    outcomes=all_outcomes,
+                    diagnoses=diagnoses,
+                    experience=experience,
+                    approval_ids=approval_ids,
+                    always=rounds > 1,
+                )
+                if approval_block is not None:
+                    return approval_block
                 self.store.save_event(task_id, "step_started", {"tool_name": step.tool, "round": rounds}, step_id=step.id)
                 key = state.action_key_for_step(step)
                 self._emit_observability(
@@ -357,9 +847,9 @@ class Orchestrator:
                     step_id=step.id,
                     metadata={"tool_name": step.tool, "round": rounds},
                 )
-                step_result = self._execute_one(step, execution_context)
+                step_result = self._execute_one(step, step_context)
+                self._bind_step_result_provenance(step_result, state)
                 all_step_results.append(step_result)
-                execution_context.previous_results[step.id] = step_result
                 state.mark_action(
                     key,
                     status="OBSERVING",
@@ -412,6 +902,7 @@ class Orchestrator:
 
                 if outcome.verification_status == "VERIFIED" and outcome.execution_status == "success":
                     step.status = "completed"
+                    verified_previous_results[step.id] = step_result
                     state.mark_action(
                         key,
                         status="VERIFIED",
@@ -428,6 +919,21 @@ class Orchestrator:
                     )
                     state.checkpoint("AFTER_VERIFICATION", status="READY", phase="AFTER_VERIFICATION", step_id=step.id, successful=True)
                     self._save_checkpoint(state, "AFTER_VERIFICATION")
+                    current_plan, updated_decisions, conversation_blocked, conversation_updated = self._maybe_replan_from_followups(
+                        state,
+                        current_plan,
+                        prior=prior,
+                        retrieved=retrieved_payload,
+                        reflection_context=reflection_context,
+                        learned_context=learned_context,
+                    )
+                    if conversation_blocked is not None:
+                        return conversation_blocked
+                    if conversation_updated:
+                        security_decisions = updated_decisions
+                        latest_outcomes = self._verified_outcomes_for_plan(state, current_plan)
+                        recovery_requested = True
+                        break
                     continue
 
                 state.mark_action(
@@ -511,6 +1017,7 @@ class Orchestrator:
                     break
 
                 state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
+                verified_previous_results.clear()
                 self._emit_observability(
                     "PLAN_UPDATED",
                     task_id=task_id,
@@ -550,12 +1057,18 @@ class Orchestrator:
 
         final_outcomes = list(latest_outcomes.values())
         verification_payload = self._task_verification(final_outcomes)
-        if verification_payload["verified"]:
+        if self._task_verification_allows_completion(verification_payload):
             terminal_status = "COMPLETED"
         elif terminal_status == "COMPLETED":
             terminal_status = "FAILED"
 
         experience.final_outcome = terminal_status
+        experience.verification_status = str(verification_payload["status"])
+        experience.verification_scope = str(verification_payload.get("verification_scope", ""))
+        impact_verified = verification_payload.get("security_impact_verified")
+        experience.security_impact_verified = impact_verified if isinstance(impact_verified, bool) else None
+        experience.identity = {}
+        experience.build_identity()
         result = {
             "task_id": task_id,
             "goal": goal,
@@ -568,6 +1081,8 @@ class Orchestrator:
             "step_outcomes": [outcome.to_dict() for outcome in all_outcomes],
             "final_step_outcomes": [outcome.to_dict() for outcome in final_outcomes],
             "verification": verification_payload,
+            "planning_mode": state.plan.get("planning_mode", UNKNOWN) if state.plan else UNKNOWN,
+            "plan_version": state.plan_version if state.plan else 0,
             "diagnoses": diagnoses,
             "recovery_attempts": [attempt.to_dict() for attempt in self.recovery.attempts],
             "learned_strategies_used": learned_context,
@@ -581,6 +1096,11 @@ class Orchestrator:
             state.checkpoint("TASK_COMPLETED", status="COMPLETED", phase="TASK_COMPLETED", successful=True)
             self._save_checkpoint(state, "TASK_COMPLETED")
         else:
+            state.set_stop_reason(
+                TaskStopReasonCode.TASK_FAILED,
+                step_id=state.current_step or None,
+                action_id=self._action_id_for_step(state, state.current_step) if state.current_step else None,
+            )
             state.checkpoint("TASK_FAILED", status="FAILED", phase="TASK_FAILED", successful=False)
             self._save_checkpoint(state, "TASK_FAILED")
         self.experience_memory.store(experience)
@@ -624,7 +1144,7 @@ class Orchestrator:
             task_id,
             goal,
             storage_status,
-            {"rationale": current_plan.rationale, "steps": [step.__dict__ for step in current_plan.steps]},
+            self._plan_payload(current_plan),
             result,
             rounds,
         )
@@ -637,6 +1157,95 @@ class Orchestrator:
         self._persist_knowledge(result["sources"], goal, verification_payload)
         return result
 
+    def _capability_gap_result(
+        self,
+        state: TaskState,
+        *,
+        unavailable_tool_names: list[str],
+        registered_tool_names: list[str],
+    ) -> dict[str, Any]:
+        requested_tools = sorted({
+            name for name in unavailable_tool_names
+            if isinstance(name, str) and _SAFE_TOOL_REFERENCE.fullmatch(name)
+        })[:20]
+        registered_tools = sorted({
+            name for name in registered_tool_names
+            if isinstance(name, str) and _SAFE_TOOL_REFERENCE.fullmatch(name)
+        })[:50]
+        code = "UNREGISTERED_TOOL_REQUEST" if unavailable_tool_names else "NO_REGISTERED_TOOLS"
+        summary = (
+            "The planner requested a tool that is not registered; no tool was executed or installed."
+            if unavailable_tool_names
+            else "No tools are registered for planning; no tool was executed or installed."
+        )
+        gap = {
+            "code": code,
+            "source": "planner_registry_validation",
+            "summary": summary,
+            "requested_tools": requested_tools,
+            "unavailable_tool_count": len(unavailable_tool_names),
+            "registered_tools": registered_tools,
+            "execution_attempted": False,
+            "acquisition_attempted": False,
+            "permissions_granted": False,
+        }
+        state.recovery_state = {"reason": "capability_unavailable", "capability_gap": gap}
+        result = {
+            "task_id": state.task_id,
+            "goal": state.goal,
+            "sources": [],
+            "errors": ["capability_unavailable"],
+            "attempts": 0,
+            "step_results": [],
+            "observations": [],
+            "step_outcomes": [],
+            "final_step_outcomes": [],
+            "verification": self._task_verification([]),
+            "diagnoses": [],
+            "recovery_attempts": [],
+            "security_decisions": [],
+            "capability_gap": gap,
+            "planning_mode": state.plan.get("planning_mode", UNKNOWN) if state.plan else UNKNOWN,
+            "plan_version": state.plan_version if state.plan else 0,
+            "final_status": "BLOCKED",
+        }
+        state.result = result
+        state.context["attempts"] = 0
+        state.checkpoint(
+            "CAPABILITY_GAP_DETECTED",
+            status="BLOCKED",
+            phase="CAPABILITY_GAP",
+            successful=False,
+        )
+        self._save_checkpoint(state, "CAPABILITY_GAP_DETECTED")
+        self.store.save_event(state.task_id, "capability_gap_detected", gap)
+        self._emit_observability(
+            "TASK_BLOCKED",
+            task_id=state.task_id,
+            severity="ERROR",
+            metadata={
+                "reason": "capability_unavailable",
+                "gap_code": code,
+                "unavailable_tool_count": len(unavailable_tool_names),
+                "execution_attempted": False,
+                "acquisition_attempted": False,
+            },
+        )
+        self.store.save_task(
+            state.task_id,
+            state.goal,
+            "blocked",
+            {
+                "goal": state.goal,
+                "rationale": "Planning stopped at the registered-tool boundary",
+                "planning_mode": result["planning_mode"],
+                "steps": [],
+            },
+            result,
+            0,
+        )
+        return result
+
     def _security_blocked_result(
         self,
         task_id: str,
@@ -647,6 +1256,11 @@ class Orchestrator:
         decisions: list[PolicyDecision],
         *,
         state: TaskState | None = None,
+        attempts: int = 0,
+        step_results: list[StepResult] | None = None,
+        outcomes: list[StepOutcome] | None = None,
+        diagnoses: list[dict[str, Any]] | None = None,
+        experience: ExperienceRecord | None = None,
     ) -> dict[str, Any]:
         approval_requests = []
         if self.security is not None:
@@ -655,31 +1269,42 @@ class Orchestrator:
                     request = self.security.approval_gate.get(decision.approval_id)
                     if request is not None:
                         approval_requests.append(request.to_dict())
-        experience = ExperienceRecord(
-            task_id=task_id,
-            goal=goal,
-            context={
-                "prior_knowledge_used": prior,
-                "learned_strategies_used": learned_context,
-                "security_decisions": [decision.to_dict() for decision in decisions],
-            },
-            initial_plan=self._plan_payload(plan),
-            final_outcome="BLOCKED",
-        )
+        if experience is None:
+            experience = ExperienceRecord(
+                task_id=task_id,
+                goal=goal,
+                context={
+                    "prior_knowledge_used": prior,
+                    "learned_strategies_used": learned_context,
+                    "security_decisions": [decision.to_dict() for decision in decisions],
+                },
+                initial_plan=self._plan_payload(plan),
+                final_outcome="BLOCKED",
+            )
+        else:
+            experience.final_outcome = "BLOCKED"
+            experience.context["security_decisions"] = [decision.to_dict() for decision in decisions]
+        step_results = step_results or []
+        outcomes = outcomes or []
+        diagnoses = diagnoses or []
+        outcome_payloads = [item.to_dict() for item in outcomes]
         self.experience_memory.store(experience)
         result = {
             "task_id": task_id,
             "goal": goal,
+            **self._plan_provenance(state),
             "sources": [],
             "errors": ["security_policy_blocked"],
             "prior_knowledge_used": prior,
-            "attempts": 0,
-            "step_results": [],
-            "observations": [],
-            "step_outcomes": [],
-            "final_step_outcomes": [],
-            "verification": self._task_verification([]),
-            "diagnoses": [],
+            "attempts": attempts,
+            "step_results": [item.to_dict() for item in step_results],
+            "observations": [item.observation.to_dict() for item in outcomes],
+            "step_outcomes": outcome_payloads,
+            "final_step_outcomes": [
+                item.to_dict() for item in outcomes if item.verification_status == "VERIFIED"
+            ],
+            "verification": self._task_verification(outcomes),
+            "diagnoses": diagnoses,
             "recovery_attempts": [],
             "learned_strategies_used": learned_context,
             "security_decisions": [decision.to_dict() for decision in decisions],
@@ -703,7 +1328,7 @@ class Orchestrator:
         )
         if state is not None:
             state.result = result
-            state.context["attempts"] = 0
+            state.context["attempts"] = attempts
             state.checkpoint(
                 "SECURITY_BLOCKED",
                 status=state.status,
@@ -711,7 +1336,7 @@ class Orchestrator:
                 successful=False,
             )
             self._save_checkpoint(state, "SECURITY_BLOCKED")
-        self.store.save_task(task_id, goal, "blocked", self._plan_payload(plan), result, 0)
+        self.store.save_task(task_id, goal, "blocked", self._plan_payload(plan), result, attempts)
         return result
 
     def resume_task(
@@ -740,7 +1365,150 @@ class Orchestrator:
                     task_id=state.task_id,
                     metadata={"terminal_state": True},
                 )
-            return state.result or self._resume_failure(task_id, "terminal_state_missing_result")
+            return state.result or self._resume_failure(task_id, "terminal_state_missing_result", state=state)
+
+        def valid_persisted_action_record(key: str, record: Any) -> bool:
+            if not isinstance(key, str) or not isinstance(record, dict):
+                return False
+            status = record.get("status")
+            if status not in ("NOT_STARTED", "EXECUTING", "OBSERVING", "VERIFIED", "FAILED"):
+                return False
+            if record.get("action_key") != key:
+                return False
+            for field in ("step_id", "tool_name", "input_fingerprint", "updated_at"):
+                if not isinstance(record.get(field), str):
+                    return False
+            if status == "NOT_STARTED":
+                return (
+                    key in state.pending_actions
+                    and key not in state.completed_actions
+                    and key not in state.failed_actions
+                    and record.get("tool_name") == ""
+                    and record.get("input_fingerprint") == ""
+                    and record.get("execution_status") in (None, "")
+                    and record.get("output") is None
+                    and record.get("observation") is None
+                    and record.get("verification") is None
+                )
+            if not all(record.get(field) for field in ("step_id", "tool_name", "input_fingerprint")):
+                return False
+            if record.get("input_fingerprint") != key:
+                return False
+            if status == "EXECUTING":
+                return (
+                    key in state.pending_actions
+                    and key not in state.completed_actions
+                    and record.get("execution_status") in (None, "")
+                    and record.get("output") is None
+                    and record.get("observation") is None
+                    and record.get("verification") is None
+                    and key not in state.observations
+                    and key not in state.verification_results
+                )
+
+            execution_status = record.get("execution_status")
+            if execution_status not in ("success", "failed", "blocked"):
+                return False
+            try:
+                step_result = self._step_result_from_dict(record.get("output"))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return False
+            if (
+                step_result is None
+                or step_result.step_id != record.get("step_id")
+                or step_result.tool_name != record.get("tool_name")
+                or step_result.status != execution_status
+            ):
+                return False
+            if status == "OBSERVING":
+                observation = state.observations.get(key)
+                if (
+                    key not in state.pending_actions
+                    or key in state.completed_actions
+                    or record.get("observation") is not None
+                    or record.get("verification") is not None
+                    or key in state.verification_results
+                ):
+                    return False
+                if observation is not None and (
+                    not isinstance(observation, dict)
+                    or observation.get("task_id") != state.task_id
+                    or observation.get("step_id") != record.get("step_id")
+                    or observation.get("tool_name") != record.get("tool_name")
+                    or observation.get("execution_status") != execution_status
+                    or observation.get("observed_output") != step_result.output
+                ):
+                    return False
+                return True
+
+            if status == "VERIFIED":
+                if key not in state.completed_actions:
+                    return False
+            elif key not in state.failed_actions or key in state.completed_actions:
+                return False
+            observation = record.get("observation")
+            verification = record.get("verification")
+            if (
+                not isinstance(observation, dict)
+                or observation != state.observations.get(key)
+                or observation.get("task_id") != state.task_id
+                or observation.get("step_id") != record.get("step_id")
+                or observation.get("tool_name") != record.get("tool_name")
+                or observation.get("execution_status") != execution_status
+                or observation.get("observed_output") != step_result.output
+                or not isinstance(verification, dict)
+                or verification != state.verification_results.get(key)
+                or verification.get("status") not in ("VERIFIED", "FAILED", "INSUFFICIENT", "BLOCKED")
+                or verification.get("verified") is not (verification.get("status") == "VERIFIED")
+            ):
+                return False
+            if status == "VERIFIED":
+                return (
+                    execution_status == "success"
+                    and step_result.error is None
+                    and observation.get("observed_error") is None
+                    and verification.get("status") == "VERIFIED"
+                )
+            return True
+
+        invalid_action_record_keys = [
+            key for key, record in state.action_records.items()
+            if not valid_persisted_action_record(key, record)
+        ]
+        if invalid_action_record_keys:
+            for key in invalid_action_record_keys:
+                state.action_records[key] = {
+                    "action_key": key,
+                    "status": "FAILED",
+                    "execution_status": "failed",
+                    "step_id": "",
+                    "tool_name": "",
+                    "input_fingerprint": "",
+                    "output": None,
+                    "observation": None,
+                    "verification": None,
+                    "approval_id": "",
+                    "updated_at": state.updated_at,
+                }
+                state.completed_actions = [item for item in state.completed_actions if item != key]
+                state.pending_actions = [item for item in state.pending_actions if item != key]
+                if key not in state.failed_actions:
+                    state.failed_actions.append(key)
+            state.recovery_state = {
+                **state.recovery_state,
+                "invalid_action_record_keys": invalid_action_record_keys,
+            }
+            state.touch()
+            if state.status == "EXECUTING":
+                state.transition("EXECUTION_UNKNOWN", phase="EXECUTION_UNKNOWN", step_id=state.current_step)
+            elif state.status == "WAITING_APPROVAL":
+                state.transition("BLOCKED", phase="RESUME_BLOCKED")
+            reason = (
+                "ambiguous_execution_state_invalid_action_record"
+                if state.status == "EXECUTION_UNKNOWN"
+                else "invalid_persisted_action_record"
+            )
+            return self._resume_blocked(state, reason)
 
         self.recovery.attempts.clear()
         self._audit_task_event(state, "TASK_RESUMED", "Task state loaded after process restart")
@@ -786,10 +1554,10 @@ class Orchestrator:
                 self._save_checkpoint(state, "UNKNOWN_RESOLVED")
 
         if state.status == "OBSERVING":
-            state.transition("READY", phase="RESUME_OBSERVING")
+            state.checkpoint("RESUME_OBSERVING", phase="RESUME_OBSERVING")
             self._save_checkpoint(state, "RESUME_OBSERVING")
         elif state.status == "VERIFYING":
-            state.transition("READY", phase="RESUME_VERIFYING")
+            state.checkpoint("RESUME_VERIFYING", phase="RESUME_VERIFYING")
             self._save_checkpoint(state, "RESUME_VERIFYING")
 
         try:
@@ -817,7 +1585,9 @@ class Orchestrator:
             state.checkpoint("APPROVAL_REVALIDATED", status="READY", phase="APPROVAL_REVALIDATED", successful=True)
             self._save_checkpoint(state, "APPROVAL_REVALIDATED")
             return True, []
-        pending_plan = TaskPlan(plan.goal, pending_steps, plan.rationale)
+        pending_plan = TaskPlan(
+            plan.goal, pending_steps, plan.rationale, planning_mode=plan.planning_mode,
+        )
         decisions = self.security.preflight_plan(
             state.task_id,
             pending_plan,
@@ -840,9 +1610,16 @@ class Orchestrator:
                 status="WAITING_APPROVAL" if waiting else "BLOCKED",
                 phase="WAITING_APPROVAL" if waiting else "RESUME_SECURITY_BLOCKED",
             )
+            self._set_policy_stop_reason(state, blocked)
             self._save_checkpoint(state, "BEFORE_WAITING_APPROVAL" if waiting else "RESUME_BLOCKED")
             return False, decisions
-        state.checkpoint("APPROVAL_REVALIDATED", status="READY", phase="APPROVAL_REVALIDATED", successful=True)
+        resumed_lifecycle_status = state.status if state.status in {"OBSERVING", "VERIFYING"} else "READY"
+        state.checkpoint(
+            "APPROVAL_REVALIDATED",
+            status=resumed_lifecycle_status,
+            phase="APPROVAL_REVALIDATED",
+            successful=True,
+        )
         self._save_checkpoint(state, "APPROVAL_REVALIDATED")
         return True, decisions
 
@@ -882,6 +1659,52 @@ class Orchestrator:
         return False
 
     def _resume_execute_state(self, state: TaskState, current_plan: TaskPlan) -> dict[str, Any]:
+        completed_actions = set(state.completed_actions)
+        verified_previous_results: dict[str, StepResult] = {}
+        for step in current_plan.steps:
+            key = state.action_key_for_step(step)
+            record = state.action_records.get(key)
+            record_observation = record.get("observation") if isinstance(record, dict) else None
+            state_observation = state.observations.get(key)
+            if key not in completed_actions:
+                if isinstance(record, dict) and record.get("status") == "VERIFIED":
+                    return self._resume_blocked(state, "persisted_action_completion_conflict")
+                continue
+            record_verification = record.get("verification") if isinstance(record, dict) else None
+            state_verification = state.verification_results.get(key)
+            try:
+                step_result = self._step_result_from_dict(record.get("output")) if isinstance(record, dict) else None
+            except (KeyError, TypeError, ValueError):
+                step_result = None
+            if (
+                not isinstance(record, dict)
+                or record.get("action_key") != key
+                or record.get("status") != "VERIFIED"
+                or record.get("step_id") != step.id
+                or record.get("tool_name") != step.tool
+                or record.get("input_fingerprint") != key
+                or record.get("execution_status") != "success"
+                or not isinstance(record_verification, dict)
+                or record_verification.get("status") != "VERIFIED"
+                or record_verification.get("verified") is not True
+                or state_verification != record_verification
+                or step_result is None
+                or step_result.step_id != step.id
+                or step_result.tool_name != step.tool
+                or step_result.status != "success"
+                or step_result.error is not None
+                or not isinstance(record_observation, dict)
+                or record_observation != state_observation
+                or record_observation.get("task_id") != state.task_id
+                or record_observation.get("step_id") != step.id
+                or record_observation.get("tool_name") != step.tool
+                or record_observation.get("execution_status") != "success"
+                or record_observation.get("observed_error") is not None
+                or record_observation.get("observed_output") != step_result.output
+            ):
+                return self._resume_blocked(state, "persisted_verified_action_untrusted")
+            verified_previous_results[step.id] = step_result
+
         prior = list(state.context.get("prior_knowledge_used", []))
         learned_context = list(state.context.get("learned_strategies_used", []))
         retrieved_payload = list(state.context.get("retrieved_experiences", []))
@@ -919,7 +1742,29 @@ class Orchestrator:
         security_decisions = list(state.security_decisions.values())
         rounds = max(0, int(state.context.get("attempts", 0)))
         terminal_status = "FAILED"
-        max_rounds = max(rounds + 1, 1 + self.recovery.max_recovery_attempts)
+        max_rounds = max(rounds + 1, 1 + self.recovery.max_recovery_attempts) + MAX_CONVERSATION_REPLANS
+        if self.store.has_active_lease_context(state.task_id):
+            current_plan, updated_decisions, conversation_blocked, conversation_updated = self._maybe_replan_from_followups(
+                state,
+                current_plan,
+                prior=prior,
+                retrieved=retrieved_payload,
+                reflection_context=reflection_context,
+                learned_context=learned_context,
+            )
+            if conversation_blocked is not None:
+                return conversation_blocked
+            if conversation_updated:
+                security_decisions = [item.to_dict() for item in updated_decisions]
+                verified_previous_results = {}
+                for step in current_plan.steps:
+                    step_result = self._verified_result_from_action_record(state, step)
+                    if step_result is not None:
+                        verified_previous_results[step.id] = step_result
+                latest = self._verified_outcomes_for_plan(state, current_plan)
+                outcome_by_step = {item.step_id: item for item in all_outcomes}
+                outcome_by_step.update(latest)
+                all_outcomes = list(outcome_by_step.values())
         while rounds < max_rounds:
             rounds += 1
             recovery_requested = False
@@ -928,7 +1773,7 @@ class Orchestrator:
                 if outcome.verification_status == "VERIFIED"
             }
             pending_steps = [
-                step for step in current_plan.steps
+                step for step in self._ordered_plan_steps(current_plan)
                 if state.action_key_for_step(step) not in set(state.completed_actions)
             ]
             if not pending_steps:
@@ -936,8 +1781,9 @@ class Orchestrator:
                 break
             context = ExecutionContext(
                 task_id=state.task_id,
+                previous_results={},
                 approved_permissions=set(self.approved_permissions),
-                metadata={"attempt": rounds, "goal": state.goal},
+                metadata={"attempt": rounds, "goal": current_plan.goal},
                 security_controller=self.security,
                 approval_ids=state.approval_ids,
                 observability=self.observability,
@@ -957,6 +1803,26 @@ class Orchestrator:
                     if step_result is None:
                         return self._resume_blocked(state, "persisted_execution_result_corrupted")
                 else:
+                    step_context = self._isolated_execution_context(context, verified_previous_results)
+                    approval_block = self._preflight_bound_step(
+                        state,
+                        step,
+                        step_context,
+                        plan=current_plan,
+                        prior=prior,
+                        learned_context=learned_context,
+                        attempts=rounds,
+                        step_results=all_step_results,
+                        outcomes=all_outcomes,
+                        diagnoses=diagnoses,
+                        experience=experience,
+                        approval_ids=state.approval_ids,
+                        always=True,
+                    )
+                    if approval_block is not None:
+                        return approval_block
+                    state.observations.pop(key, None)
+                    state.verification_results.pop(key, None)
                     state.mark_action(
                         key,
                         status="EXECUTING",
@@ -968,6 +1834,10 @@ class Orchestrator:
                             tool=step.tool,
                             inputs=step.input,
                         ),
+                        execution_status="",
+                        output=None,
+                        observation=None,
+                        verification=None,
                     )
                     state.context["attempts"] = rounds
                     state.checkpoint("BEFORE_EXECUTION", status="EXECUTING", phase="BEFORE_EXECUTION", step_id=step.id)
@@ -979,7 +1849,8 @@ class Orchestrator:
                         step_id=step.id,
                         metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
                     )
-                    step_result = self._execute_one(step, context)
+                    step_result = self._execute_one(step, step_context)
+                    self._bind_step_result_provenance(step_result, state)
                     state.mark_action(
                         key,
                         status="OBSERVING",
@@ -996,7 +1867,6 @@ class Orchestrator:
                     )
                     self._save_checkpoint_after(state, "AFTER_EXECUTION", step.id)
                 all_step_results.append(step_result)
-                context.previous_results[step.id] = step_result
                 outcome, diagnosis, action = self._observe_verify_diagnose(
                     state.task_id, step, step_result, rounds, experience
                 )
@@ -1026,6 +1896,7 @@ class Orchestrator:
                     },
                 )
                 if outcome.verification_status == "VERIFIED" and outcome.execution_status == "success":
+                    verified_previous_results[step.id] = step_result
                     state.mark_action(
                         key,
                         status="VERIFIED",
@@ -1042,6 +1913,29 @@ class Orchestrator:
                     )
                     state.checkpoint("AFTER_VERIFICATION", status="READY", phase="AFTER_VERIFICATION", step_id=step.id, successful=True)
                     self._save_checkpoint(state, "AFTER_VERIFICATION")
+                    current_plan, updated_decisions, conversation_blocked, conversation_updated = self._maybe_replan_from_followups(
+                        state,
+                        current_plan,
+                        prior=prior,
+                        retrieved=retrieved_payload,
+                        reflection_context=reflection_context,
+                        learned_context=learned_context,
+                    )
+                    if conversation_blocked is not None:
+                        return conversation_blocked
+                    if conversation_updated:
+                        security_decisions = [item.to_dict() for item in updated_decisions]
+                        verified_previous_results = {}
+                        for current_step in current_plan.steps:
+                            previous_result = self._verified_result_from_action_record(state, current_step)
+                            if previous_result is not None:
+                                verified_previous_results[current_step.id] = previous_result
+                        latest = self._verified_outcomes_for_plan(state, current_plan)
+                        outcome_by_step = {item.step_id: item for item in all_outcomes}
+                        outcome_by_step.update(latest)
+                        all_outcomes = list(outcome_by_step.values())
+                        recovery_requested = True
+                        break
                     continue
                 state.mark_action(
                     key,
@@ -1102,6 +1996,7 @@ class Orchestrator:
                     errors.append(str(exc))
                     break
                 state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
+                verified_previous_results.clear()
                 self._emit_observability(
                     "PLAN_UPDATED",
                     task_id=state.task_id,
@@ -1135,11 +2030,17 @@ class Orchestrator:
 
         final_outcomes = list(latest_outcomes.values())
         verification_payload = self._task_verification(final_outcomes)
-        if verification_payload["verified"]:
+        if self._task_verification_allows_completion(verification_payload):
             terminal_status = "COMPLETED"
         elif terminal_status == "COMPLETED":
             terminal_status = "FAILED"
         experience.final_outcome = terminal_status
+        experience.verification_status = str(verification_payload["status"])
+        experience.verification_scope = str(verification_payload.get("verification_scope", ""))
+        impact_verified = verification_payload.get("security_impact_verified")
+        experience.security_impact_verified = impact_verified if isinstance(impact_verified, bool) else None
+        experience.identity = {}
+        experience.build_identity()
         result = {
             "task_id": state.task_id,
             "goal": state.goal,
@@ -1152,6 +2053,7 @@ class Orchestrator:
             "step_outcomes": [item.to_dict() for item in all_outcomes],
             "final_step_outcomes": [item.to_dict() for item in final_outcomes],
             "verification": verification_payload,
+            **self._plan_provenance(state),
             "diagnoses": diagnoses,
             "recovery_attempts": [attempt.to_dict() for attempt in self.recovery.attempts],
             "learned_strategies_used": learned_context,
@@ -1165,6 +2067,11 @@ class Orchestrator:
             state.checkpoint("TASK_COMPLETED", status="COMPLETED", phase="TASK_COMPLETED", successful=True)
             self._save_checkpoint(state, "TASK_COMPLETED")
         else:
+            state.set_stop_reason(
+                TaskStopReasonCode.TASK_FAILED,
+                step_id=state.current_step or None,
+                action_id=self._action_id_for_step(state, state.current_step) if state.current_step else None,
+            )
             state.checkpoint("TASK_FAILED", status="FAILED", phase="TASK_FAILED")
             self._save_checkpoint(state, "TASK_FAILED")
         self.experience_memory.store(experience)
@@ -1212,11 +2119,24 @@ class Orchestrator:
         *,
         decisions: list[PolicyDecision] | None = None,
     ) -> dict[str, Any]:
+        execution_unknown = state.status == "EXECUTION_UNKNOWN"
         waiting = state.status == "WAITING_APPROVAL"
         unresolved_unknown = "ambiguous_execution_state" in reason
         if not waiting and not unresolved_unknown:
             state.transition("BLOCKED", phase="RESUME_BLOCKED")
         state.recovery_state = {**state.recovery_state, "reason": reason}
+        if execution_unknown:
+            state.set_stop_reason(
+                TaskStopReasonCode.EXECUTION_UNKNOWN,
+                step_id=state.current_step or None,
+                action_id=self._action_id_for_step(state, state.current_step) if state.current_step else None,
+            )
+        elif decisions:
+            self._set_policy_stop_reason(state, decisions)
+        elif waiting:
+            # Keep the state reason absent when resume failed for a different,
+            # unclassified cause; do not claim approval is still the blocker.
+            state.set_stop_reason(None)
         result = dict(state.result or {})
         result.update(
             {
@@ -1225,6 +2145,7 @@ class Orchestrator:
                 "errors": list(result.get("errors", [])) + [reason],
                 "security_decisions": [decision.to_dict() for decision in decisions] if decisions else list(state.security_decisions.values()),
                 "final_status": "BLOCKED",
+                **self._plan_provenance(state),
             }
         )
         if self.security is not None:
@@ -1254,14 +2175,20 @@ class Orchestrator:
             )
         return result
 
-    def _resume_failure(self, task_id: str, reason: str) -> dict[str, Any]:
+    def _resume_failure(self, task_id: str, reason: str, *, state: TaskState | None = None) -> dict[str, Any]:
         self.store.save_event(task_id, "resume_blocked", {"reason": reason})
-        return {"task_id": task_id, "errors": [reason], "final_status": "BLOCKED", "verification": {"verified": False, "status": "BLOCKED"}}
+        return {
+            "task_id": task_id,
+            "errors": [reason],
+            "final_status": "BLOCKED",
+            "verification": {"verified": False, "status": "BLOCKED"},
+            **self._plan_provenance(state),
+        }
 
     def _plan_from_payload(self, payload: dict[str, Any]) -> TaskPlan:
         if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
             raise StateIntegrityError("persisted_plan_missing")
-        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output"}
+        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output", "input_bindings"}
         steps = []
         for raw in payload["steps"]:
             if not isinstance(raw, dict) or not set(raw).issubset(allowed):
@@ -1271,11 +2198,18 @@ class Orchestrator:
                     id=raw["id"], objective=raw["objective"], tool=raw["tool"], input=dict(raw.get("input", {})),
                     reason=raw.get("reason", ""), depends_on=list(raw.get("depends_on", [])), verifier=raw.get("verifier", ""),
                     success_criteria=dict(raw.get("success_criteria", {})), status=raw.get("status", "pending"), output=dict(raw.get("output", {})),
+                    input_bindings={key: dict(value) for key, value in raw.get("input_bindings", {}).items()},
                 )
             )
         if not steps:
             raise StateIntegrityError("persisted_plan_empty")
-        return TaskPlan(str(payload.get("goal", "")), steps, str(payload.get("rationale", "")))
+        planning_mode = payload.get("planning_mode", UNKNOWN)
+        if not isinstance(planning_mode, str) or planning_mode not in PLANNING_MODES:
+            raise StateIntegrityError("persisted_plan_planning_mode_invalid")
+        return TaskPlan(
+            str(payload.get("goal", "")), steps, str(payload.get("rationale", "")),
+            planning_mode=planning_mode,
+        )
 
     def _experience_from_state(self, state: TaskState, plan: TaskPlan) -> ExperienceRecord:
         payload = state.result.get("experience", {})
@@ -1290,6 +2224,9 @@ class Orchestrator:
             identity=dict(payload.get("identity", {})),
             metadata=dict(payload.get("metadata", {})),
             created_at=str(payload.get("created_at", "")) or None or ExperienceRecord.__dataclass_fields__["created_at"].default_factory(),
+            verification_status=str(payload.get("verification_status", "")),
+            verification_scope=str(payload.get("verification_scope", "")),
+            security_impact_verified=payload.get("security_impact_verified") if isinstance(payload.get("security_impact_verified"), bool) else None,
         )
 
     @staticmethod
@@ -1302,7 +2239,16 @@ class Orchestrator:
             from private_agent.tools.contracts import ToolError
 
             error = ToolError(error_payload.get("code", "unknown"), error_payload.get("message", ""), error_payload.get("details", {}))
-        return StepResult(payload["step_id"], payload["tool_name"], payload.get("status", "failed"), payload.get("output"), error, dict(payload.get("metadata", {})))
+        return StepResult(
+            payload["step_id"],
+            payload["tool_name"],
+            payload.get("status", "failed"),
+            payload.get("output"),
+            error,
+            dict(payload.get("metadata", {})),
+            normalize_planning_mode(payload.get("planning_mode", UNKNOWN)),
+            normalize_plan_version(payload.get("plan_version", 0)),
+        )
 
     def _save_checkpoint_after(self, state: TaskState, checkpoint_type: str, step_id: str, *, status: str = "OBSERVING") -> None:
         state.checkpoint(checkpoint_type, status=status, phase=checkpoint_type, step_id=step_id)
@@ -1321,9 +2267,15 @@ class Orchestrator:
         state.checkpoint(checkpoint_type, status=status, phase=phase, step_id=step_id, successful=successful)
         self._save_checkpoint(state, checkpoint_type)
 
-    def _save_checkpoint(self, state: TaskState, checkpoint_type: str) -> None:
+    def _save_checkpoint(
+        self,
+        state: TaskState,
+        checkpoint_type: str,
+        *,
+        consume_message_ids: list[str] | tuple[str, ...] = (),
+    ) -> None:
         state.validate()
-        self.store.save_task_state(state, checkpoint_type)
+        self.store.save_task_state(state, checkpoint_type, consume_message_ids=consume_message_ids)
         special_events = {
             "TASK_CREATED": "TASK_CREATED",
             "TASK_COMPLETED": "TASK_COMPLETED",
@@ -1389,6 +2341,7 @@ class Orchestrator:
         retrieved: list[dict[str, Any]],
         reflection_insights: list[dict[str, Any]],
         learned_strategies: list[dict[str, Any]],
+        task_id: str = "",
     ) -> TaskPlan:
         parameters = inspect.signature(self.planner.create).parameters
         kwargs: dict[str, Any] = {}
@@ -1400,6 +2353,8 @@ class Orchestrator:
             kwargs["reflection_insights"] = reflection_insights
         if "learned_strategies" in parameters:
             kwargs["learned_strategies"] = learned_strategies
+        if "task_id" in parameters:
+            kwargs["task_id"] = task_id
         return self.planner.create(goal, self.tools, prior, **kwargs)
 
     def _observe_verify_diagnose(
@@ -1482,16 +2437,101 @@ class Orchestrator:
         diagnosis = self.diagnoser.diagnose(step_result=step_result, observation=observation, verification=verification)
         return outcome, diagnosis, action
 
-    def _execute_one(self, step: PlanStep, context: ExecutionContext) -> StepResult:
-        if callable(getattr(self.executor, "execute_step", None)):
-            return self.executor.execute_step(step, context)
-        results = self.executor.execute_plan(
-            TaskPlan(context.metadata.get("goal", ""), [step], "checkpointed single-step execution"),
-            context,
+    @staticmethod
+    def _ordered_plan_steps(plan: TaskPlan) -> list[PlanStep]:
+        ordered, error = GenericExecutor._dependency_order(plan.steps)
+        if error is not None:
+            raise StateIntegrityError(f"invalid_plan_dependencies:{error}")
+        return ordered
+
+    def _verified_result_from_action_record(self, state: TaskState, step: PlanStep) -> StepResult | None:
+        key = state.action_key_for_step(step)
+        record = state.action_records.get(key)
+        verification = record.get("verification") if isinstance(record, dict) else None
+        record_observation = record.get("observation") if isinstance(record, dict) else None
+        if (
+            key not in state.completed_actions
+            or not isinstance(record, dict)
+            or record.get("action_key") != key
+            or record.get("status") != "VERIFIED"
+            or record.get("step_id") != step.id
+            or record.get("tool_name") != step.tool
+            or record.get("input_fingerprint") != key
+            or record.get("execution_status") != "success"
+            or not isinstance(verification, dict)
+            or verification.get("status") != "VERIFIED"
+            or verification.get("verified") is not True
+            or state.verification_results.get(key) != verification
+            or not isinstance(record_observation, dict)
+            or record_observation != state.observations.get(key)
+            or record_observation.get("task_id") != state.task_id
+            or record_observation.get("step_id") != step.id
+            or record_observation.get("tool_name") != step.tool
+            or record_observation.get("execution_status") != "success"
+            or record_observation.get("observed_error") is not None
+        ):
+            return None
+        result = self._step_result_from_dict(record.get("output"))
+        if (
+            result is None
+            or result.step_id != step.id
+            or result.tool_name != step.tool
+            or result.status != "success"
+            or result.error is not None
+            or record_observation.get("observed_output") != result.output
+        ):
+            return None
+        return result
+
+    def _isolated_execution_context(
+        self,
+        base: ExecutionContext,
+        verified_results: dict[str, StepResult],
+    ) -> ExecutionContext:
+        previous_results: dict[str, StepResult] = {}
+        for step_id, result in verified_results.items():
+            if (
+                not isinstance(result, StepResult)
+                or result.step_id != step_id
+                or result.status != "success"
+                or result.error is not None
+            ):
+                raise StateIntegrityError("verified_dependency_result_identity_mismatch")
+            try:
+                payload = json.loads(json.dumps(result.to_dict(), ensure_ascii=False, allow_nan=False))
+            except (TypeError, ValueError) as exc:
+                raise StateIntegrityError("verified_dependency_result_not_json_safe") from exc
+            copied = self._step_result_from_dict(payload)
+            if (
+                copied is None
+                or copied.step_id != step_id
+                or copied.tool_name != result.tool_name
+                or copied.status != "success"
+                or copied.error is not None
+            ):
+                raise StateIntegrityError("verified_dependency_result_copy_invalid")
+            previous_results[step_id] = copied
+        try:
+            limits = json.loads(json.dumps(base.limits, ensure_ascii=False, allow_nan=False))
+            metadata = json.loads(json.dumps(base.metadata, ensure_ascii=False, allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise StateIntegrityError("execution_context_not_json_safe") from exc
+        return ExecutionContext(
+            task_id=base.task_id,
+            previous_results=previous_results,
+            approved_permissions=set(base.approved_permissions),
+            limits=limits,
+            metadata=metadata,
+            security_controller=self.security,
+            approval_ids=dict(base.approval_ids),
+            observability=base.observability,
+            verified_result_ids=set(previous_results),
         )
-        if not results:
-            return StepResult.failed(step.id, step.tool, "empty_executor_result", "Executor returned no step result")
-        return results[0]
+
+    def _execute_one(self, step: PlanStep, context: ExecutionContext) -> StepResult:
+        # Production owns a GenericExecutor and must execute one step at a time:
+        # execute_plan gates dependencies on execution success, not verification.
+        return self.executor.execute_step(step, context)
 
     def _apply_decision(
         self,
@@ -1510,6 +2550,7 @@ class Orchestrator:
                     tools=[step.tool],
                     failure_type=diagnosis.failure_type,
                     recovery_strategy=decision.strategy,
+                    task_id=experience.task_id,
                 )
             )
         ]
@@ -1522,6 +2563,7 @@ class Orchestrator:
                     "tools": [step.tool],
                     "failure_types": [diagnosis.failure_type],
                     "recovery_strategies": [decision.strategy],
+                    "task_id": experience.task_id,
                 },
                 limit=5,
             )
@@ -1534,6 +2576,7 @@ class Orchestrator:
                     "task_type": "general",
                     "tools": [step.tool],
                     "failure_types": [diagnosis.failure_type],
+                    "task_id": experience.task_id,
                 },
                 limit=5,
             )
@@ -1617,8 +2660,29 @@ class Orchestrator:
         return {
             "goal": plan.goal,
             "rationale": plan.rationale,
+            "planning_mode": plan.planning_mode if plan.planning_mode in PLANNING_MODES else UNKNOWN,
             "steps": [step.__dict__ for step in plan.steps],
         }
+
+    @staticmethod
+    def _task_verification_allows_completion(payload: dict[str, Any]) -> bool:
+        if payload.get("verified") is True:
+            return True
+        details = payload.get("details", {})
+        step_statuses = details.get("step_statuses", []) if isinstance(details, dict) else []
+        return (
+            payload.get("status") == "INSUFFICIENT"
+            and payload.get("verification_scope") == "STATIC_ONLY"
+            and payload.get("security_impact_verified") is False
+            and isinstance(details, dict)
+            and details.get("code") == "security_impact_not_verified"
+            and details.get("verification_scope") == "STATIC_ONLY"
+            and details.get("security_impact_verified") is False
+            and isinstance(step_statuses, list)
+            and bool(step_statuses)
+            and len(step_statuses) == details.get("step_count")
+            and all(status == "VERIFIED" for status in step_statuses)
+        )
 
     @staticmethod
     def _task_verification(outcomes: list[StepOutcome]) -> dict[str, Any]:
@@ -1642,16 +2706,56 @@ class Orchestrator:
             status = "INSUFFICIENT"
         else:
             status = "VERIFIED"
-        return {
+        limited_scope_steps: list[StepOutcome] = []
+        limited_scopes: list[str] = []
+        for outcome in outcomes:
+            verification = outcome.verification if isinstance(outcome.verification, dict) else {}
+            details = verification.get("details", {})
+            if isinstance(details, dict) and details.get("security_impact_verified") is False:
+                scope = details.get("verification_scope")
+                if isinstance(scope, str) and scope:
+                    limited_scope_steps.append(outcome)
+                    limited_scopes.append(scope)
+        limited_scope_completion = status == "VERIFIED" and bool(limited_scope_steps)
+        if limited_scope_completion:
+            status = "INSUFFICIENT"
+        scope_label = (
+            "STATIC_ONLY"
+            if limited_scope_steps and all(scope.startswith("static_") for scope in limited_scopes)
+            else "LIMITED"
+            if limited_scope_steps
+            else "TASK_CRITERIA"
+        )
+        details_payload: dict[str, Any] = {"step_count": len(outcomes), "step_statuses": statuses}
+        if limited_scope_steps:
+            details_payload.update(
+                {
+                    "verification_scope": scope_label,
+                    "security_impact_verified": False,
+                    "limited_step_ids": [outcome.step_id for outcome in limited_scope_steps],
+                }
+            )
+        if limited_scope_completion:
+            details_payload["code"] = "security_impact_not_verified"
+        reason = (
+            "Step checks passed within a limited static-only scope; security impact was not verified"
+            if limited_scope_completion
+            else f"Step verification statuses: {', '.join(statuses)}"
+        )
+        payload = {
             "status": status,
             "verified": status == "VERIFIED",
-            "reason": f"Step verification statuses: {', '.join(statuses)}",
+            "reason": reason,
             "evidence": [{"step_id": outcome.step_id, "status": outcome.verification_status} for outcome in outcomes],
             "verifier_type": "orchestrator",
-            "details": {"step_count": len(outcomes), "step_statuses": statuses},
+            "verification_scope": scope_label,
+            "details": details_payload,
             "criteria": {},
             "errors": [],
         }
+        if limited_scope_steps:
+            payload["security_impact_verified"] = False
+        return payload
 
     @staticmethod
     def _collect_sources(outcomes: list[StepOutcome]) -> list[dict[str, Any]]:

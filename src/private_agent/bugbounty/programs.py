@@ -160,6 +160,14 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def scope_proposal_digest(proposal: Mapping[str, Any] | None) -> str:
+    """Digest the exact persisted, public-safe proposal representation."""
+    if not isinstance(proposal, Mapping):
+        return ""
+    canonical = json.dumps(safe_json(dict(proposal)), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _parse_iso(value: str) -> str:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -285,6 +293,7 @@ class ProgramAnalysis:
             "source": self.source.to_dict(),
             "status": self.status,
             "scope_proposal": scope,
+            "proposal_digest": scope_proposal_digest(scope),
             "exclusions": list(self.exclusions),
             "ambiguities": list(self.ambiguities),
             "limitations": list(self.limitations),

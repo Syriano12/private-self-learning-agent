@@ -30,7 +30,13 @@ class ResearchStageExecutor:
     def __init__(self, *, passive_adapter: PassiveResearchAdapter | None = None) -> None:
         self.passive_adapter = passive_adapter or PassiveResearchAdapter()
 
-    def execute(self, stage: ResearchStage, analysis: Mapping[str, Any] | None) -> StageExecutionOutcome:
+    def execute(
+        self,
+        stage: ResearchStage,
+        analysis: Mapping[str, Any] | None,
+        *,
+        report_artifacts: list[dict[str, str]] | None = None,
+    ) -> StageExecutionOutcome:
         if stage.stage_type == ResearchStageType.PROGRAM_ANALYSIS.value:
             if analysis is None:
                 return StageExecutionOutcome(
@@ -164,16 +170,16 @@ class ResearchStageExecutor:
                 )
             return StageExecutionOutcome(ResearchStageStatus.COMPLETED.value, result, {},)
         if stage.stage_type == ResearchStageType.REPORT_PREPARATION.value:
-            if not stage.input_payload.get("artifacts"):
+            if not report_artifacts:
                 return StageExecutionOutcome(
-                    ResearchStageStatus.UNAVAILABLE.value,
+                    ResearchStageStatus.FAILED.value,
                     {},
                     {},
-                    "external_runtime_unavailable",
-                    "Report preparation requires local stage-result artifacts; external collection is disabled",
+                    "report_source_lineage_required",
+                    "Report preparation requires server-resolved completed stage results",
                 )
             result = build_local_report(
-                stage.input_payload,
+                {"artifacts": report_artifacts},
                 max_items=stage.budget.max_items,
                 max_output_bytes=stage.budget.max_output_bytes,
             )

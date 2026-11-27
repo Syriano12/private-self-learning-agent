@@ -97,6 +97,7 @@ def make_service(
     *,
     token: str | None = API_TOKEN,
     hook=None,
+    planner=None,
 ) -> tuple[AgentAPIService, Store, ObservabilityMonitor]:
     store = Store(tmp_path / "api.sqlite3")
     monitor = ObservabilityMonitor(store)
@@ -104,7 +105,7 @@ def make_service(
     core = Orchestrator(
         store,
         make_registry(tool),
-        planner=APIPlanner(tool.name),
+        planner=planner or APIPlanner(tool.name),
         security_controller=security,
         observability=monitor,
         checkpoint_hook=hook,
@@ -182,9 +183,12 @@ def test_valid_authentication_creates_real_typed_task_response(tmp_path: Path) -
     assert body["current_phase"] == "QUEUED"
     assert body["created_at"]
     assert body["api_version"] == "v1"
-    assert body["schema_version"] == 1
+    assert body["schema_version"] == 3
     assert body["request_id"] == response.headers["X-Request-ID"]
     assert store.get_task_state(task_id)["status"] == "QUEUED"
+    listed = client.get("/api/v1/tasks", headers=auth_headers())
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["stop_reason"] is None
     store.close()
 
 
@@ -278,6 +282,7 @@ def test_task_get_is_safe_and_unknown_task_is_404(tmp_path: Path) -> None:
     assert body["plan_version"] == 0
     assert body["checkpoint"]["last_successful_checkpoint"] == "TASK_QUEUED"
     assert body["verification_status"] == "NOT_STARTED"
+    assert body["stop_reason"] is None
     assert '"value":"safe"' not in response.text
     assert "raw sensitive payload" not in response.text
     unknown = client.get("/api/v1/tasks/not-a-real-task", headers=auth_headers())
@@ -348,6 +353,9 @@ def test_execution_unknown_resume_does_not_blindly_retry(tmp_path: Path) -> None
     assert resumed.status_code == 200
     body = resumed.json()
     assert body["status"] == "EXECUTION_UNKNOWN"
+    assert body["stop_reason"]["code"] == "EXECUTION_UNKNOWN"
+    assert body["stop_reason"]["step_id"] == "api-step-1"
+    assert "controlled API interruption" not in resumed.text
     assert body["verification_status"] in {"NOT_STARTED", "BLOCKED"}
     assert tool.calls == 0
     event_types = [event["event_type"] for event in service.observability.get_task_timeline(task_id)]
@@ -361,6 +369,9 @@ def test_approval_list_inspect_approve_and_resume_preserve_binding(tmp_path: Pat
     client = client_for(service)
     _, task_id = run_core_task(service, "request a controlled high risk action")
     assert store.get_task_state(task_id)["status"] == "WAITING_APPROVAL"
+    pending_task = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers())
+    assert pending_task.status_code == 200
+    assert pending_task.json()["stop_reason"]["code"] == "APPROVAL_REQUIRED"
     pending = client.get("/api/v1/approvals", headers=auth_headers())
     assert pending.status_code == 200
     assert len(pending.json()) == 1
@@ -383,6 +394,7 @@ def test_approval_list_inspect_approve_and_resume_preserve_binding(tmp_path: Pat
     resumed = client.post(f"/api/v1/tasks/{task_id}/resume", json={}, headers=auth_headers())
     assert resumed.status_code == 200
     assert resumed.json()["status"] == "COMPLETED"
+    assert resumed.json()["stop_reason"] is None
     assert tool.calls == 1
     assert "APPROVAL_APPROVED" in {event["event_type"] for event in monitor.get_security_events(task_id)}
     duplicate = client.post(f"/api/v1/approvals/{approval_id}/approve", json={}, headers=auth_headers())
@@ -426,6 +438,9 @@ def test_api_cannot_bypass_capability_or_quarantined_skill_boundaries(tmp_path: 
     result, task_id = run_core_task(service, "complete a safe API task")
     assert result["final_status"] == "BLOCKED"
     assert mismatch.calls == 0
+    blocked_task = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers())
+    assert blocked_task.status_code == 200
+    assert blocked_task.json()["stop_reason"]["code"] == "POLICY_BLOCKED"
     security_events = client.get(f"/api/v1/security-events?task_id={task_id}", headers=auth_headers())
     assert security_events.status_code == 200
     assert any(item["event_type"] == "SECURITY_DENY" for item in security_events.json())
@@ -434,7 +449,7 @@ def test_api_cannot_bypass_capability_or_quarantined_skill_boundaries(tmp_path: 
 
 
 def test_observability_timeline_metrics_failures_security_and_tools_are_read_only(tmp_path: Path) -> None:
-    tool = APITestTool("safe", [ToolResult.failed("tool_failed", "controlled failure")])
+    tool = APITestTool("safe", [ToolResult.failed("tool_failed", "controlled failure", no_side_effects=True)])
     service, store, monitor = make_service(tmp_path, tool)
     client = client_for(service)
     _, task_id = run_core_task(service, "complete a safe API task")
@@ -454,6 +469,39 @@ def test_observability_timeline_metrics_failures_security_and_tools_are_read_onl
     store.close()
 
 
+def test_task_failure_exposes_only_closed_reason_not_raw_error_or_event_metadata(tmp_path: Path) -> None:
+    raw_detail = "RAW_TOOL_EXCEPTION_do_not_expose_9c2d"
+    repeated_failure = ToolResult.failed("tool_failed", raw_detail, no_side_effects=True)
+    tool = APITestTool("safe", [repeated_failure for _ in range(8)])
+    service, store, monitor = make_service(tmp_path, tool)
+    client = client_for(service)
+
+    result, task_id = run_core_task(service, "fail a safe API task")
+    assert result["final_status"] == "FAILED"
+    monitor.emit(
+        "TASK_FAILED",
+        task_id=task_id,
+        severity="ERROR",
+        metadata={"reason": raw_detail, "stop_reason": "POLICY_BLOCKED"},
+    )
+
+    response = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "FAILED"
+    assert body["stop_reason"]["code"] == "TASK_FAILED"
+    assert body["stop_reason"]["step_id"] == "api-step-1"
+    assert "reason" not in body["stop_reason"]
+    assert "metadata" not in body["stop_reason"]
+    assert raw_detail not in response.text
+
+    listed = client.get("/api/v1/tasks", headers=auth_headers())
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["stop_reason"]["code"] == "TASK_FAILED"
+    assert raw_detail not in listed.text
+    store.close()
+
+
 def test_request_correlation_uses_header_and_never_contains_credentials(tmp_path: Path) -> None:
     service, store, monitor = make_service(tmp_path, APITestTool("safe"))
     client = client_for(service)
@@ -469,6 +517,32 @@ def test_request_correlation_uses_header_and_never_contains_credentials(tmp_path
     assert completed[-1]["correlation_id"] == "request-phase12-001"
     raw = json.dumps(store.all_observability_events(), ensure_ascii=False)
     assert API_TOKEN not in raw
+    store.close()
+
+
+def test_task_timeline_read_is_logged_globally_without_growing_its_task_timeline(tmp_path: Path) -> None:
+    service, store, monitor = make_service(tmp_path, APITestTool("safe"))
+    client = client_for(service)
+    created = client.post("/api/v1/tasks", json={"goal": "timeline read correlation"}, headers=auth_headers(key="timeline-read-create"))
+    assert created.status_code == 201
+    task_id = created.json()["task_id"]
+    before = monitor.get_task_timeline(task_id)
+
+    headers = auth_headers()
+    headers["X-Request-ID"] = "timeline-read-no-feedback"
+    response = client.get(f"/api/v1/tasks/{task_id}/timeline", headers=headers)
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == "timeline-read-no-feedback"
+    after = monitor.get_task_timeline(task_id)
+    assert [event["event_id"] for event in after] == [event["event_id"] for event in before]
+    assert [event["event_id"] for event in response.json()] == [event["event_id"] for event in before]
+
+    global_completions = [
+        event for event in store.all_observability_events()
+        if event["event_type"] == "API_REQUEST_COMPLETED" and event["correlation_id"] == "timeline-read-no-feedback"
+    ]
+    assert len(global_completions) == 1
+    assert global_completions[0]["task_id"] == ""
     store.close()
 
 

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
 from typing import Any
 
+from private_agent.bugbounty.learning import BugBountyLearningService
+from private_agent.bugbounty.local_evidence import normalize_execution_stage_refs
+from private_agent.bugbounty.research import ResearchStageRepository
 from private_agent.bugbounty.workflow import BugBountyAgent, markdown_report
 from private_agent.tools.contracts import ToolResult
 
@@ -39,6 +43,19 @@ class BugBountyAnalysisTool:
                 "urls": {"type": "array", "items": {"type": "string"}},
                 "openapi": {"type": "object"},
                 "source_documents": {"type": "object"},
+                "research_stage_refs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "stage_id": {"type": "string"},
+                            "stage_type": {"type": "string"},
+                            "result_sha256": {"type": "string"},
+                        },
+                        "required": ["stage_id", "stage_type", "result_sha256"],
+                        "additionalProperties": False,
+                    },
+                },
             },
             "required": ["scope"],
             "additionalProperties": False,
@@ -56,7 +73,6 @@ class BugBountyAnalysisTool:
         }
 
     def execute(self, inputs: dict[str, Any], context: Any) -> ToolResult:
-        del context
         try:
             scope = inputs.get("scope")
             if not isinstance(scope, Mapping):
@@ -76,19 +92,92 @@ class BugBountyAnalysisTool:
             openapi = inputs.get("openapi")
             if openapi is not None and not isinstance(openapi, Mapping):
                 raise ValueError("openapi_invalid")
-            run = BugBountyAgent(store=self.store).run(
-                scope,
-                fixture_variant=inputs.get("fixture") or None,
-                urls=tuple(urls),
-                openapi=dict(openapi) if isinstance(openapi, Mapping) else None,
-                source_documents=dict(source_documents),
-                mode="deterministic",
-                persist=True,
-            )
-            return ToolResult.success({"run": run.to_dict(public=True), "report": markdown_report(run)})
+            provided_stage_refs = normalize_execution_stage_refs(inputs.get("research_stage_refs", []))
         except (TypeError, ValueError) as exc:
             return ToolResult.failed(
                 "bugbounty_invalid_input",
                 "Bug Bounty input was rejected by the bounded local workflow",
                 details={"error": str(exc)[:160]},
+                no_side_effects=True,
             )
+        metadata = getattr(context, "metadata", None)
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        provenance = metadata.get("program_analysis_provenance")
+        learned_review_advisories: list[dict[str, Any]] = []
+        resolved_stage_sources: list[dict[str, Any]] = []
+        verified_stage_refs: list[dict[str, str]] = []
+        if provenance is None:
+            if provided_stage_refs:
+                return ToolResult.blocked(
+                    "bugbounty_research_lineage_unattested",
+                    "Research-stage references require matching server handoff provenance",
+                    no_side_effects=True,
+                )
+        else:
+            if not isinstance(provenance, Mapping):
+                return ToolResult.blocked(
+                    "bugbounty_research_lineage_invalid",
+                    "Stored program-analysis provenance is malformed",
+                    no_side_effects=True,
+                )
+            try:
+                expected_stage_refs = normalize_execution_stage_refs(provenance.get("research_stage_refs", []))
+                analysis_id = provenance.get("analysis_id")
+                owner_user_id = provenance.get("scope_attested_by_user_id")
+                if (
+                    provenance.get("scope_attestation") is not True
+                    or provenance.get("execution_mode") != "deterministic_local"
+                    or not isinstance(analysis_id, str)
+                    or not analysis_id
+                    or not isinstance(owner_user_id, str)
+                    or not owner_user_id
+                    or provided_stage_refs != expected_stage_refs
+                ):
+                    raise ValueError("bugbounty_research_lineage_binding_mismatch")
+                resolved_stage_sources = ResearchStageRepository(self.store).resolve_execution_results(
+                    analysis_id,
+                    owner_user_id=owner_user_id,
+                    source_stage_refs=expected_stage_refs,
+                )
+                verified_stage_refs = [
+                    {key: source[key] for key in ("stage_id", "stage_type", "result_sha256")}
+                    for source in resolved_stage_sources
+                ]
+            except (KeyError, TypeError, ValueError) as exc:
+                return ToolResult.blocked(
+                    "bugbounty_research_lineage_invalid",
+                    "Selected research-stage lineage no longer matches the completed owner-bound results",
+                    details={"error": str(exc)[:160]},
+                    no_side_effects=True,
+                )
+        task_id = getattr(context, "task_id", "")
+        goal = metadata.get("goal")
+        if isinstance(task_id, str) and task_id and isinstance(goal, str) and goal.strip():
+            try:
+                # The task identity comes from ExecutionContext, never tool input.
+                # The learning memory independently resolves the task owner and
+                # revalidates each source review and its evidence digest.
+                if self.store.task_owner_user_id(task_id):
+                    learned_review_advisories = BugBountyLearningService(self.store).planning_advisories(
+                        task_id=task_id,
+                        goal=goal,
+                    )
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                # Learning is optional guidance; any ownership or storage error
+                # disables it without changing the ordinary bounded analysis.
+                learned_review_advisories = []
+        # The deterministic run persists evidence; if it raises after beginning,
+        # let the executor preserve EXECUTION_UNKNOWN instead of claiming no effect.
+        run = BugBountyAgent(store=self.store).run(
+            scope,
+            fixture_variant=inputs.get("fixture") or None,
+            urls=tuple(urls),
+            openapi=dict(openapi) if isinstance(openapi, Mapping) else None,
+            source_documents=dict(source_documents),
+            research_stage_refs=verified_stage_refs,
+            research_stage_results=resolved_stage_sources if verified_stage_refs else [],
+            learned_review_advisories=learned_review_advisories,
+            mode="deterministic",
+            persist=True,
+        )
+        return ToolResult.success({"run": run.to_dict(public=True), "report": markdown_report(run)})

@@ -61,6 +61,16 @@ def test_inconclusive_acceptance_check_is_not_runnable():
     assert report.can_run_acceptance is False
 
 
+def test_inconclusive_cgroup_check_blocks_acceptance():
+    checks = list(_ready_report().checks)
+    index = next(i for i, check in enumerate(checks) if check.name == "cgroups")
+    checks[index] = HostPreflightCheck("cgroups", HostPreflightStatus.INCONCLUSIVE, "delegation_unverified")
+    report = HostPreflightReport(tuple(checks))
+
+    assert report.host_ready is False
+    assert report.can_run_acceptance is False
+
+
 def test_acceptance_runs_after_host_gate_and_returns_bound_identity(monkeypatch):
     monkeypatch.setenv("VULNORA_ENABLE_RUNTIME_ACCEPTANCE", "1")
     monkeypatch.setattr(acceptance, "run_host_preflight", lambda: _ready_report())

@@ -8,7 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from private_agent.api import AgentAPIService, build_api_service, create_app
-from private_agent.core.knowledge import KnowledgeValidationError
+from private_agent.auth import AuthManager
+from private_agent.core.knowledge import KnowledgeAttestor, KnowledgeValidationError
 from private_agent.worker import BackgroundWorker
 from tests.test_phase12_api import API_TOKEN, auth_headers, make_service
 
@@ -186,25 +187,39 @@ def test_vulnora_bug_bounty_task_uses_real_queue_worker_and_report(tmp_path: Pat
 def test_owner_finding_review_requires_evidence_gate_and_is_audited(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "finding-review.sqlite3"
     monkeypatch.setenv("AGENT_DB_PATH", str(db_path))
-    monkeypatch.setenv("AGENT_API_TOKEN", API_TOKEN)
     service = build_api_service(token=API_TOKEN)
+    owner_password = "phase18-finding-review-owner-password-123"
+    service.auth_manager.initialize_owner(service.auth_manager.owner_email, owner_password)
     worker = BackgroundWorker(service.orchestrator, worker_id="phase18-finding-review", poll_interval_seconds=0.01, idle_poll_interval_seconds=0.02)
     application = create_app(service=service, worker=worker)
 
     with TestClient(application, raise_server_exceptions=False) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"email": service.auth_manager.owner_email, "password": owner_password},
+        )
+        assert login.status_code == 200, login.text
+        csrf = str(client.cookies.get("vulnora_csrf"))
+
+        def owner_headers(key: str | None = None) -> dict[str, str]:
+            headers = {"X-CSRF-Token": csrf}
+            if key:
+                headers["Idempotency-Key"] = key
+            return headers
+
         created = client.post(
             "/api/v1/bug-bounty/tasks", json={"scope": _scope(), "fixture": "idor_horizontal"},
-            headers=auth_headers(key="phase18-finding-review"),
+            headers=owner_headers("phase18-finding-review"),
         )
         assert created.status_code == 201, created.text
         task_id = created.json()["task_id"]
-        assert _wait_for(lambda: client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=auth_headers()).json().get("status") in {"COMPLETED", "FAILED"})
-        body = client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=auth_headers()).json()
+        assert _wait_for(lambda: client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=owner_headers()).json().get("status") in {"COMPLETED", "FAILED"})
+        body = client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers=owner_headers()).json()
         finding_id = body["run"]["findings"][0]["finding_id"]
         confirmed = client.post(
             f"/api/v1/bug-bounty/tasks/{task_id}/findings/{finding_id}/review",
             json={"decision": "CONFIRM", "note": "owner review of validated local fixture"},
-            headers=auth_headers(key="phase18-finding-review"),
+            headers=owner_headers("phase18-finding-review-review"),
         )
         assert confirmed.status_code == 200, confirmed.text
         assert confirmed.json()["evidence_validated"] is True
@@ -218,23 +233,153 @@ def test_owner_finding_review_requires_evidence_gate_and_is_audited(tmp_path: Pa
         assert learned[0].preferred_action["type"] == "require_evidence_review"
         assert learned[0].avoided_action["type"] == "auto_confirm_finding"
         assert learned[0].metadata["non_authoritative"] is True
-        reviews = client.get(f"/api/v1/bug-bounty/tasks/{task_id}/reviews", headers=auth_headers())
+        reviews = client.get(f"/api/v1/bug-bounty/tasks/{task_id}/reviews", headers=owner_headers())
         assert reviews.status_code == 200 and reviews.json()[0]["decision"] == "CONFIRM"
         assert any(event.get("event_type") == "BUGBOUNTY_FINDING_REVIEW" for event in service.store.all_audit_events(task_id=task_id))
 
         second = client.post(
             "/api/v1/bug-bounty/tasks", json={"scope": _scope(), "fixture": "idor_horizontal"},
-            headers=auth_headers(key="phase18-finding-review-second"),
+            headers=owner_headers("phase18-finding-review-second"),
         )
         assert second.status_code == 201, second.text
         second_task_id = second.json()["task_id"]
         assert _wait_for(
-            lambda: client.get(f"/api/v1/bug-bounty/tasks/{second_task_id}", headers=auth_headers()).json().get("status") in {"COMPLETED", "FAILED"}
+            lambda: client.get(f"/api/v1/bug-bounty/tasks/{second_task_id}", headers=owner_headers()).json().get("status") in {"COMPLETED", "FAILED"}
         )
         second_state = service.store.get_task_state(second_task_id)
         assert second_state is not None
         reused = second_state["context"].get("learned_strategies_used", [])
         assert any(item.get("metadata", {}).get("review_id") == confirmed_review["review_id"] for item in reused)
+    service.store.close()
+
+
+def test_knowledge_attestation_binds_authenticated_review_actor_and_is_idempotent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "reviewer-attestation.sqlite3"
+    attestation_key = "review-attestation-test-key-32-bytes-minimum"
+    monkeypatch.setenv("AGENT_KNOWLEDGE_ATTESTATION_KEY", attestation_key)
+    monkeypatch.setenv("AGENT_API_TOKEN", API_TOKEN)
+    service = build_api_service(token=None, database_path=str(database))
+    owner = AuthManager(service.store).initialize_owner(
+        "ashbm1995@gmail.com", "owner-password-for-reviewer-attestation-123"
+    )
+    worker = BackgroundWorker(
+        service.orchestrator,
+        worker_id="reviewer-attestation-integration",
+        poll_interval_seconds=0.01,
+        idle_poll_interval_seconds=0.02,
+    )
+
+    with TestClient(create_app(service=service, worker=worker), raise_server_exceptions=False) as client:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"email": "ashbm1995@gmail.com", "password": "owner-password-for-reviewer-attestation-123"},
+        )
+        assert login.status_code == 200, login.text
+        csrf = str(client.cookies.get("vulnora_csrf"))
+        headers = {"X-CSRF-Token": csrf}
+        created = client.post(
+            "/api/v1/bug-bounty/tasks",
+            json={"scope": _scope(), "fixture": "idor_horizontal"},
+            headers=headers,
+        )
+        assert created.status_code == 201, created.text
+        task_id = created.json()["task_id"]
+        assert _wait_for(
+            lambda: client.get(f"/api/v1/bug-bounty/tasks/{task_id}").json().get("status")
+            in {"COMPLETED", "FAILED"}
+        )
+        task = client.get(f"/api/v1/bug-bounty/tasks/{task_id}")
+        assert task.status_code == 200, task.text
+        finding_id = task.json()["run"]["findings"][0]["finding_id"]
+        review = client.post(
+            f"/api/v1/bug-bounty/tasks/{task_id}/findings/{finding_id}/review",
+            json={"decision": "CONFIRM", "note": "authenticated owner reviewed validated local evidence"},
+            headers=headers,
+        )
+        assert review.status_code == 200, review.text
+        review_body = review.json()
+        assert review_body["actor_user_id"] == owner.user_id
+        assert review_body["evidence_validated"] is True
+
+        route = (
+            f"/api/v1/bug-bounty/tasks/{task_id}/reviews/"
+            f"{review_body['review_id']}/knowledge-attestation"
+        )
+        original_finding_for_review = service._finding_for_review
+
+        def changed_finding_evidence(target_task_id, target_finding_id, principal):
+            state, raw, finding = original_finding_for_review(target_task_id, target_finding_id, principal)
+            finding.evidence[0].observed["post_review_mutation"] = True
+            return state, raw, finding
+
+        monkeypatch.setattr(service, "_finding_for_review", changed_finding_evidence)
+        stale = client.post(route, headers=headers)
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["error_code"] == "review_evidence_stale"
+        monkeypatch.setattr(service, "_finding_for_review", original_finding_for_review)
+
+        issued = client.post(
+            route,
+            json={"verified_by": "attacker-selected-reviewer", "claim": "caller-controlled"},
+            headers=headers,
+        )
+        assert issued.status_code == 200, issued.text
+        attestation = issued.json()["attestation"]
+        assert attestation["verified_by"] == owner.user_id
+        assert attestation["attestation_id"] == f"attestation-{review_body['review_id']}"
+        assert attestation["claim_snapshot"]["metadata"]["review_id"] == review_body["review_id"]
+        assert attestation["evidence_snapshots"][0]["metadata"]["evidence_sha256"] == review_body["evidence_sha256"]
+        assert KnowledgeAttestor(attestation_key).verify(attestation)
+
+        repeated = client.post(route, headers=headers)
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["attestation"] == attestation
+        stored = service.store.db.execute(
+            "SELECT COUNT(*) AS count FROM knowledge_attestations WHERE attestation_id = ?",
+            (attestation["attestation_id"],),
+        ).fetchone()
+        assert int(stored["count"]) == 1
+
+        legacy = client.post(
+            route,
+            headers={"Authorization": f"Bearer {API_TOKEN}", "X-CSRF-Token": csrf},
+        )
+        assert legacy.status_code == 401
+        assert legacy.json()["error_code"] == "legacy_bearer_disabled"
+
+        unconfirmed_task = client.post(
+            "/api/v1/bug-bounty/tasks",
+            json={"scope": _scope(), "fixture": "idor_horizontal"},
+            headers=headers,
+        )
+        assert unconfirmed_task.status_code == 201, unconfirmed_task.text
+        unconfirmed_task_id = unconfirmed_task.json()["task_id"]
+        assert _wait_for(
+            lambda: client.get(f"/api/v1/bug-bounty/tasks/{unconfirmed_task_id}").json().get("status")
+            in {"COMPLETED", "FAILED"}
+        )
+        unconfirmed_body = client.get(f"/api/v1/bug-bounty/tasks/{unconfirmed_task_id}").json()
+        unconfirmed_finding_id = unconfirmed_body["run"]["findings"][0]["finding_id"]
+        unconfirmed_review = client.post(
+            f"/api/v1/bug-bounty/tasks/{unconfirmed_task_id}/findings/{unconfirmed_finding_id}/review",
+            json={"decision": "INCONCLUSIVE", "note": "not confirmed"},
+            headers=headers,
+        )
+        assert unconfirmed_review.status_code == 200, unconfirmed_review.text
+        unconfirmed_route = (
+            f"/api/v1/bug-bounty/tasks/{unconfirmed_task_id}/reviews/"
+            f"{unconfirmed_review.json()['review_id']}/knowledge-attestation"
+        )
+        rejected = client.post(unconfirmed_route, headers=headers)
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["error_code"] == "review_not_confirmed"
+        assert service.store.db.execute(
+            "SELECT 1 FROM knowledge_attestations WHERE attestation_id = ?",
+            (f"attestation-{unconfirmed_review.json()['review_id']}",),
+        ).fetchone() is None
+
     service.store.close()
 
 

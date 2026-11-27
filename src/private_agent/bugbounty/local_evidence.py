@@ -22,6 +22,10 @@ MAX_NAME_LENGTH = 256
 MAX_CONTENT_TYPE_LENGTH = 128
 MAX_OUTPUT_ITEMS = 10_000
 MAX_OUTPUT_ITEM_LENGTH = 512
+MAX_REPORT_SOURCE_STAGES = 4
+_STAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$", re.IGNORECASE)
+_REPORTABLE_STAGE_TYPES = frozenset({"INVENTORY", "PASSIVE_RESEARCH", "HYPOTHESIS_GENERATION", "VERIFICATION"})
 
 _SECRET_PATTERNS = (
     re.compile(r"(?im)^(\s*(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*)[^\r\n]+$"),
@@ -175,9 +179,78 @@ def normalize_local_artifacts(value: Mapping[str, Any] | None) -> dict[str, Any]
     return {"artifacts": artifacts}
 
 
+def normalize_report_stage_ids(value: Any) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_REPORT_SOURCE_STAGES:
+        raise ValueError("report_source_stage_ids_invalid")
+    stage_ids: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not _STAGE_ID_RE.fullmatch(raw):
+            raise ValueError("report_source_stage_id_invalid")
+        if raw in stage_ids:
+            raise ValueError("report_source_stage_id_duplicate")
+        stage_ids.append(raw)
+    return stage_ids
+
+
+def normalize_execution_stage_ids(value: Any) -> list[str]:
+    """Normalize an optional, owner-selected set of completed-stage IDs."""
+    if not isinstance(value, list) or len(value) > MAX_REPORT_SOURCE_STAGES:
+        raise ValueError("execution_source_stage_ids_invalid")
+    stage_ids: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or not _STAGE_ID_RE.fullmatch(raw):
+            raise ValueError("execution_source_stage_id_invalid")
+        if raw in stage_ids:
+            raise ValueError("execution_source_stage_id_duplicate")
+        stage_ids.append(raw)
+    return stage_ids
+
+
+def normalize_report_stage_refs(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError("report_source_stage_refs_invalid")
+    stage_ids = normalize_report_stage_ids(
+        [item.get("stage_id") if isinstance(item, Mapping) else None for item in value]
+    )
+    normalized: list[dict[str, str]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping) or set(raw) != {"stage_id", "stage_type", "result_sha256"}:
+            raise ValueError("report_source_stage_ref_invalid")
+        stage_type = raw.get("stage_type")
+        digest = raw.get("result_sha256")
+        if not isinstance(stage_type, str) or stage_type not in _REPORTABLE_STAGE_TYPES:
+            raise ValueError("report_source_stage_type_invalid")
+        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+            raise ValueError("report_source_result_digest_invalid")
+        normalized.append({"stage_id": stage_ids[len(normalized)], "stage_type": stage_type, "result_sha256": digest.lower()})
+    return normalized
+
+
+def normalize_execution_stage_refs(value: Any) -> list[dict[str, str]]:
+    """Validate digest-bound execution lineage while permitting no sources."""
+    if not isinstance(value, list) or len(value) > MAX_REPORT_SOURCE_STAGES:
+        raise ValueError("execution_source_stage_refs_invalid")
+    if not value:
+        return []
+    try:
+        return normalize_report_stage_refs(value)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("report_source", "execution_source")) from exc
+
+
 def normalize_research_input(stage_type: str, value: Mapping[str, Any] | None) -> dict[str, Any]:
     """Normalize the closed input contract for one research stage type."""
     payload = dict(value or {})
+    if stage_type == "REPORT_PREPARATION":
+        if set(payload) == {"source_stage_ids"}:
+            return {"source_stage_ids": normalize_report_stage_ids(payload["source_stage_ids"])}
+        if set(payload) == {"source_stage_refs"}:
+            return {"source_stage_refs": normalize_report_stage_refs(payload["source_stage_refs"])}
+        # Older persisted rows remain readable, but repository creation rejects
+        # these client-supplied artifacts and the worker will not execute them.
+        if set(payload) <= {"artifacts"}:
+            return normalize_local_artifacts(payload)
+        raise ValueError("report_source_stage_ids_required")
     if stage_type != "PASSIVE_RESEARCH":
         return normalize_local_artifacts(payload)
     if set(payload) - {"artifacts", "sources"}:
