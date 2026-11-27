@@ -534,19 +534,39 @@ def test_unchanged_followup_plan_preserves_verified_outcome(tmp_path: Path) -> N
     created = store.create_queued_task("complete the first safe action", initial_message="complete the first safe action")
 
     original_execute = safe.execute
+    followup_message_ids: list[str] = []
 
     def inject_followup(inputs, context):
         if safe.calls == 0:
             queued = service.append_task_message(created["task_id"], "The verified first step is sufficient; add no action")
             assert queued.status == "PENDING"
+            followup_message_ids.append(queued.message_id)
         return original_execute(inputs, context)
 
     safe.execute = inject_followup
+    original_save = store.save_task_state
+    rejected_bug_bounty_checkpoints: list[str] = []
+
+    def reject_bug_bounty_checkpoint_for_general_task(state, checkpoint_type, *, task_status=None, consume_message_ids=()):
+        saved = original_save(state, checkpoint_type, task_status=task_status, consume_message_ids=consume_message_ids)
+        if checkpoint_type == "AFTER_VERIFICATION" and followup_message_ids:
+            try:
+                original_save(
+                    state,
+                    "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED",
+                    consume_message_ids=followup_message_ids,
+                )
+            except ValueError as exc:
+                rejected_bug_bounty_checkpoints.append(str(exc))
+        return saved
+
+    store.save_task_state = reject_bug_bounty_checkpoint_for_general_task
     completed = BackgroundWorker(service.orchestrator, worker_id="worker-unchanged-followup").run_once()
 
     assert completed["status"] == "COMPLETED", completed
     assert safe.calls == 1
     assert len(planner.calls) == 2
+    assert rejected_bug_bounty_checkpoints == ["conversation_safe_checkpoint_required"]
     assert "The verified first step is sufficient; add no action" in planner.calls[1]
     result = completed["result"]
     assert result["verification"]["verified"] is True

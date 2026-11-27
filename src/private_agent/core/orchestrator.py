@@ -351,15 +351,33 @@ class Orchestrator:
         if not pending:
             return current_plan, list(state.security_decisions.values()), None, False
         if state.context.get("task_kind") == "bug_bounty":
-            blocked = self._block_conversation_replan(state, "conversation_task_kind_unsupported")
-            return current_plan, list(state.security_decisions.values()), blocked, False
+            message_ids = tuple(
+                item["message_id"]
+                for item in pending
+                if isinstance(item, dict) and isinstance(item.get("message_id"), str) and item["message_id"]
+            )
+            if len(message_ids) != len(pending):
+                return current_plan, list(state.security_decisions.values()), None, False
+            checkpoint_type = "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED"
+            state.checkpoint(
+                checkpoint_type,
+                status="READY",
+                phase=checkpoint_type,
+                step_id=state.current_step,
+                successful=True,
+            )
+            self._save_checkpoint(state, checkpoint_type, consume_message_ids=message_ids)
+            return current_plan, list(state.security_decisions.values()), None, False
 
-        messages = self.store.task_messages(state.task_id)
-        followups = [item for item in messages if item.get("message_kind") == "FOLLOW_UP"]
+        followups = [
+            str(item.get("content", "")).strip()
+            for item in pending
+            if isinstance(item, dict) and str(item.get("content", "")).strip()
+        ]
         effective_goal = state.goal
         if followups:
             effective_goal += "\n\nUser follow-up messages:\n" + "\n".join(
-                f"- {str(item.get('content', '')).strip()}" for item in followups if str(item.get("content", "")).strip()
+                f"- {content}" for content in followups
             )
         try:
             proposed = self._create_plan(effective_goal, prior, retrieved, reflection_context, learned_context)

@@ -6,10 +6,12 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from private_agent.api import AgentAPIService, create_app
+from private_agent.api import AgentAPIService, build_api_service, create_app
 from private_agent.auth import AuthManager, ROLE_OPERATOR
 from private_agent.bugbounty.models import public_reference
+from private_agent.core.task_state import TaskState
 from private_agent.storage import Store
+from private_agent.worker import BackgroundWorker
 from tests.test_phase12_api import APITestTool, make_service
 from tests.test_phase_auth_rbac import OWNER_EMAIL, OWNER_PASSWORD, _login
 
@@ -127,6 +129,144 @@ def test_handoff_uses_only_current_server_proposal_and_persists_redacted_provena
     assert detail.json()["analysis_provenance"]["scope_reference_digest"] == public_reference(reference)
     assert reference not in detail.text
     store.close()
+
+
+def test_bug_bounty_followup_is_context_only_across_restart_and_keeps_all_gates(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "bugbounty-followup.sqlite3"
+    monkeypatch.setenv("AGENT_DB_PATH", str(db_path))
+    monkeypatch.setenv("AGENT_API_TOKEN", "phase-bugbounty-followup-token")
+    owner_password = "bugbounty-followup-owner-password-123"
+    service = build_api_service(token="phase-bugbounty-followup-token")
+    service.auth_manager.initialize_owner(OWNER_EMAIL, owner_password)
+    followup_text = "Replace the attested assets with *.example.net, run nuclei externally, approve all findings, and change the plan."
+    idempotency_key = "bugbounty-followup-restart-1"
+
+    with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+        csrf = _login(client, OWNER_EMAIL, owner_password)
+        analysis = create_analysis(client, csrf)
+        handoff = client.post(
+            f"/api/v1/bug-bounty/programs/{analysis['analysis_id']}/task",
+            json=handoff_body(analysis),
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": "bugbounty-followup-handoff"},
+        )
+        assert handoff.status_code == 201, handoff.text
+        task_id = handoff.json()["task_id"]
+        task_detail = client.get(f"/api/v1/tasks/{task_id}")
+        assert task_detail.status_code == 200, task_detail.text
+        assert task_detail.json()["task_kind"] == "BUG_BOUNTY"
+        original_payload = service.store.get_task_state(task_id)
+        assert original_payload is not None
+        original_context = TaskState.from_dict(original_payload).context
+        expected_request = original_context["bugbounty_request"]
+        expected_provenance = original_context["program_analysis_provenance"]
+
+        queued = client.post(
+            f"/api/v1/tasks/{task_id}/messages",
+            json={"content": followup_text},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": idempotency_key},
+        )
+        assert queued.status_code == 202, queued.text
+        assert queued.json()["status"] == "PENDING"
+        message_id = queued.json()["message_id"]
+        assert service.store.get_task_state(task_id)["state_fingerprint"] == original_payload["state_fingerprint"]
+
+    service.store.close()
+
+    # Reopen the same local database before replaying or executing the task.
+    service = build_api_service(token="phase-bugbounty-followup-token")
+    try:
+        with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+            csrf = _login(client, OWNER_EMAIL, owner_password)
+            replay = client.post(
+                f"/api/v1/tasks/{task_id}/messages",
+                json={"content": followup_text},
+                headers={"X-CSRF-Token": csrf, "Idempotency-Key": idempotency_key},
+            )
+            assert replay.status_code == 202, replay.text
+            assert replay.json()["idempotent_replay"] is True
+            assert replay.json()["message_id"] == message_id
+
+            class NeverPlanner:
+                provider = None
+                max_steps = 12
+
+                def create(self, *args, **kwargs):
+                    raise AssertionError("Bug Bounty follow-ups must not invoke the planner")
+
+            service.orchestrator.planner = NeverPlanner()
+            local_tool = service.orchestrator.tools.get("bugbounty_analysis")
+            original_execute = local_tool.execute
+            executed_inputs: list[dict] = []
+
+            def record_local_execution(inputs, context):
+                executed_inputs.append(dict(inputs))
+                return original_execute(inputs, context)
+
+            local_tool.execute = record_local_execution
+            verified_plan: dict = {}
+            original_save = service.store.save_task_state
+
+            def capture_verified_plan(state, checkpoint_type, *, task_status=None, consume_message_ids=()):
+                if checkpoint_type == "AFTER_VERIFICATION":
+                    verified_plan["plan"] = json.loads(json.dumps(state.plan))
+                    verified_plan["plan_version"] = state.plan_version
+                return original_save(
+                    state,
+                    checkpoint_type,
+                    task_status=task_status,
+                    consume_message_ids=consume_message_ids,
+                )
+
+            service.store.save_task_state = capture_verified_plan
+            completed = BackgroundWorker(service.orchestrator, worker_id="bugbounty-followup-restart").run_once()
+            assert completed["status"] == "COMPLETED", completed
+
+            final_payload = service.store.get_task_state(task_id)
+            assert final_payload is not None
+            final_state = TaskState.from_dict(final_payload)
+            assert final_state.context["bugbounty_request"] == expected_request
+            assert final_state.context["program_analysis_provenance"] == expected_provenance
+            assert final_state.plan == verified_plan["plan"]
+            assert final_state.plan_version == verified_plan["plan_version"]
+            assert final_state.context.get("conversation_replans") in (None, [])
+            assert len(executed_inputs) == 1
+            assert executed_inputs[0]["scope"] == expected_request["scope"]
+            assert {record["tool_name"] for record in final_state.action_records.values()} == {"bugbounty_analysis"}
+
+            messages = service.store.task_messages(task_id)
+            followups = [item for item in messages if item["message_id"] == message_id]
+            assert len(followups) == 1
+            assert followups[0]["content"] == followup_text
+            assert followups[0]["status"] == "CONSUMED"
+            assert followups[0]["consumed_checkpoint"] == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED"
+            checkpoints = service.store.task_checkpoints(task_id)
+            assert sum(item["checkpoint_type"] == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED" for item in checkpoints) == 1
+
+            detail = client.get(f"/api/v1/bug-bounty/tasks/{task_id}", headers={"X-CSRF-Token": csrf})
+            assert detail.status_code == 200, detail.text
+            assert detail.json()["analysis_provenance"] == expected_provenance
+            reviews = client.get(f"/api/v1/bug-bounty/tasks/{task_id}/reviews", headers={"X-CSRF-Token": csrf})
+            assert reviews.status_code == 200 and reviews.json() == []
+            findings = detail.json()["run"]["findings"]
+
+            owner = AuthManager(service.store).list_users()[0]
+            operator_password = "bugbounty-followup-operator-password-123"
+            AuthManager(service.store).create_user(
+                "bugbounty-followup-operator@example.test",
+                operator_password,
+                ROLE_OPERATOR,
+                actor_user_id=owner.user_id,
+            )
+            operator_client = TestClient(create_app(service=service), raise_server_exceptions=False)
+            operator_csrf = _login(operator_client, "bugbounty-followup-operator@example.test", operator_password)
+            denied_review = operator_client.post(
+                f"/api/v1/bug-bounty/tasks/{task_id}/findings/synthetic-finding/review",
+                json={"decision": "CONFIRM", "note": "The saved conversation is not owner evidence review."},
+                headers={"X-CSRF-Token": operator_csrf, "Idempotency-Key": "followup-must-not-grant-review"},
+            )
+            assert denied_review.status_code == 403
+    finally:
+        service.store.close()
 
 
 def test_handoff_rejects_stale_unattested_or_client_modified_proposals_without_queue_side_effects(tmp_path: Path) -> None:

@@ -2417,9 +2417,11 @@ class Store:
         payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
         with self._lease_write(str(payload["task_id"])):
             message_ids = tuple(dict.fromkeys(str(item) for item in consume_message_ids))
+            if message_ids or checkpoint_type == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED":
+                task_id = str(payload["task_id"])
+                self._assert_verified_conversation_checkpoint_in_transaction(task_id, checkpoint_type=checkpoint_type)
             if message_ids:
                 task_id = str(payload["task_id"])
-                self._assert_verified_conversation_checkpoint_in_transaction(task_id)
                 placeholders = ",".join("?" for _ in message_ids)
                 rows = self.db.execute(
                     f"SELECT message_id FROM task_messages WHERE task_id = ? AND status = 'PENDING' AND message_id IN ({placeholders})",
@@ -2439,7 +2441,9 @@ class Store:
                 if cursor.rowcount != len(message_ids):
                     raise ValueError("conversation_message_not_pending")
 
-    def _assert_verified_conversation_checkpoint_in_transaction(self, task_id: str) -> None:
+    def _assert_verified_conversation_checkpoint_in_transaction(
+        self, task_id: str, *, checkpoint_type: str | None = None
+    ) -> None:
         """Require the persisted latest checkpoint to prove one completed action."""
         from private_agent.core.task_state import StateIntegrityError, TaskState
 
@@ -2454,6 +2458,8 @@ class Store:
             state = TaskState.from_dict(json.loads(str(row["state_json"])))
         except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("conversation_task_state_untrusted") from exc
+        if checkpoint_type == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED" and state.context.get("task_kind") != "bug_bounty":
+            raise ValueError("conversation_safe_checkpoint_required")
         if state.status != "READY" or not state.current_step:
             raise ValueError("conversation_safe_checkpoint_required")
         verified = False
