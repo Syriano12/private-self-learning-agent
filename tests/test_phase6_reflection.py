@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from private_agent.core.experience import ExperienceAction, ExperienceRecord
+from private_agent.core.learning import LearningEngine, SQLiteLearningMemory
 from private_agent.core.memory import ExperienceMemory, ExperienceQuery, RetrievedExperience, SQLiteExperienceMemory
 from private_agent.core.planner import PlanValidationError, Planner
 from private_agent.core.reflection import (
@@ -29,18 +30,51 @@ def candidate(
     task_type: str = "research",
     created_at: str | None = None,
 ) -> RetrievedExperience:
+    resolved_tools = tools or ["tool_a"]
+    failed_tool = (
+        resolved_tools[-2]
+        if "CHANGE_TOOL" in (recoveries or []) and len(resolved_tools) > 1
+        else resolved_tools[0]
+    )
+    failure_actions = [
+        {"tool_name": failed_tool, "step_id": "step", "failure_type": failure_type}
+        for failure_type in (failures or [])
+    ]
+    recovery_transitions = (
+        [{
+            "failed_tool": failed_tool,
+            "alternative_tool": resolved_tools[-1],
+            "failure_type": (failures or [""])[0],
+            "recovery_strategy": "CHANGE_TOOL",
+            "step_id": "step",
+            "alternative_verified": outcome == "COMPLETED",
+        }]
+        if "CHANGE_TOOL" in (recoveries or []) and len(resolved_tools) > 1 and (failures or [])
+        else []
+    )
     return RetrievedExperience(
         experience_id=experience_id,
         relevance=0.9,
         task_summary=goal,
-        strategy_used=tools or ["tool_a"],
+        strategy_used=resolved_tools,
         outcome=outcome,
         failure_diagnosis=failures or [],
         recovery_strategy=recoveries or [],
         verification_evidence=[{"type": "verification", "value": "real evidence"}],
         why_relevant=["goal_overlap"],
-        identity={"goal": goal, "task_type": task_type, "tools": tools or ["tool_a"]},
+        identity={
+            "goal": goal,
+            "task_type": task_type,
+            "tools": resolved_tools,
+            "verification_status": "VERIFIED" if outcome == "COMPLETED" else outcome,
+            "verification_scope": "TASK_CRITERIA" if outcome == "COMPLETED" else "UNKNOWN",
+            "security_impact_verified": None,
+            "verified_action_tools": [resolved_tools[-1]] if outcome == "COMPLETED" else [],
+            "verified_final_action_tool": resolved_tools[-1] if outcome == "COMPLETED" else "",
+        },
         created_at=created_at or "2026-01-01T00:00:00+00:00",
+        failure_actions=failure_actions,
+        recovery_transitions=recovery_transitions,
     )
 
 
@@ -98,6 +132,73 @@ def test_successful_recovery_generates_structured_insight() -> None:
     assert insight.supporting_experience_ids == ["recovery-0", "recovery-1"]
     assert insight.evidence[0]["experience_id"] in insight.supporting_experience_ids
     assert 0 < insight.confidence <= 0.95
+
+
+def test_recovery_pair_does_not_mistake_a_safe_prerequisite_for_the_failed_tool() -> None:
+    experiences = [
+        candidate(
+            f"prerequisite-recovery-{index}",
+            tools=["safe_probe", "tool_a", "tool_b"],
+            failures=["NETWORK_ERROR"],
+            recoveries=["CHANGE_TOOL"],
+        )
+        for index in range(2)
+    ]
+    insights = ReflectionEngine(MemoryDouble(experiences), min_supporting_experiences=2).reflect(
+        ExperienceQuery("research X", task_type="research")
+    )
+    recovery = next(item for item in insights if item.pattern == "successful_recovery_alternative")
+
+    assert recovery.condition["failed_tool"] == "tool_a"
+    assert recovery.condition["alternative_tool"] == "tool_b"
+
+
+def test_recovery_without_a_recorded_tool_transition_does_not_create_strategy() -> None:
+    experiences = [
+        candidate(
+            f"unlinked-recovery-{index}",
+            tools=["tool_a", "tool_b"],
+            failures=["NETWORK_ERROR"],
+        )
+        for index in range(2)
+    ]
+    insights = ReflectionEngine(MemoryDouble(experiences), min_supporting_experiences=2).reflect(
+        ExperienceQuery("research X", task_type="research")
+    )
+    assert not any(item.pattern == "successful_recovery_alternative" for item in insights)
+
+
+def test_static_only_completed_recoveries_do_not_generate_or_store_strategy(tmp_path: Path) -> None:
+    experiences = recovery_candidates(2)
+    for experience in experiences:
+        experience.identity.update(
+            {
+                "verification_status": "INSUFFICIENT",
+                "verification_scope": "STATIC_ONLY",
+                "security_impact_verified": False,
+            }
+        )
+    insights = ReflectionEngine(MemoryDouble(experiences), min_supporting_experiences=2).reflect(
+        ExperienceQuery("research X", task_type="research")
+    )
+    assert not any(item.pattern == "successful_recovery_alternative" for item in insights)
+
+    store = Store(tmp_path / "no-static-learning.sqlite3")
+    learning_memory = SQLiteLearningMemory(store)
+    assert LearningEngine(learning_memory).learn(insights) == []
+    assert learning_memory.list() == []
+
+
+def test_recovery_requires_explicit_verified_final_action() -> None:
+    experiences = recovery_candidates(2)
+    for experience in experiences:
+        experience.identity.pop("verified_action_tools", None)
+        experience.identity.pop("verified_final_action_tool", None)
+
+    insights = ReflectionEngine(MemoryDouble(experiences), min_supporting_experiences=2).reflect(
+        ExperienceQuery("research X", task_type="research")
+    )
+    assert not any(item.pattern == "successful_recovery_alternative" for item in insights)
 
 
 def test_single_supporting_experience_does_not_create_default_recovery_pattern() -> None:

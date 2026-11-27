@@ -53,7 +53,7 @@ class SecurityTool:
     def execute(self, inputs: dict, context: ExecutionContext) -> ToolResult:
         self.calls += 1
         if self.failure:
-            return ToolResult.failed(self.failure, "controlled failure")
+            return ToolResult.failed(self.failure, "controlled failure", no_side_effects=True)
         return ToolResult.success({"result": self.name})
 
 
@@ -374,7 +374,14 @@ def test_recovery_rechecks_policy_before_privileged_replacement(tmp_path: Path) 
     result = agent.run("recovery goal")
     assert tool_a.calls == 1
     assert tool_b.calls == 0
-    assert any(event["event_type"] == "ACTION_BLOCKED" and event["tool_or_skill"] == "tool_b" for event in store.all_audit_events())
+    assert any(
+        event["event_type"] == "APPROVAL_REQUESTED" and event["tool_or_skill"] == "tool_b"
+        for event in store.all_audit_events()
+    )
+    assert any(
+        request["tool_or_skill"] == "tool_b" and request["status"] == "PENDING"
+        for request in store.all_approval_requests()
+    )
     store.close()
 
 

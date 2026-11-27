@@ -577,6 +577,14 @@ class BackgroundWorker:
         """Execute one task while the caller owns a Store lifecycle registration."""
         if self.store.closing:
             return {"status": "STOPPED", "processed": False, "task_id": ""}
+        pending_reply = self._try_generate_assistant_reply()
+        if pending_reply is not None:
+            return {
+                "status": "ASSISTANT_REPLY_SAVED",
+                "processed": True,
+                "task_id": str(pending_reply["task_id"]),
+                "reply_id": str(pending_reply["reply_id"]),
+            }
         self._reconcile_approved_waiting_tasks()
         claim = self.store.claim_next_task(
             self.worker_id,
@@ -589,6 +597,7 @@ class BackgroundWorker:
             return {"status": "NO_TASK", "processed": False, "task_id": ""}
         if claim.get("kind") == "EXECUTION_UNKNOWN":
             task_id = str(claim["task_id"])
+            self._try_generate_assistant_reply(task_id=task_id)
             self._emit_event(
                 "worker_execution_unknown_recovered",
                 task_id=task_id,
@@ -602,6 +611,8 @@ class BackgroundWorker:
             }
         if claim.get("kind") != "CLAIMED":
             task_id = str(claim.get("task_id", ""))
+            if task_id:
+                self._try_generate_assistant_reply(task_id=task_id)
             status = str(claim.get("queue_status") or claim.get("kind") or "BLOCKED")
             self._emit_event(
                 "worker_non_executable_claim",
@@ -642,7 +653,43 @@ class BackgroundWorker:
                 self._untrack_heartbeat(heartbeat)
         if result is None:
             raise RuntimeError("worker_result_missing")
+        self._try_generate_assistant_reply(task_id=task_id)
         return result
+
+    def _try_generate_assistant_reply(self, *, task_id: str | None = None) -> dict[str, Any] | None:
+        """Generate and persist one allowlisted reply without affecting task execution."""
+        planner = getattr(self.orchestrator, "planner", None)
+        provider = getattr(planner, "provider", None)
+        if provider is None or not callable(getattr(provider, "generate_json", None)):
+            return None
+        if getattr(provider, "is_configured", True) is False:
+            return None
+        try:
+            event = self.store.claim_next_task_assistant_reply_event(
+                self.worker_id,
+                lease_ttl_seconds=300,
+                task_id=task_id,
+            )
+            if event is None:
+                return None
+            from private_agent.core.assistant_reply import generate_grounded_reply
+
+            reply = generate_grounded_reply(event, provider)
+            return self.store.save_task_assistant_reply(
+                str(event["event_id"]),
+                worker_id=self.worker_id,
+                reply_code=reply.reply_code,
+                content=reply.content,
+                generation_mode=reply.generation_mode,
+            )
+        except Exception as exc:
+            # A reply is explanatory only; provider or persistence trouble must
+            # never relabel task state, change approvals, or alter its result.
+            LOGGER.warning(
+                "worker_assistant_reply_unavailable",
+                extra={"error_type": type(exc).__name__, "task_id": str(task_id or "")},
+            )
+            return None
 
     def _run_one_research_stage(self) -> dict[str, Any] | None:
         claim = self.research_stages.claim_next(self.worker_id, lease_ttl_seconds=self.lease_ttl_seconds)
@@ -681,7 +728,21 @@ class BackgroundWorker:
         self._track_heartbeat(stage_heartbeat)
         stage_heartbeat.start()
         try:
-            outcome = self.stage_executor.execute(stage, analysis)
+            if stage.stage_type == "REPORT_PREPARATION":
+                try:
+                    report_artifacts = self.research_stages.resolve_report_artifacts(stage)
+                except ValueError:
+                    outcome = StageExecutionOutcome(
+                        ResearchStageStatus.FAILED.value,
+                        {},
+                        {},
+                        "report_source_integrity_failed",
+                        "A bound report source could not be verified; no report was prepared",
+                    )
+                else:
+                    outcome = self.stage_executor.execute(stage, analysis, report_artifacts=report_artifacts)
+            else:
+                outcome = self.stage_executor.execute(stage, analysis)
             if time.monotonic() - started > stage.budget.timeout_seconds:
                 outcome = StageExecutionOutcome(
                     ResearchStageStatus.UNKNOWN.value,
@@ -772,6 +833,13 @@ class BackgroundWorker:
                 continue
             except ValueError as exc:
                 if str(exc) in {"approval_not_approved", "task_not_waiting_approval"}:
+                    continue
+                if str(exc) in {"approval_policy_stale", "approval_policy_unavailable"}:
+                    self._emit_event(
+                        "worker_approval_requeue_deferred",
+                        task_id=task_id,
+                        error_code=str(exc),
+                    )
                     continue
                 raise
 

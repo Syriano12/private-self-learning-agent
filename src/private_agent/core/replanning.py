@@ -7,6 +7,7 @@ from typing import Any
 from private_agent.core.diagnosis import FailureDiagnosis
 from private_agent.core.llm import LLMProvider
 from private_agent.core.observation import Observation
+from private_agent.core.planning_provenance import DETERMINISTIC_REPLAN, PROVIDER_VALIDATED
 from private_agent.core.planner import PLAN_RESPONSE_SCHEMA, PlanStep, PlanValidationError, Planner, TaskPlan
 from private_agent.tools.research import ToolRegistry
 
@@ -73,7 +74,9 @@ class Replanner:
             "steps": steps,
         }
         try:
-            return self.planner.validate(payload, goal=current_plan.goal, tools=tools, permissions=permissions)
+            plan = self.planner.validate(payload, goal=current_plan.goal, tools=tools, permissions=permissions)
+            plan.planning_mode = DETERMINISTIC_REPLAN
+            return plan
         except PlanValidationError as exc:
             raise ReplanError(f"Recovery plan failed validation: {exc.errors}") from exc
 
@@ -103,12 +106,14 @@ class Replanner:
             response_schema=PLAN_RESPONSE_SCHEMA,
         )
         try:
-            return self.planner.validate(
+            plan = self.planner.validate(
                 response.data,
                 goal=request.current_plan.goal,
                 tools=tools,
                 permissions=request.permissions,
             )
+            plan.planning_mode = PROVIDER_VALIDATED
+            return plan
         except PlanValidationError as exc:
             raise ReplanError(f"LLM re-plan failed validation: {exc.errors}") from exc
 
@@ -147,6 +152,7 @@ class Replanner:
             depends_on=[dep for dep in failed_step.depends_on if dep != failed_step.id],
             verifier="",
             success_criteria=dict(failed_step.success_criteria),
+            input_bindings={key: dict(value) for key, value in failed_step.input_bindings.items()},
         )
         steps: list[dict[str, Any]] = []
         replaced = False
@@ -164,12 +170,14 @@ class Replanner:
             "steps": steps,
         }
         try:
-            return self.planner.validate(
+            plan = self.planner.validate(
                 payload,
                 goal=request.current_plan.goal,
                 tools=tools,
                 permissions=request.permissions,
             )
+            plan.planning_mode = DETERMINISTIC_REPLAN
+            return plan
         except PlanValidationError as exc:
             raise ReplanError(f"Deterministic re-plan failed validation: {exc.errors}") from exc
 
@@ -205,6 +213,7 @@ class Replanner:
             "depends_on": step.depends_on,
             "verifier": step.verifier,
             "success_criteria": step.success_criteria,
+            "input_bindings": step.input_bindings,
         }
 
     def _plan_payload(self, plan: TaskPlan) -> dict[str, Any]:

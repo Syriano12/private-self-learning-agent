@@ -577,21 +577,21 @@ class RepositoryTool:
     def execute(self, inputs: dict[str, Any], context: Any) -> ToolResult:
         del context  # No authority, local roots or credentials are accepted from a task.
         if validate_schema_value(inputs, self.input_schema(), path="input"):
-            return ToolResult.failed("invalid_input", "Repository input failed validation")
+            return ToolResult.failed("invalid_input", "Repository input failed validation", no_side_effects=True)
         if any(isinstance(value, str) and (len(value) > 512 or (key in {"repository", "path", "query"} and not value))
                for key, value in inputs.items()):
-            return ToolResult.failed("invalid_input", "Repository inputs must be non-empty bounded strings")
+            return ToolResult.failed("invalid_input", "Repository inputs must be non-empty bounded strings", no_side_effects=True)
         if "query" in inputs and len(inputs["query"]) > 128:
-            return ToolResult.failed("invalid_input", "Search query exceeds the literal query limit")
+            return ToolResult.failed("invalid_input", "Search query exceeds the literal query limit", no_side_effects=True)
         try:
             output = self.inspector.inspect(self.name, inputs)
             return ToolResult.success(output, metadata={"read_only": True, "untrusted_data": True})
         except RepositoryAccessError as exc:
             if exc.code in {"sensitive_path", "invalid_path", "repository_not_authorized", "private_repository_not_authorized"}:
-                return ToolResult.blocked(exc.code, "Repository inspection was not authorized or safe")
-            return ToolResult.failed(exc.code, "Repository data was unavailable within inspection limits")
+                return ToolResult.blocked(exc.code, "Repository inspection was not authorized or safe", no_side_effects=True)
+            return ToolResult.failed(exc.code, "Repository data was unavailable within inspection limits", no_side_effects=True)
         except (OSError, ValueError, TypeError, KeyError, RecursionError):
-            return ToolResult.failed("repository_inspection_failed", "Repository inspection failed safely")
+            return ToolResult.failed("repository_inspection_failed", "Repository inspection failed safely", no_side_effects=True)
 
 
 def register_repository_tools(

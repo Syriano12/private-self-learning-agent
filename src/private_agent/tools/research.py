@@ -4,8 +4,10 @@ import ipaddress
 import re
 import socket
 import ssl
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from threading import Lock
+from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import parse_qs, quote, urljoin, urlparse, urlunsplit
 
 import httpx
@@ -405,7 +407,7 @@ class WebResearchTool:
         query = inputs["query"]
         limit = inputs.get("limit", 5)
         if type(limit) is not int or limit < 1 or limit > MAX_SEARCH_LIMIT:
-            return ToolResult.failed("invalid_input", "Research limit is invalid", output={"query": _redact_text(query), "sources": [], "errors": ["limit_invalid"]})
+            return ToolResult.failed("invalid_input", "Research limit is invalid", output={"query": _redact_text(query), "sources": [], "errors": ["limit_invalid"]}, no_side_effects=True)
         found = self._search_internal(query, limit=limit)
         errors = list(found.errors)
         if not found.sources:
@@ -413,6 +415,7 @@ class WebResearchTool:
                 "no_sources",
                 "Web research returned no sources",
                 output={"query": _redact_text(query), "sources": [], "errors": errors},
+                no_side_effects=True,
             )
 
         fetched: list[dict[str, Any]] = []
@@ -432,6 +435,13 @@ class WebResearchTool:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Any] = {}
+        self._lock = Lock()
+
+    @contextmanager
+    def guard_unregistered(self, name: str) -> Iterator[bool]:
+        """Hold registration stable while a missing-capability decision is committed."""
+        with self._lock:
+            yield name not in self._tools
 
     def register(self, tool: Any) -> None:
         candidate = tool
@@ -443,12 +453,24 @@ class ToolRegistry:
         remaining = contract_errors(candidate)
         if remaining:
             raise ValueError(f"Tool does not satisfy contract: {remaining}")
-        self._tools[candidate.name] = candidate
+        with self._lock:
+            self._tools[candidate.name] = candidate
 
     def available(self) -> list[dict[str, str]]:
-        return [{"name": name, "risk_level": getattr(tool, "risk_level", "unknown"), "permission_level": getattr(tool, "permission_level", "unknown")} for name, tool in self._tools.items()]
+        with self._lock:
+            tools = list(self._tools.items())
+        return [
+            {
+                "name": name,
+                "risk_level": getattr(tool, "risk_level", "unknown"),
+                "permission_level": getattr(tool, "permission_level", "unknown"),
+            }
+            for name, tool in tools
+        ]
 
     def describe(self) -> list[dict[str, Any]]:
+        with self._lock:
+            tools = list(self._tools.items())
         return [
             {
                 **metadata,
@@ -456,7 +478,7 @@ class ToolRegistry:
                 "input_schema": getattr(tool, "input_schema", lambda: {})(),
                 "output_schema": getattr(tool, "output_schema", lambda: {})(),
             }
-            for name, tool in self._tools.items()
+            for name, tool in tools
             for metadata in [{
                 "name": name,
                 "risk_level": getattr(tool, "risk_level", "unknown"),
@@ -465,4 +487,5 @@ class ToolRegistry:
         ]
 
     def get(self, name: str) -> Any:
-        return self._tools[name]
+        with self._lock:
+            return self._tools[name]

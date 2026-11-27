@@ -42,8 +42,9 @@ PATCH_TOOL_NAMES = (PATCH_PREPARE_TOOL, PATCH_APPLY_TOOL, PATCH_ROLLBACK_TOOL)
 class PatchSafetyError(Exception):
     """A bounded patch operation rejected for a deterministic safety reason."""
 
-    def __init__(self, code: str, message: str = "") -> None:
+    def __init__(self, code: str, message: str = "", *, no_side_effects: bool = True) -> None:
         self.code = code
+        self.no_side_effects = no_side_effects
         super().__init__(message or code)
 
 
@@ -682,7 +683,14 @@ class PatchWorkspaceManager:
             "application": {"status": "NOT_APPLIED"},
             "rollback": {"status": "NOT_AVAILABLE"},
         }
-        _safe_json_write(session_path / "metadata.json", metadata)
+        try:
+            _safe_json_write(session_path / "metadata.json", metadata)
+        except Exception:
+            self._cleanup_paths_after_failed_operation(
+                [session_path],
+                "patch_preparation_cleanup_failed",
+            )
+            raise
         return {
             "patch_id": patch_id,
             "status": "PREPARED",
@@ -720,6 +728,8 @@ class PatchWorkspaceManager:
             proposed: dict[str, bytes] = {}
             workspace = session_path / "workspace"
             workspace.mkdir(parents=True, exist_ok=False)
+            rollback_dir = session_path / "rollback"
+            rollback_dir_created = False
             try:
                 for file_patch in file_patches:
                     if file_patch.is_new:
@@ -736,8 +746,8 @@ class PatchWorkspaceManager:
                 for path, data in proposed.items():
                     if _sha256(data) != changed[path].get("proposed_sha256"):
                         raise PatchSafetyError("application_integrity_mismatch")
-                rollback_dir = session_path / "rollback"
                 rollback_dir.mkdir()
+                rollback_dir_created = True
                 for path, data in original.items():
                     _safe_write(rollback_dir, path, data, overwrite=False)
                 metadata.update({
@@ -751,7 +761,13 @@ class PatchWorkspaceManager:
                 _safe_json_write(session_path / "metadata.json", metadata)
             except Exception:
                 # Do not expose a partially applied workspace as successful.
-                self._remove_tree(workspace)
+                cleanup_paths = [workspace]
+                if rollback_dir_created:
+                    cleanup_paths.append(rollback_dir)
+                self._cleanup_paths_after_failed_operation(
+                    cleanup_paths,
+                    "patch_application_cleanup_failed",
+                )
                 raise
             result = {
                 "patch_id": patch_id,
@@ -806,35 +822,43 @@ class PatchWorkspaceManager:
 
             working_files = dict(expected_files)
             working_dirs = set(expected_dirs)
-            for item in changed_files:
-                current_files, current_dirs = _workspace_snapshot(workspace, self.limits)
-                if current_files != working_files or current_dirs != working_dirs:
-                    raise PatchSafetyError("rollback_conflict")
-                path = _ensure_safe_path(str(item["path"]), max_path_bytes=self.limits.max_path_bytes)
-                if item.get("created"):
-                    _safe_delete(workspace, path, expected_sha256=working_files[path])
-                    parent = (workspace / path).parent
-                    while parent != workspace:
-                        try:
-                            parent.rmdir()
-                        except OSError:
-                            break
-                        parent = parent.parent
-                else:
-                    _safe_write(
-                        workspace,
-                        path,
-                        originals[path],
-                        overwrite=True,
-                        expected_sha256=working_files[path],
-                    )
-                working_files, working_dirs = _workspace_snapshot(workspace, self.limits)
+            rollback_changes_applied = False
+            try:
+                for item in changed_files:
+                    current_files, current_dirs = _workspace_snapshot(workspace, self.limits)
+                    if current_files != working_files or current_dirs != working_dirs:
+                        raise PatchSafetyError("rollback_conflict")
+                    path = _ensure_safe_path(str(item["path"]), max_path_bytes=self.limits.max_path_bytes)
+                    if item.get("created"):
+                        _safe_delete(workspace, path, expected_sha256=working_files[path])
+                        parent = (workspace / path).parent
+                        while parent != workspace:
+                            try:
+                                parent.rmdir()
+                            except OSError:
+                                break
+                            parent = parent.parent
+                    else:
+                        _safe_write(
+                            workspace,
+                            path,
+                            originals[path],
+                            overwrite=True,
+                            expected_sha256=working_files[path],
+                        )
+                    rollback_changes_applied = True
+                    working_files, working_dirs = _workspace_snapshot(workspace, self.limits)
 
-            final_files, final_dirs = _workspace_snapshot(workspace, self.limits)
-            if final_files != working_files or final_dirs != working_dirs:
-                raise PatchSafetyError("rollback_conflict")
-            metadata.update({"status": "ROLLED_BACK", "rolled_back_at": _now(), "rollback": {"status": "ROLLED_BACK"}})
-            _safe_json_write(session_path / "metadata.json", metadata)
+                final_files, final_dirs = _workspace_snapshot(workspace, self.limits)
+                if final_files != working_files or final_dirs != working_dirs:
+                    raise PatchSafetyError("rollback_conflict")
+                metadata.update({"status": "ROLLED_BACK", "rolled_back_at": _now(), "rollback": {"status": "ROLLED_BACK"}})
+                _safe_json_write(session_path / "metadata.json", metadata)
+            except PatchSafetyError as exc:
+                no_side_effects = not rollback_changes_applied and exc.code == "rollback_conflict"
+                raise PatchSafetyError(exc.code, no_side_effects=no_side_effects) from None
+            except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                raise PatchSafetyError("rollback_operation_failed", no_side_effects=False) from None
             result = {
                 "patch_id": patch_id,
                 "status": "ROLLED_BACK",
@@ -845,6 +869,21 @@ class PatchWorkspaceManager:
                 "remaining_uncertainties": [],
             }
         return result
+
+    def _cleanup_paths_after_failed_operation(self, paths: Iterable[Path], error_code: str) -> None:
+        cleanup_failed = False
+        for path in paths:
+            try:
+                self._remove_tree(path)
+            except Exception:
+                cleanup_failed = True
+            try:
+                if path.exists() or path.is_symlink():
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise PatchSafetyError(error_code, no_side_effects=False) from None
 
     @staticmethod
     def _remove_tree(path: Path) -> None:
@@ -920,6 +959,7 @@ class _PatchTool:
             return ToolResult.blocked(
                 "security_execution_required",
                 "Mutating patch operations require the trusted executor boundary",
+                no_side_effects=True,
             )
         return self._execute_operation(inputs)
 
@@ -942,6 +982,7 @@ class _PatchTool:
             return ToolResult.blocked(
                 "security_execution_required",
                 "Mutating patch operations require the trusted executor boundary",
+                no_side_effects=True,
             )
         return self._execute_operation(inputs)
 
@@ -1005,10 +1046,18 @@ class _PatchTool:
             return ToolResult.success(self.manager.rollback(inputs), metadata={"target_code_executed": False, "isolated": True})
         except PatchSafetyError as exc:
             if exc.code in {"patch_scope_exceeded", "invalid_path", "sensitive_or_unsafe_path", "excluded_path", "symlink_path", "symlink_in_repository", "base_revision_mismatch", "diagnosis_revision_mismatch", "diagnosis_evidence_stale", "diagnosis_invalid", "diagnosis_size_exceeded", "patch_not_linked_to_diagnosis_evidence", "patch_contains_sensitive_literal", "file_count_exceeded", "rollback_conflict", "modification_source_unsupported"}:
-                return ToolResult.blocked(exc.code, "Patch operation was rejected by its safety boundary")
-            return ToolResult.failed(exc.code, "Patch operation failed safely")
+                return ToolResult.blocked(
+                    exc.code,
+                    "Patch operation was rejected by its safety boundary",
+                    no_side_effects=exc.no_side_effects,
+                )
+            return ToolResult.failed(exc.code, "Patch operation failed safely", no_side_effects=exc.no_side_effects)
         except (OSError, ValueError, TypeError, KeyError, RecursionError):
-            return ToolResult.failed("patch_operation_failed", "Patch operation failed safely")
+            return ToolResult.failed(
+                "patch_operation_failed",
+                "Patch operation failed safely",
+                no_side_effects=self.name != PATCH_ROLLBACK_TOOL,
+            )
 
 
 def register_patch_tools(registry: Any, inspector: Any, *, workspace_root: Path | None = None) -> PatchWorkspaceManager:

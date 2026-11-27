@@ -297,6 +297,8 @@ class ScopeDefinition:
             if str(exc) == "scope_not_yet_active":
                 return ScopeDecision.NOT_YET_ACTIVE, str(exc)
             return ScopeDecision.AMBIGUOUS, str(exc)
+        if mode not in ("passive", "active"):
+            return ScopeDecision.DENIED, "mode_not_permitted"
         parsed = urlparse(url)
         if parsed.scheme.lower() not in {"http", "https"}:
             return ScopeDecision.DENIED, "scheme_not_permitted"
@@ -742,6 +744,7 @@ class BugBountyRun:
     findings: list[Finding]
     tests: list[TestCaseResult]
     limitations: list[str] = field(default_factory=list)
+    research_stage_refs: list[dict[str, str]] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
 
     def metrics(self) -> dict[str, Any]:
@@ -776,6 +779,7 @@ class BugBountyRun:
             "plan": safe_json(self.plan),
             "findings": [item.to_dict(public=public) for item in self.findings],
             "tests": [item.to_dict(public=public) for item in self.tests],
+            "research_stage_refs": safe_json(self.research_stage_refs),
             "metrics": self.metrics(),
             "limitations": self.limitations[:50],
             "created_at": self.created_at,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import os
 import sqlite3
 import threading
 import uuid
@@ -9,9 +11,11 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from private_agent.core.knowledge import (
+    KnowledgeAttestation,
+    KnowledgeAttestor,
     KnowledgeClaim,
     KnowledgeConflict,
     KnowledgeEvidence,
@@ -22,6 +26,7 @@ from private_agent.core.knowledge import (
 )
 from private_agent.bugbounty.models import safe_json
 from private_agent.core.experience import sanitize_value
+from private_agent.core.planning_provenance import planning_mode_from_plan, plan_version_from_state
 from private_agent.core.task_state import MAX_TASK_GOAL_LENGTH
 
 LOGGER = logging.getLogger(__name__)
@@ -323,7 +328,10 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 18
+MAX_TASK_MESSAGE_LENGTH = MAX_TASK_GOAL_LENGTH
+MAX_TASK_CONVERSATION_MESSAGES = 32
+MAX_TASK_CONVERSATION_CHARS = 16_000
 
 _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
     2: {
@@ -443,6 +451,60 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
             "worker_id": "TEXT", "nonce": "TEXT", "seen_at": "TEXT", "request_digest": "TEXT",
         },
     },
+    13: {
+        "knowledge_attestations": {
+            "attestation_id": "TEXT", "claim_id": "TEXT", "source_id": "TEXT",
+            "claim_version": "INTEGER", "key_id": "TEXT", "signature": "TEXT",
+            "attestation_json": "TEXT", "created_at": "TEXT",
+        },
+    },
+    14: {
+        "knowledge_attestations": {
+            "attestation_id": "TEXT", "claim_id": "TEXT", "source_id": "TEXT",
+            "claim_version": "INTEGER", "key_id": "TEXT", "signature": "TEXT",
+            "attestation_json": "TEXT", "created_at": "TEXT",
+        },
+        "task_messages": {
+            "message_id": "TEXT", "task_id": "TEXT", "sequence": "INTEGER", "role": "TEXT",
+            "message_kind": "TEXT", "content": "TEXT", "status": "TEXT", "idempotency_key": "TEXT",
+            "request_fingerprint": "TEXT", "created_at": "TEXT", "consumed_at": "TEXT",
+            "consumed_checkpoint": "TEXT",
+        },
+    },
+    15: {
+        "task_result_events": {
+            "event_id": "TEXT", "task_id": "TEXT", "owner_user_id": "TEXT", "sequence": "INTEGER", "role": "TEXT",
+            "message_kind": "TEXT", "task_status": "TEXT", "verification_status": "TEXT",
+            "result_available": "INTEGER", "verified_action_count": "INTEGER", "failed_action_count": "INTEGER",
+            "blocked_action_count": "INTEGER", "pending_action_count": "INTEGER",
+            "approval_pending_count": "INTEGER", "approval_approved_count": "INTEGER",
+            "approval_denied_count": "INTEGER", "approval_expired_count": "INTEGER",
+            "approval_cancelled_count": "INTEGER", "result_digest": "TEXT",
+            "transition_fingerprint": "TEXT", "created_at": "TEXT",
+        },
+    },
+    16: {
+        "task_assistant_replies": {
+            "reply_id": "TEXT", "reply_key": "TEXT", "event_id": "TEXT", "task_id": "TEXT",
+            "owner_user_id": "TEXT", "source_sequence": "INTEGER", "source_digest": "TEXT",
+            "role": "TEXT", "message_kind": "TEXT", "reply_code": "TEXT", "content": "TEXT",
+            "generation_mode": "TEXT", "created_at": "TEXT",
+        },
+        "task_assistant_reply_claims": {
+            "event_id": "TEXT", "task_id": "TEXT", "owner_user_id": "TEXT", "lease_owner": "TEXT",
+            "lease_expires_at": "TEXT", "attempt_count": "INTEGER", "created_at": "TEXT", "updated_at": "TEXT",
+        },
+    },
+    17: {
+        "task_conversation_sequences": {
+            "task_id": "TEXT", "last_sequence": "INTEGER",
+        },
+    },
+    18: {
+        "task_result_events": {
+            "planning_mode": "TEXT", "plan_version": "INTEGER",
+        },
+    },
 }
 
 _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -470,6 +532,12 @@ _MIGRATION_INDEX_COLUMNS: dict[str, tuple[str, ...]] = {
     "idx_remote_worker_jobs_claim": ("status", "worker_id", "created_at", "job_id"),
     "idx_remote_worker_jobs_lease": ("status", "lease_expires_at", "job_id"),
     "idx_remote_worker_jobs_idempotency": ("worker_id", "idempotency_key"),
+    "idx_knowledge_attestations_claim": ("claim_id", "claim_version", "created_at", "attestation_id"),
+    "idx_task_messages_task_sequence": ("task_id", "sequence"),
+    "idx_task_messages_pending": ("task_id", "status", "sequence"),
+    "idx_task_result_events_task_sequence": ("task_id", "sequence"),
+    "idx_task_assistant_replies_task_sequence": ("task_id", "source_sequence"),
+    "idx_task_assistant_reply_claims_lease": ("lease_expires_at", "event_id"),
 }
 
 
@@ -482,7 +550,12 @@ class QueueLeaseLost(RuntimeError):
 
 
 class Store:
-    def __init__(self, path: str | Path = "data/agent.sqlite3") -> None:
+    def __init__(
+        self,
+        path: str | Path = "data/agent.sqlite3",
+        *,
+        knowledge_attestation_key: str | bytes | None = None,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db_lock = _database_lock(self.path)
@@ -500,9 +573,9 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self._lease_local = threading.local()
         self._approval_gate: Any | None = None
-        # No trusted knowledge-ingestion boundary exists yet. Caller-supplied
-        # source class, content binding, and verification fields remain
-        # advisory and cannot create an in-process trust authority.
+        if knowledge_attestation_key is None:
+            knowledge_attestation_key = os.environ.get("AGENT_KNOWLEDGE_ATTESTATION_KEY")
+        self._knowledge_attestor = KnowledgeAttestor(knowledge_attestation_key) if knowledge_attestation_key else None
         with self._db_lock:
             self.init_schema()
 
@@ -763,10 +836,80 @@ class Store:
                 ("index", "idx_remote_worker_jobs_lease"),
                 ("index", "idx_remote_worker_jobs_idempotency"),
             )
+        if version == 13:
+            return (
+                ("table", "knowledge_attestations"),
+                ("index", "idx_knowledge_attestations_claim"),
+            )
+        if version == 14:
+            return (
+                ("table", "knowledge_attestations"),
+                ("index", "idx_knowledge_attestations_claim"),
+                ("table", "task_messages"),
+                ("index", "idx_task_messages_task_sequence"),
+                ("index", "idx_task_messages_pending"),
+            )
+        if version == 15:
+            return (
+                ("table", "task_result_events"),
+                ("index", "idx_task_result_events_task_sequence"),
+                ("trigger", "task_result_events_owner_matches_task"),
+                ("trigger", "task_result_events_no_update"),
+                ("trigger", "task_result_events_no_delete"),
+            )
+        if version == 16:
+            return (
+                ("table", "task_assistant_replies"),
+                ("table", "task_assistant_reply_claims"),
+                ("index", "idx_task_assistant_replies_task_sequence"),
+                ("index", "idx_task_assistant_reply_claims_lease"),
+                ("trigger", "task_assistant_replies_owner_matches_event"),
+                ("trigger", "task_assistant_replies_no_update"),
+                ("trigger", "task_assistant_replies_no_delete"),
+                ("trigger", "task_assistant_reply_claims_owner_matches_event"),
+            )
+        if version == 17:
+            return (
+                ("table", "task_conversation_sequences"),
+                ("trigger", "task_conversation_sequences_monotonic_guard"),
+                ("trigger", "task_conversation_sequences_no_delete"),
+                ("trigger", "task_messages_sequence_counter_guard"),
+                ("trigger", "task_messages_sequence_cross_type_guard"),
+                ("trigger", "task_messages_sequence_immutable"),
+                ("trigger", "task_result_events_sequence_counter_guard"),
+                ("trigger", "task_result_events_sequence_cross_type_guard"),
+            )
+        if version == 18:
+            return (("table", "task_result_events"),)
         return ()
 
-    def _assert_migration_objects(self, version: int) -> None:
-        for object_type, name in self._required_objects(version):
+    def _assert_migration_objects(
+        self, version: int, *, legacy_conversation_schema13: bool = False
+    ) -> None:
+        if version == 13 and not legacy_conversation_schema13:
+            attestations = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_attestations'"
+            ).fetchone()
+            conversations = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_messages'"
+            ).fetchone()
+            if attestations is None and conversations is not None:
+                # Backend PR1 used schema marker 13 for task_messages. Accept
+                # that legacy layout only after validating its complete table
+                # and indexes; migration 14 adds the other v13 feature.
+                self._assert_migration_objects(13, legacy_conversation_schema13=True)
+                return
+        if legacy_conversation_schema13:
+            required_objects = (
+                ("table", "task_messages"),
+                ("index", "idx_task_messages_task_sequence"),
+                ("index", "idx_task_messages_pending"),
+            )
+            schema_version_for_columns = 14
+        else:
+            required_objects = self._required_objects(version)
+            schema_version_for_columns = version
+        for object_type, name in required_objects:
             row = self.db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?",
                 (object_type, name),
@@ -778,7 +921,7 @@ class Store:
                     str(item["name"]): str(item["type"]).upper()
                     for item in self.db.execute(f"PRAGMA table_info({name})").fetchall()
                 }
-                expected = _MIGRATION_TABLE_COLUMNS.get(version, {}).get(name, {})
+                expected = _MIGRATION_TABLE_COLUMNS.get(schema_version_for_columns, {}).get(name, {})
                 for column, expected_type in expected.items():
                     if column not in columns:
                         raise UnsupportedSchemaVersion(
@@ -797,15 +940,61 @@ class Store:
                     "task_queue": ("CHECK (QUEUE_STATUS IN", "FOREIGN KEY (TASK_ID)"),
                 "knowledge_claims": ("CHECK (CONFIDENCE >= 0 AND CONFIDENCE <= 1)", "CHECK (VERSION >= 1)"),
                 "knowledge_evidence": ("FOREIGN KEY (CLAIM_ID)", "FOREIGN KEY (SOURCE_ID)"),
+                "knowledge_attestations": (
+                    "CHECK (CLAIM_VERSION >= 1)",
+                    "FOREIGN KEY (CLAIM_ID)",
+                    "FOREIGN KEY (SOURCE_ID)",
+                ),
                 "knowledge_conflicts": ("CHECK (CLAIM_ID <> CONFLICTING_CLAIM_ID)", "FOREIGN KEY (CLAIM_ID)", "FOREIGN KEY (CONFLICTING_CLAIM_ID)"),
                 "auth_users": ("CHECK (ROLE IN ('OWNER', 'OPERATOR', 'VIEWER'))", "CHECK (STATUS IN ('ACTIVE', 'DISABLED'))"),
                 "auth_sessions": ("FOREIGN KEY (USER_ID)",),
                 "task_owners": ("FOREIGN KEY (TASK_ID)", "FOREIGN KEY (USER_ID)"),
                 "bugbounty_finding_reviews": ("CHECK (EVIDENCE_VALIDATED IN (0, 1))",),
                 "remote_workers": ("CHECK (STATUS IN ('ACTIVE', 'ROTATED', 'REVOKED'))", "CHECK (ACCEPTANCE_STATUS IN ('UNVERIFIED', 'VERIFIED'))"),
-                "remote_worker_jobs": ("CHECK (STATUS IN ('QUEUED', 'LEASED', 'COMPLETED', 'FAILED', 'EXECUTION_UNKNOWN', 'BLOCKED'))",),
-                "remote_worker_nonces": ("PRIMARY KEY (WORKER_ID, NONCE)",),
-            }.get(name, ())
+                    "remote_worker_jobs": ("CHECK (STATUS IN ('QUEUED', 'LEASED', 'COMPLETED', 'FAILED', 'EXECUTION_UNKNOWN', 'BLOCKED'))",),
+                    "remote_worker_nonces": ("PRIMARY KEY (WORKER_ID, NONCE)",),
+                    "task_messages": (
+                        "CHECK (ROLE = 'USER')",
+                        "CHECK (MESSAGE_KIND IN ('INITIAL', 'FOLLOW_UP'))",
+                        "CHECK (STATUS IN ('PENDING', 'CONSUMED'))",
+                        "UNIQUE (TASK_ID, SEQUENCE)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                    ),
+                    "task_result_events": (
+                        "CHECK (ROLE = 'SYSTEM')",
+                        "CHECK (MESSAGE_KIND = 'RESULT')",
+                        "CHECK (TASK_STATUS IN",
+                        "UNIQUE (TASK_ID, SEQUENCE)",
+                        "UNIQUE (TASK_ID, TRANSITION_FINGERPRINT)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                        "FOREIGN KEY (OWNER_USER_ID) REFERENCES AUTH_USERS(USER_ID)",
+                    ),
+                    "task_assistant_replies": (
+                        "CHECK (ROLE = 'ASSISTANT')",
+                        "CHECK (MESSAGE_KIND = 'RESULT_REPLY')",
+                        "CHECK (REPLY_CODE IN",
+                        "EVENT_ID TEXT NOT NULL UNIQUE",
+                        "UNIQUE (TASK_ID, REPLY_KEY)",
+                        "FOREIGN KEY (EVENT_ID) REFERENCES TASK_RESULT_EVENTS(EVENT_ID)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                        "FOREIGN KEY (OWNER_USER_ID) REFERENCES AUTH_USERS(USER_ID)",
+                    ),
+                    "task_assistant_reply_claims": (
+                        "EVENT_ID TEXT PRIMARY KEY",
+                        "FOREIGN KEY (EVENT_ID) REFERENCES TASK_RESULT_EVENTS(EVENT_ID)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                        "FOREIGN KEY (OWNER_USER_ID) REFERENCES AUTH_USERS(USER_ID)",
+                    ),
+                    "task_conversation_sequences": (
+                        "LAST_SEQUENCE INTEGER NOT NULL CHECK (LAST_SEQUENCE >= 0)",
+                        "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
+                    ),
+                }.get(name, ())
+                if version >= 18 and name == "task_result_events":
+                    required_fragments += (
+                        "CHECK (PLANNING_MODE IN ('UNKNOWN', 'PROVIDER_VALIDATED', 'DETERMINISTIC_FALLBACK', 'DETERMINISTIC_ROUTE', 'DETERMINISTIC_REPLAN'))",
+                        "CHECK (PLAN_VERSION >= 0)",
+                    )
                 for fragment in required_fragments:
                     if fragment not in table_sql:
                         raise UnsupportedSchemaVersion(
@@ -819,6 +1008,93 @@ class Store:
                 if actual != _MIGRATION_INDEX_COLUMNS[name]:
                     raise UnsupportedSchemaVersion(
                         f"inconsistent_schema_version:{version}:invalid_index:{name}"
+                    )
+            elif object_type == "trigger" and name.startswith(("task_messages_sequence_", "task_result_events_", "task_assistant_replies_", "task_assistant_reply_claims_")):
+                trigger_row = self.db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)
+                ).fetchone()
+                trigger_sql = " ".join(str(trigger_row["sql"] or "").upper().split()) if trigger_row else ""
+                required_trigger_fragments = {
+                    "task_result_events_owner_matches_task": (
+                        "BEFORE INSERT ON TASK_RESULT_EVENTS",
+                        "FROM TASK_OWNERS",
+                        "NEW.TASK_ID",
+                        "NEW.OWNER_USER_ID",
+                        "TASK_RESULT_EVENTS_OWNER_MISMATCH",
+                    ),
+                    "task_result_events_no_update": (
+                        "BEFORE UPDATE ON TASK_RESULT_EVENTS",
+                        "TASK_RESULT_EVENTS_IMMUTABLE",
+                    ),
+                    "task_result_events_no_delete": (
+                        "BEFORE DELETE ON TASK_RESULT_EVENTS",
+                        "TASK_RESULT_EVENTS_IMMUTABLE",
+                    ),
+                    "task_assistant_replies_owner_matches_event": (
+                        "BEFORE INSERT ON TASK_ASSISTANT_REPLIES",
+                        "FROM TASK_RESULT_EVENTS",
+                        "NEW.EVENT_ID",
+                        "NEW.OWNER_USER_ID",
+                        "TASK_ASSISTANT_REPLIES_OWNER_MISMATCH",
+                    ),
+                    "task_assistant_replies_no_update": (
+                        "BEFORE UPDATE ON TASK_ASSISTANT_REPLIES",
+                        "TASK_ASSISTANT_REPLIES_IMMUTABLE",
+                    ),
+                    "task_assistant_replies_no_delete": (
+                        "BEFORE DELETE ON TASK_ASSISTANT_REPLIES",
+                        "TASK_ASSISTANT_REPLIES_IMMUTABLE",
+                    ),
+                    "task_assistant_reply_claims_owner_matches_event": (
+                        "BEFORE INSERT ON TASK_ASSISTANT_REPLY_CLAIMS",
+                        "FROM TASK_RESULT_EVENTS",
+                        "NEW.EVENT_ID",
+                        "NEW.OWNER_USER_ID",
+                        "TASK_ASSISTANT_REPLY_CLAIM_OWNER_MISMATCH",
+                    ),
+                    "task_messages_sequence_counter_guard": (
+                        "BEFORE INSERT ON TASK_MESSAGES",
+                        "TASK_CONVERSATION_SEQUENCES",
+                        "LAST_SEQUENCE = NEW.SEQUENCE",
+                        "TASK_MESSAGES_SEQUENCE_NOT_ALLOCATED",
+                    ),
+                    "task_messages_sequence_cross_type_guard": (
+                        "BEFORE INSERT ON TASK_MESSAGES",
+                        "FROM TASK_RESULT_EVENTS",
+                        "NEW.TASK_ID",
+                        "NEW.SEQUENCE",
+                        "TASK_CONVERSATION_SEQUENCE_DUPLICATE",
+                    ),
+                    "task_messages_sequence_immutable": (
+                        "BEFORE UPDATE OF SEQUENCE ON TASK_MESSAGES",
+                        "TASK_MESSAGES_SEQUENCE_IMMUTABLE",
+                    ),
+                    "task_result_events_sequence_counter_guard": (
+                        "BEFORE INSERT ON TASK_RESULT_EVENTS",
+                        "TASK_CONVERSATION_SEQUENCES",
+                        "LAST_SEQUENCE = NEW.SEQUENCE",
+                        "TASK_RESULT_EVENTS_SEQUENCE_NOT_ALLOCATED",
+                    ),
+                    "task_result_events_sequence_cross_type_guard": (
+                        "BEFORE INSERT ON TASK_RESULT_EVENTS",
+                        "FROM TASK_MESSAGES",
+                        "NEW.TASK_ID",
+                        "NEW.SEQUENCE",
+                        "TASK_CONVERSATION_SEQUENCE_DUPLICATE",
+                    ),
+                    "task_conversation_sequences_monotonic_guard": (
+                        "BEFORE UPDATE OF LAST_SEQUENCE ON TASK_CONVERSATION_SEQUENCES",
+                        "NEW.LAST_SEQUENCE != OLD.LAST_SEQUENCE + 1",
+                        "TASK_CONVERSATION_SEQUENCE_NOT_MONOTONIC",
+                    ),
+                    "task_conversation_sequences_no_delete": (
+                        "BEFORE DELETE ON TASK_CONVERSATION_SEQUENCES",
+                        "TASK_CONVERSATION_SEQUENCE_IMMUTABLE",
+                    ),
+                }.get(name, ())
+                if any(fragment not in trigger_sql for fragment in required_trigger_fragments):
+                    raise UnsupportedSchemaVersion(
+                        f"inconsistent_schema_version:{version}:invalid_trigger:{name}"
                     )
         if version == 3:
             state_rows = self.db.execute(
@@ -1010,10 +1286,15 @@ class Store:
                 # Migration 10 alters the table created by migration 8, so the
                 # table's pre-existence is expected and must not short-circuit
                 # the ALTER statements below.
-                if existing_objects is not None and version not in {10, 11}:
+                # Migration 14 reconciles both known schema-13 layouts; schema
+                # 13 has already been validated, and strict combined validation
+                # runs immediately after the additive migration.
+                reconcile_schema13 = version == 14 and 13 in versions
+                if existing_objects is not None and version not in {10, 11, 18} and not reconcile_schema13:
                     self._assert_migration_objects(version)
                 self._apply_migration(version)
                 self._assert_migration_objects(version)
+                versions.add(version)
 
     def _apply_migration(self, version: int) -> None:
         """Apply one migration inside the caller's transaction, monotonically."""
@@ -1359,6 +1640,359 @@ class Store:
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_remote_worker_jobs_idempotency ON remote_worker_jobs(worker_id, idempotency_key)")
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (12, now()))
             return
+        if version == 13:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS knowledge_attestations (
+              attestation_id TEXT PRIMARY KEY,
+              claim_id TEXT NOT NULL,
+              source_id TEXT NOT NULL,
+              claim_version INTEGER NOT NULL CHECK (claim_version >= 1),
+              key_id TEXT NOT NULL,
+              signature TEXT NOT NULL,
+              attestation_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (claim_id) REFERENCES knowledge_claims(claim_id),
+              FOREIGN KEY (source_id) REFERENCES knowledge_sources(source_id)
+            )""")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_attestations_claim "
+                "ON knowledge_attestations(claim_id, claim_version, created_at, attestation_id)"
+            )
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (13, now()))
+            return
+        if version == 14:
+            # Idempotently carry both branches' schema-13 features forward.
+            # This preserves a PR1-era task_messages table and fills in the
+            # knowledge_attestations table for that legacy layout.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS knowledge_attestations (
+              attestation_id TEXT PRIMARY KEY,
+              claim_id TEXT NOT NULL,
+              source_id TEXT NOT NULL,
+              claim_version INTEGER NOT NULL CHECK (claim_version >= 1),
+              key_id TEXT NOT NULL,
+              signature TEXT NOT NULL,
+              attestation_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (claim_id) REFERENCES knowledge_claims(claim_id),
+              FOREIGN KEY (source_id) REFERENCES knowledge_sources(source_id)
+            )""")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_attestations_claim "
+                "ON knowledge_attestations(claim_id, claim_version, created_at, attestation_id)"
+            )
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_messages (
+              message_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL CHECK (sequence >= 1),
+              role TEXT NOT NULL CHECK (role = 'USER'),
+              message_kind TEXT NOT NULL CHECK (message_kind IN ('INITIAL', 'FOLLOW_UP')),
+              content TEXT NOT NULL CHECK (length(trim(content)) > 0),
+              status TEXT NOT NULL CHECK (status IN ('PENDING', 'CONSUMED')),
+              idempotency_key TEXT,
+              request_fingerprint TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              consumed_at TEXT NOT NULL DEFAULT '',
+              consumed_checkpoint TEXT NOT NULL DEFAULT '',
+              UNIQUE (task_id, sequence),
+              UNIQUE (task_id, idempotency_key),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_messages_task_sequence ON task_messages(task_id, sequence)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_messages_pending ON task_messages(task_id, status, sequence)")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (14, now()))
+            return
+        if version == 15:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_result_events (
+              event_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL CHECK (sequence >= 1),
+              role TEXT NOT NULL CHECK (role = 'SYSTEM'),
+              message_kind TEXT NOT NULL CHECK (message_kind = 'RESULT'),
+              task_status TEXT NOT NULL CHECK (task_status IN (
+                'CREATED', 'QUEUED', 'PLANNING', 'READY', 'EXECUTING', 'EXECUTION_UNKNOWN',
+                'OBSERVING', 'VERIFYING', 'WAITING_APPROVAL', 'BLOCKED', 'FAILED', 'COMPLETED'
+              )),
+              verification_status TEXT NOT NULL CHECK (verification_status IN (
+                'VERIFIED', 'UNVERIFIED', 'EXECUTION_UNKNOWN', 'FAILED',
+                'WAITING_APPROVAL', 'BLOCKED', 'IN_PROGRESS'
+              )),
+              result_available INTEGER NOT NULL CHECK (result_available IN (0, 1)),
+              verified_action_count INTEGER NOT NULL CHECK (verified_action_count >= 0),
+              failed_action_count INTEGER NOT NULL CHECK (failed_action_count >= 0),
+              blocked_action_count INTEGER NOT NULL CHECK (blocked_action_count >= 0),
+              pending_action_count INTEGER NOT NULL CHECK (pending_action_count >= 0),
+              approval_pending_count INTEGER NOT NULL CHECK (approval_pending_count >= 0),
+              approval_approved_count INTEGER NOT NULL CHECK (approval_approved_count >= 0),
+              approval_denied_count INTEGER NOT NULL CHECK (approval_denied_count >= 0),
+              approval_expired_count INTEGER NOT NULL CHECK (approval_expired_count >= 0),
+              approval_cancelled_count INTEGER NOT NULL CHECK (approval_cancelled_count >= 0),
+              result_digest TEXT NOT NULL,
+              transition_fingerprint TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE (task_id, sequence),
+              UNIQUE (task_id, transition_fingerprint),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id),
+              FOREIGN KEY (owner_user_id) REFERENCES auth_users(user_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_result_events_task_sequence ON task_result_events(task_id, sequence)")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_owner_matches_task
+              BEFORE INSERT ON task_result_events
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_owners WHERE task_id = NEW.task_id AND user_id = NEW.owner_user_id
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_owner_mismatch');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_no_update
+              BEFORE UPDATE ON task_result_events BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_no_delete
+              BEFORE DELETE ON task_result_events BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_immutable');
+              END""")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (15, now()))
+            return
+        if version == 16:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_assistant_replies (
+              reply_id TEXT PRIMARY KEY,
+              reply_key TEXT NOT NULL UNIQUE,
+              event_id TEXT NOT NULL UNIQUE,
+              task_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              source_sequence INTEGER NOT NULL CHECK (source_sequence >= 1),
+              source_digest TEXT NOT NULL,
+              role TEXT NOT NULL CHECK (role = 'ASSISTANT'),
+              message_kind TEXT NOT NULL CHECK (message_kind = 'RESULT_REPLY'),
+              reply_code TEXT NOT NULL CHECK (reply_code IN (
+                'VERIFIED_A', 'VERIFIED_B', 'UNVERIFIED_A', 'UNVERIFIED_B',
+                'FAILED_A', 'FAILED_B', 'BLOCKED_A', 'BLOCKED_B', 'UNKNOWN_A', 'UNKNOWN_B',
+                'APPROVAL_PENDING_A', 'APPROVAL_PENDING_B', 'APPROVAL_DECISION_A', 'APPROVAL_DECISION_B',
+                'IN_PROGRESS_A', 'IN_PROGRESS_B'
+              )),
+              content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 500),
+              generation_mode TEXT NOT NULL CHECK (generation_mode IN ('MODEL_VARIANT', 'DETERMINISTIC_FALLBACK')),
+              created_at TEXT NOT NULL,
+              UNIQUE (task_id, reply_key),
+              FOREIGN KEY (event_id) REFERENCES task_result_events(event_id),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id),
+              FOREIGN KEY (owner_user_id) REFERENCES auth_users(user_id)
+            )""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_assistant_reply_claims (
+              event_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              lease_owner TEXT NOT NULL,
+              lease_expires_at TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (event_id) REFERENCES task_result_events(event_id),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id),
+              FOREIGN KEY (owner_user_id) REFERENCES auth_users(user_id)
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_assistant_replies_task_sequence ON task_assistant_replies(task_id, source_sequence)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_task_assistant_reply_claims_lease ON task_assistant_reply_claims(lease_expires_at, event_id)")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_owner_matches_event
+              BEFORE INSERT ON task_assistant_replies
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_result_events AS e
+                JOIN task_owners AS o ON o.task_id = e.task_id AND o.user_id = e.owner_user_id
+                WHERE e.event_id = NEW.event_id AND e.task_id = NEW.task_id
+                  AND e.owner_user_id = NEW.owner_user_id AND e.sequence = NEW.source_sequence
+                  AND e.result_digest = NEW.source_digest
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_owner_mismatch');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_no_update
+              BEFORE UPDATE ON task_assistant_replies BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_no_delete
+              BEFORE DELETE ON task_assistant_replies BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_reply_claims_owner_matches_event
+              BEFORE INSERT ON task_assistant_reply_claims
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_result_events AS e
+                JOIN task_owners AS o ON o.task_id = e.task_id AND o.user_id = e.owner_user_id
+                WHERE e.event_id = NEW.event_id AND e.task_id = NEW.task_id
+                  AND e.owner_user_id = NEW.owner_user_id
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_reply_claim_owner_mismatch');
+              END""")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (16, now()))
+            return
+        if version == 17:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS task_conversation_sequences (
+              task_id TEXT PRIMARY KEY,
+              last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+
+            # Result events and their assistant replies were immutable in v16.
+            # This one-time migration rewrites only their sequence bindings,
+            # then reinstalls the immutability guards in the same transaction.
+            self.db.execute("DROP TRIGGER IF EXISTS task_result_events_no_update")
+            self.db.execute("DROP TRIGGER IF EXISTS task_assistant_replies_no_update")
+
+            maximum = self.db.execute(
+                "SELECT MAX(sequence) AS sequence FROM ("
+                "SELECT sequence FROM task_messages UNION ALL "
+                "SELECT sequence FROM task_result_events)"
+            ).fetchone()
+            item_count = int(self.db.execute(
+                "SELECT (SELECT COUNT(*) FROM task_messages) + "
+                "(SELECT COUNT(*) FROM task_result_events) AS count"
+            ).fetchone()["count"])
+            offset = int(maximum["sequence"] or 0) + item_count + 1
+            if offset + int(maximum["sequence"] or 0) > (2**63 - 1):
+                raise UnsupportedSchemaVersion("conversation_sequence_migration_overflow")
+            self.db.execute("UPDATE task_messages SET sequence = sequence + ?", (offset,))
+            self.db.execute("UPDATE task_result_events SET sequence = sequence + ?", (offset,))
+            self.db.execute(
+                "UPDATE task_assistant_replies SET source_sequence = "
+                "(SELECT sequence FROM task_result_events WHERE event_id = task_assistant_replies.event_id)"
+            )
+
+            task_ids = [str(row["task_id"]) for row in self.db.execute(
+                "SELECT task_id FROM task_states ORDER BY task_id"
+            ).fetchall()]
+            migrated_last_sequences: dict[str, int] = {}
+            for task_id in task_ids:
+                messages = [dict(row) for row in self.db.execute(
+                    "SELECT message_id, sequence, created_at FROM task_messages "
+                    "WHERE task_id = ? ORDER BY sequence", (task_id,)
+                ).fetchall()]
+                events = [dict(row) for row in self.db.execute(
+                    "SELECT event_id, sequence, created_at FROM task_result_events "
+                    "WHERE task_id = ? ORDER BY sequence", (task_id,)
+                ).fetchall()]
+
+                # Preserve each legacy per-type sequence. Timestamps are used
+                # only to make a deterministic best-effort historical merge;
+                # ties put USER messages before SYSTEM results. Exact cross-type
+                # order for legacy timestamp ties was never stored.
+                merged: list[tuple[str, dict[str, Any]]] = []
+                message_index = event_index = 0
+                while message_index < len(messages) or event_index < len(events):
+                    if event_index >= len(events):
+                        item_type, item = "message", messages[message_index]
+                        message_index += 1
+                    elif message_index >= len(messages):
+                        item_type, item = "event", events[event_index]
+                        event_index += 1
+                    else:
+                        message = messages[message_index]
+                        result_event = events[event_index]
+                        message_key = (str(message["created_at"]), 0, int(message["sequence"]))
+                        event_key = (str(result_event["created_at"]), 1, int(result_event["sequence"]))
+                        if message_key <= event_key:
+                            item_type, item = "message", message
+                            message_index += 1
+                        else:
+                            item_type, item = "event", result_event
+                            event_index += 1
+                    merged.append((item_type, item))
+
+                for sequence, (item_type, item) in enumerate(merged, start=1):
+                    if item_type == "message":
+                        self.db.execute(
+                            "UPDATE task_messages SET sequence = ? WHERE message_id = ?",
+                            (sequence, str(item["message_id"])),
+                        )
+                    else:
+                        event_id = str(item["event_id"])
+                        self.db.execute(
+                            "UPDATE task_result_events SET sequence = ? WHERE event_id = ?",
+                            (sequence, event_id),
+                        )
+                        self.db.execute(
+                            "UPDATE task_assistant_replies SET source_sequence = ? WHERE event_id = ?",
+                            (sequence, event_id),
+                        )
+                migrated_last_sequences[task_id] = len(merged)
+
+            for task_id, last_sequence in migrated_last_sequences.items():
+                self.db.execute(
+                    "INSERT INTO task_conversation_sequences(task_id, last_sequence) VALUES (?, ?)",
+                    (task_id, last_sequence),
+                )
+
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_messages_sequence_counter_guard
+              BEFORE INSERT ON task_messages
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_conversation_sequences
+                WHERE task_id = NEW.task_id AND last_sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_messages_sequence_not_allocated');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_messages_sequence_cross_type_guard
+              BEFORE INSERT ON task_messages
+              WHEN EXISTS (
+                SELECT 1 FROM task_result_events
+                WHERE task_id = NEW.task_id AND sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_duplicate');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_messages_sequence_immutable
+              BEFORE UPDATE OF sequence ON task_messages BEGIN
+                SELECT RAISE(ABORT, 'task_messages_sequence_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_sequence_counter_guard
+              BEFORE INSERT ON task_result_events
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_conversation_sequences
+                WHERE task_id = NEW.task_id AND last_sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_sequence_not_allocated');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_sequence_cross_type_guard
+              BEFORE INSERT ON task_result_events
+              WHEN EXISTS (
+                SELECT 1 FROM task_messages
+                WHERE task_id = NEW.task_id AND sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_duplicate');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_conversation_sequences_monotonic_guard
+              BEFORE UPDATE OF last_sequence ON task_conversation_sequences
+              WHEN NEW.last_sequence != OLD.last_sequence + 1 BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_not_monotonic');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_conversation_sequences_no_delete
+              BEFORE DELETE ON task_conversation_sequences BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_result_events_no_update
+              BEFORE UPDATE ON task_result_events BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER IF NOT EXISTS task_assistant_replies_no_update
+              BEFORE UPDATE ON task_assistant_replies BEGIN
+                SELECT RAISE(ABORT, 'task_assistant_replies_immutable');
+              END""")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (17, now()))
+            return
+        if version == 18:
+            columns = {
+                str(item["name"])
+                for item in self.db.execute("PRAGMA table_info(task_result_events)").fetchall()
+            }
+            if "planning_mode" not in columns:
+                self.db.execute(
+                    "ALTER TABLE task_result_events ADD COLUMN planning_mode TEXT NOT NULL "
+                    "DEFAULT 'UNKNOWN' CHECK (planning_mode IN "
+                    "('UNKNOWN', 'PROVIDER_VALIDATED', 'DETERMINISTIC_FALLBACK', "
+                    "'DETERMINISTIC_ROUTE', 'DETERMINISTIC_REPLAN'))"
+                )
+            if "plan_version" not in columns:
+                self.db.execute(
+                    "ALTER TABLE task_result_events ADD COLUMN plan_version INTEGER NOT NULL "
+                    "DEFAULT 0 CHECK (plan_version >= 0)"
+                )
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (18, now()))
+            return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
     def latest_owner_policy_version(self) -> int:
@@ -1619,17 +2253,249 @@ class Store:
                 updated_at,
             ),
         )
+        self._persist_task_result_event_in_transaction(payload, status)
 
-    def save_task_state(self, state: Any, checkpoint_type: str, *, task_status: str | None = None) -> None:
+    def _allocate_task_conversation_sequence_in_transaction(self, task_id: str) -> int:
+        """Allocate the next task-wide conversation sequence inside a write transaction."""
+        if not self.db.in_transaction:
+            raise RuntimeError("conversation_sequence_transaction_required")
+        self.db.execute(
+            "INSERT INTO task_conversation_sequences(task_id, last_sequence) VALUES (?, 1) "
+            "ON CONFLICT(task_id) DO UPDATE SET last_sequence = last_sequence + 1",
+            (str(task_id),),
+        )
+        row = self.db.execute(
+            "SELECT last_sequence FROM task_conversation_sequences WHERE task_id = ?",
+            (str(task_id),),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("conversation_sequence_allocation_failed")
+        return int(row["last_sequence"])
+
+    def _persist_task_result_event_in_transaction(self, payload: dict[str, Any], status: str) -> None:
+        """Append a compact immutable result snapshot when its trusted summary changes."""
+        task_id = str(payload["task_id"])
+        owner = self.db.execute(
+            "SELECT user_id FROM task_owners WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if owner is None:
+            return
+        owner_user_id = str(owner["user_id"])
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        result_json = json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":"))
+        result_digest = hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+        planning_mode = planning_mode_from_plan(payload.get("plan"))
+        plan_version = plan_version_from_state(payload)
+        verification = result.get("verification") if isinstance(result.get("verification"), dict) else {}
+        if status == "COMPLETED":
+            verification_status = "VERIFIED" if verification.get("verified") is True else "UNVERIFIED"
+        elif status == "EXECUTION_UNKNOWN":
+            verification_status = "EXECUTION_UNKNOWN"
+        elif status == "FAILED":
+            verification_status = "FAILED"
+        elif status == "WAITING_APPROVAL":
+            verification_status = "WAITING_APPROVAL"
+        elif status == "BLOCKED":
+            verification_status = "BLOCKED"
+        else:
+            verification_status = "IN_PROGRESS"
+        action_records = payload.get("action_records")
+        action_statuses = [
+            str(record.get("status", ""))
+            for record in action_records.values()
+            if isinstance(action_records, dict) and isinstance(record, dict)
+        ] if isinstance(action_records, dict) else []
+        approval_counts = {
+            "PENDING": 0,
+            "APPROVED": 0,
+            "DENIED": 0,
+            "EXPIRED": 0,
+            "CANCELLED": 0,
+        }
+        for row in self.db.execute(
+            "SELECT status, COUNT(*) AS count FROM approval_requests WHERE task_id = ? GROUP BY status",
+            (task_id,),
+        ).fetchall():
+            key = str(row["status"])
+            if key in approval_counts:
+                approval_counts[key] = int(row["count"])
+        summary = {
+            "owner_user_id": owner_user_id,
+            "task_status": str(status),
+            "verification_status": verification_status,
+            "result_available": int(bool(result)),
+            "verified_action_count": action_statuses.count("VERIFIED"),
+            "failed_action_count": action_statuses.count("FAILED"),
+            "blocked_action_count": action_statuses.count("BLOCKED"),
+            "pending_action_count": len(payload.get("pending_actions", [])) if isinstance(payload.get("pending_actions"), list) else 0,
+            "approval_pending_count": approval_counts["PENDING"],
+            "approval_approved_count": approval_counts["APPROVED"],
+            "approval_denied_count": approval_counts["DENIED"],
+            "approval_expired_count": approval_counts["EXPIRED"],
+            "approval_cancelled_count": approval_counts["CANCELLED"],
+            "result_digest": result_digest,
+            "planning_mode": planning_mode,
+            "plan_version": plan_version,
+        }
+        latest = self.db.execute(
+            "SELECT owner_user_id, task_status, verification_status, result_available, "
+            "verified_action_count, failed_action_count, blocked_action_count, pending_action_count, "
+            "approval_pending_count, approval_approved_count, approval_denied_count, "
+            "approval_expired_count, approval_cancelled_count, result_digest, planning_mode, plan_version "
+            "FROM task_result_events WHERE task_id = ? ORDER BY sequence DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest is not None and all(latest[key] == value for key, value in summary.items()):
+            return
+        transition = {
+            "task_id": task_id,
+            "state_version": int(payload["state_version"]),
+            "state_fingerprint": str(payload["state_fingerprint"]),
+            **summary,
+        }
+        transition_fingerprint = hashlib.sha256(
+            json.dumps(transition, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        duplicate = self.db.execute(
+            "SELECT 1 FROM task_result_events WHERE task_id = ? AND transition_fingerprint = ?",
+            (task_id, transition_fingerprint),
+        ).fetchone()
+        if duplicate is not None:
+            return
+        sequence = self._allocate_task_conversation_sequence_in_transaction(task_id)
+        event_id = hashlib.sha256(f"task-result:{task_id}:{transition_fingerprint}".encode("utf-8")).hexdigest()
+        self.db.execute(
+            """INSERT OR IGNORE INTO task_result_events
+            (event_id, task_id, owner_user_id, sequence, role, message_kind, task_status,
+             verification_status, result_available, verified_action_count, failed_action_count,
+             blocked_action_count, pending_action_count, approval_pending_count, approval_approved_count,
+             approval_denied_count, approval_expired_count, approval_cancelled_count, result_digest,
+             transition_fingerprint, created_at, planning_mode, plan_version)
+            VALUES (?, ?, ?, ?, 'SYSTEM', 'RESULT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event_id, task_id, owner_user_id, sequence, summary["task_status"],
+                summary["verification_status"], summary["result_available"], summary["verified_action_count"],
+                summary["failed_action_count"], summary["blocked_action_count"], summary["pending_action_count"],
+                summary["approval_pending_count"], summary["approval_approved_count"],
+                summary["approval_denied_count"], summary["approval_expired_count"],
+                summary["approval_cancelled_count"], summary["result_digest"], transition_fingerprint,
+                str(payload.get("updated_at") or now()), summary["planning_mode"], summary["plan_version"],
+            ),
+        )
+
+    def _persist_task_result_event_for_current_state_in_transaction(self, task_id: str) -> None:
+        """Append an event using the validated persisted state while the caller owns the transaction."""
+        from private_agent.core.task_state import StateIntegrityError, TaskState
+
+        owner = self.db.execute(
+            "SELECT 1 FROM task_owners WHERE task_id = ?", (str(task_id),)
+        ).fetchone()
+        if owner is None:
+            return
+        row = self.db.execute(
+            "SELECT state_json FROM task_states WHERE task_id = ?", (str(task_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("approval_task_state_missing")
+        try:
+            state = TaskState.from_dict(json.loads(str(row["state_json"])))
+        except (TypeError, ValueError, KeyError, StateIntegrityError) as exc:
+            raise ValueError("approval_task_state_untrusted") from exc
+        if state.task_id != str(task_id):
+            raise ValueError("approval_task_state_binding_mismatch")
+        self._persist_task_result_event_in_transaction(state.to_dict(), state.status)
+
+    def save_task_state(
+        self,
+        state: Any,
+        checkpoint_type: str,
+        *,
+        task_status: str | None = None,
+        consume_message_ids: list[str] | tuple[str, ...] = (),
+    ) -> None:
         """Persist state, checkpoint and action records in one SQLite transaction."""
         payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
         with self._lease_write(str(payload["task_id"])):
+            message_ids = tuple(dict.fromkeys(str(item) for item in consume_message_ids))
+            if message_ids or checkpoint_type == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED":
+                task_id = str(payload["task_id"])
+                self._assert_verified_conversation_checkpoint_in_transaction(task_id, checkpoint_type=checkpoint_type)
+            if message_ids:
+                task_id = str(payload["task_id"])
+                placeholders = ",".join("?" for _ in message_ids)
+                rows = self.db.execute(
+                    f"SELECT message_id FROM task_messages WHERE task_id = ? AND status = 'PENDING' AND message_id IN ({placeholders})",
+                    (task_id, *message_ids),
+                ).fetchall()
+                if len(rows) != len(message_ids):
+                    raise ValueError("conversation_message_not_pending")
             self._persist_task_state_in_transaction(payload, checkpoint_type, task_status=task_status)
+            if message_ids:
+                stamp = now()
+                placeholders = ",".join("?" for _ in message_ids)
+                cursor = self.db.execute(
+                    f"UPDATE task_messages SET status = 'CONSUMED', consumed_at = ?, consumed_checkpoint = ? "
+                    f"WHERE task_id = ? AND status = 'PENDING' AND message_id IN ({placeholders})",
+                    (stamp, checkpoint_type, str(payload["task_id"]), *message_ids),
+                )
+                if cursor.rowcount != len(message_ids):
+                    raise ValueError("conversation_message_not_pending")
+
+    def _assert_verified_conversation_checkpoint_in_transaction(
+        self, task_id: str, *, checkpoint_type: str | None = None
+    ) -> None:
+        """Require the persisted latest checkpoint to prove one completed action."""
+        from private_agent.core.task_state import StateIntegrityError, TaskState
+
+        checkpoint = self.db.execute(
+            "SELECT checkpoint_type FROM task_checkpoints WHERE task_id = ? ORDER BY sequence DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
+        if checkpoint is None or str(checkpoint["checkpoint_type"]) not in {"AFTER_VERIFICATION", "APPROVAL_REVALIDATED"} or row is None:
+            raise ValueError("conversation_safe_checkpoint_required")
+        try:
+            state = TaskState.from_dict(json.loads(str(row["state_json"])))
+        except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("conversation_task_state_untrusted") from exc
+        if checkpoint_type == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED" and state.context.get("task_kind") != "bug_bounty":
+            raise ValueError("conversation_safe_checkpoint_required")
+        if state.status != "READY" or not state.current_step:
+            raise ValueError("conversation_safe_checkpoint_required")
+        verified = False
+        for key, record in state.action_records.items():
+            if not isinstance(record, dict) or record.get("step_id") != state.current_step:
+                continue
+            observation = state.observations.get(key)
+            verification = state.verification_results.get(key)
+            output = record.get("output")
+            if (
+                key in state.completed_actions
+                and record.get("action_key") == key
+                and record.get("input_fingerprint") == key
+                and record.get("status") == "VERIFIED"
+                and record.get("execution_status") == "success"
+                and isinstance(output, dict)
+                and output.get("status") == "success"
+                and isinstance(observation, dict)
+                and record.get("observation") == observation
+                and observation.get("execution_status") == "success"
+                and observation.get("observed_error") is None
+                and isinstance(verification, dict)
+                and record.get("verification") == verification
+                and verification.get("status") == "VERIFIED"
+                and verification.get("verified") is True
+            ):
+                verified = True
+                break
+        if not verified:
+            raise ValueError("conversation_verified_action_required")
 
     def create_queued_task(
         self,
         goal: str,
         *,
+        initial_message: str | None = None,
         task_id: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
@@ -1637,7 +2503,7 @@ class Store:
         max_attempts: int = 3,
         owner_user_id: str | None = None,
     ) -> dict[str, Any]:
-        """Atomically create a QUEUED state, checkpoint, queue row, and idempotency record."""
+        """Atomically create a QUEUED state, owner, queue, first message and idempotency record."""
         from private_agent.core.task_state import TaskState
 
         if not isinstance(goal, str):
@@ -1647,6 +2513,14 @@ class Store:
             raise ValueError("goal_required")
         if len(goal) > MAX_TASK_GOAL_LENGTH:
             raise ValueError("goal_too_long")
+        if initial_message is not None:
+            if not isinstance(initial_message, str):
+                raise ValueError("task_message_must_be_string")
+            initial_message = initial_message.strip()
+            if not initial_message:
+                raise ValueError("task_message_required")
+            if len(initial_message) > MAX_TASK_MESSAGE_LENGTH:
+                raise ValueError("task_message_too_long")
         if max_attempts < 1:
             raise ValueError("max_attempts_invalid")
         if idempotency_key is not None and not request_fingerprint:
@@ -1728,6 +2602,17 @@ class Store:
                     "INSERT INTO task_owners (task_id, user_id, created_at) VALUES (?, ?, ?)",
                     (state.task_id, owner_user_id, stamp),
                 )
+            if initial_message is not None:
+                initial_sequence = self._allocate_task_conversation_sequence_in_transaction(state.task_id)
+                self.db.execute(
+                    """INSERT INTO task_messages
+                    (message_id, task_id, sequence, role, message_kind, content, status,
+                     idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint)
+                    VALUES (?, ?, ?, 'USER', 'INITIAL', ?, 'CONSUMED', NULL, '', ?, ?, 'TASK_QUEUED')""",
+                    (str(uuid.uuid4()), state.task_id, initial_sequence, initial_message, stamp, stamp),
+                )
+            if owner_user_id is not None:
+                self._persist_task_result_event_in_transaction(payload, "QUEUED")
             if idempotency_key:
                 self.db.execute(
                     """INSERT INTO api_idempotency_keys
@@ -1749,6 +2634,431 @@ class Store:
         finally:
             self._db_lock.release()
 
+    def task_messages(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return only user-authored messages, optionally enforcing task ownership."""
+        with self._db_lock:
+            if owner_user_id is None:
+                rows = self.db.execute(
+                    "SELECT message_id, task_id, sequence, role, message_kind, content, status, "
+                    "created_at, consumed_at, consumed_checkpoint FROM task_messages "
+                    "WHERE task_id = ? ORDER BY sequence",
+                    (str(task_id),),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT m.message_id, m.task_id, m.sequence, m.role, m.message_kind, m.content, "
+                    "m.status, m.created_at, m.consumed_at, m.consumed_checkpoint "
+                    "FROM task_messages AS m JOIN task_owners AS o ON o.task_id = m.task_id "
+                    "WHERE m.task_id = ? AND o.user_id = ? ORDER BY m.sequence",
+                    (str(task_id), str(owner_user_id)),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def task_result_events(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return immutable result summaries only while the task-owner binding matches."""
+        query = (
+            "SELECT e.event_id, e.task_id, e.owner_user_id, e.sequence, e.role, e.message_kind, "
+            "e.task_status, e.verification_status, e.result_available, e.verified_action_count, "
+            "e.failed_action_count, e.blocked_action_count, e.pending_action_count, "
+            "e.approval_pending_count, e.approval_approved_count, e.approval_denied_count, "
+            "e.approval_expired_count, e.approval_cancelled_count, e.result_digest, "
+            "e.planning_mode, e.plan_version, e.created_at "
+            "FROM task_result_events AS e JOIN task_owners AS o "
+            "ON o.task_id = e.task_id AND o.user_id = e.owner_user_id "
+            "WHERE e.task_id = ?"
+        )
+        params: tuple[Any, ...] = (str(task_id),)
+        if owner_user_id is not None:
+            query += " AND e.owner_user_id = ?"
+            params = (str(task_id), str(owner_user_id))
+        query += " ORDER BY e.sequence"
+        with self._db_lock:
+            rows = self.db.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def task_conversation_items(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str | None = None,
+        after_sequence: int = 0,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Read one server-ordered page; the cursor is exclusive and append-only."""
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int) or after_sequence < 0:
+            raise ValueError("conversation_cursor_invalid")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500
+        ):
+            raise ValueError("conversation_limit_invalid")
+        task_id = str(task_id)
+        message_owner = ""
+        event_owner = ""
+        params: list[Any] = [task_id]
+        if owner_user_id is not None:
+            message_owner = " AND EXISTS (SELECT 1 FROM task_owners AS mo " \
+                "WHERE mo.task_id = m.task_id AND mo.user_id = ?)"
+            event_owner = " AND e.owner_user_id = ?"
+        if owner_user_id is not None:
+            params.append(str(owner_user_id))
+        params.append(task_id)
+        if owner_user_id is not None:
+            params.append(str(owner_user_id))
+        params.append(after_sequence)
+        query = (
+            "SELECT * FROM ("
+            "SELECT 'USER_MESSAGE' AS item_type, m.message_id AS item_id, m.sequence, m.task_id, "
+            "m.role, m.message_kind, m.content, m.status, m.created_at, m.consumed_at, "
+            "m.consumed_checkpoint, NULL AS task_status, NULL AS verification_status, "
+            "NULL AS result_available, NULL AS verified_action_count, NULL AS failed_action_count, "
+            "NULL AS blocked_action_count, NULL AS pending_action_count, NULL AS approval_pending_count, "
+            "NULL AS approval_approved_count, NULL AS approval_denied_count, NULL AS approval_expired_count, "
+            "NULL AS approval_cancelled_count, NULL AS result_digest, "
+            "NULL AS planning_mode, NULL AS plan_version "
+            "FROM task_messages AS m WHERE m.task_id = ?" + message_owner + " UNION ALL "
+            "SELECT 'SYSTEM_RESULT' AS item_type, e.event_id AS item_id, e.sequence, e.task_id, "
+            "e.role, e.message_kind, NULL AS content, NULL AS status, e.created_at, NULL AS consumed_at, "
+            "NULL AS consumed_checkpoint, e.task_status, e.verification_status, e.result_available, "
+            "e.verified_action_count, e.failed_action_count, e.blocked_action_count, e.pending_action_count, "
+            "e.approval_pending_count, e.approval_approved_count, e.approval_denied_count, "
+            "e.approval_expired_count, e.approval_cancelled_count, e.result_digest, "
+            "e.planning_mode, e.plan_version "
+            "FROM task_result_events AS e JOIN task_owners AS eo "
+            "ON eo.task_id = e.task_id AND eo.user_id = e.owner_user_id "
+            "WHERE e.task_id = ?" + event_owner + ") AS conversation_items "
+            "WHERE sequence > ? ORDER BY sequence"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit + 1)
+        with self._db_lock:
+            rows = [dict(row) for row in self.db.execute(query, tuple(params)).fetchall()]
+        has_more = limit is not None and len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            sequence = int(row["sequence"])
+            if row["item_type"] == "USER_MESSAGE":
+                message = {
+                    "message_id": str(row["item_id"]), "task_id": task_id, "sequence": sequence,
+                    "role": str(row["role"]), "message_kind": str(row["message_kind"]),
+                    "content": str(row["content"]), "status": str(row["status"]),
+                    "created_at": str(row["created_at"]), "consumed_at": str(row["consumed_at"]),
+                    "consumed_checkpoint": str(row["consumed_checkpoint"]),
+                }
+                items.append({"item_type": "USER_MESSAGE", "sequence": sequence, "message": message})
+            else:
+                result_event = {
+                    "event_id": str(row["item_id"]), "task_id": task_id, "sequence": sequence,
+                    "role": str(row["role"]), "message_kind": str(row["message_kind"]),
+                    "task_status": str(row["task_status"]),
+                    "verification_status": str(row["verification_status"]),
+                    "result_available": bool(row["result_available"]),
+                    "verified_action_count": int(row["verified_action_count"]),
+                    "failed_action_count": int(row["failed_action_count"]),
+                    "blocked_action_count": int(row["blocked_action_count"]),
+                    "pending_action_count": int(row["pending_action_count"]),
+                    "approval_pending_count": int(row["approval_pending_count"]),
+                    "approval_approved_count": int(row["approval_approved_count"]),
+                    "approval_denied_count": int(row["approval_denied_count"]),
+                    "approval_expired_count": int(row["approval_expired_count"]),
+                    "approval_cancelled_count": int(row["approval_cancelled_count"]),
+                    "result_digest": str(row["result_digest"]),
+                    "planning_mode": str(row["planning_mode"]),
+                    "plan_version": int(row["plan_version"]),
+                    "created_at": str(row["created_at"]),
+                }
+                items.append({"item_type": "SYSTEM_RESULT", "sequence": sequence, "result_event": result_event})
+        return {
+            "items": items,
+            "has_more": bool(has_more),
+            "next_cursor": int(items[-1]["sequence"]) if has_more and items else None,
+        }
+
+    def claim_next_task_assistant_reply_event(
+        self,
+        worker_id: str,
+        *,
+        lease_ttl_seconds: int = 300,
+        task_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Lease the latest unanswered user-facing result event across restarts."""
+        worker_id = str(worker_id).strip()
+        if not worker_id or len(worker_id) > 200:
+            raise ValueError("assistant_reply_worker_id_invalid")
+        if isinstance(lease_ttl_seconds, bool) or int(lease_ttl_seconds) < 1:
+            raise ValueError("assistant_reply_lease_invalid")
+        current = now()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=int(lease_ttl_seconds))).isoformat()
+        conditions = [
+            "(e.task_status IN ('COMPLETED', 'FAILED', 'BLOCKED', 'EXECUTION_UNKNOWN', 'WAITING_APPROVAL') "
+            "OR e.verification_status IN ('FAILED', 'BLOCKED', 'EXECUTION_UNKNOWN', 'WAITING_APPROVAL'))",
+            "NOT EXISTS (SELECT 1 FROM task_assistant_replies AS r WHERE r.event_id = e.event_id)",
+            "NOT EXISTS (SELECT 1 FROM task_result_events AS newer WHERE newer.task_id = e.task_id AND newer.sequence > e.sequence)",
+            "NOT EXISTS (SELECT 1 FROM task_assistant_reply_claims AS c WHERE c.event_id = e.event_id AND c.lease_expires_at > ?)",
+        ]
+        params: list[Any] = [current]
+        if task_id is not None:
+            conditions.append("e.task_id = ?")
+            params.append(str(task_id))
+        with self._db_lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.db.execute(
+                    "SELECT e.* FROM task_result_events AS e WHERE " + " AND ".join(conditions)
+                    + " ORDER BY e.created_at, e.sequence LIMIT 1",
+                    tuple(params),
+                ).fetchone()
+                if row is None:
+                    self.db.commit()
+                    return None
+                event = dict(row)
+                existing = self.db.execute(
+                    "SELECT attempt_count, created_at FROM task_assistant_reply_claims WHERE event_id = ?",
+                    (str(event["event_id"]),),
+                ).fetchone()
+                attempt_count = int(existing["attempt_count"]) + 1 if existing is not None else 1
+                created_at = str(existing["created_at"]) if existing is not None else current
+                self.db.execute(
+                    """INSERT INTO task_assistant_reply_claims
+                    (event_id, task_id, owner_user_id, lease_owner, lease_expires_at, attempt_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET task_id = excluded.task_id,
+                      owner_user_id = excluded.owner_user_id, lease_owner = excluded.lease_owner,
+                      lease_expires_at = excluded.lease_expires_at, attempt_count = excluded.attempt_count,
+                      updated_at = excluded.updated_at""",
+                    (
+                        str(event["event_id"]), str(event["task_id"]), str(event["owner_user_id"]),
+                        worker_id, expires, attempt_count, created_at, current,
+                    ),
+                )
+                self.db.commit()
+                event["result_available"] = bool(event["result_available"])
+                return event
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def save_task_assistant_reply(
+        self,
+        event_id: str,
+        *,
+        worker_id: str,
+        reply_code: str,
+        content: str,
+        generation_mode: str,
+    ) -> dict[str, Any]:
+        """Persist only a validated fixed phrase for the currently leased result."""
+        from private_agent.core.assistant_reply import render_reply_for_event
+
+        with self._db_lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                event_row = self.db.execute(
+                    "SELECT * FROM task_result_events WHERE event_id = ?", (str(event_id),)
+                ).fetchone()
+                if event_row is None:
+                    raise ValueError("assistant_reply_event_missing")
+                event = dict(event_row)
+                event["result_available"] = bool(event["result_available"])
+                expected_content = render_reply_for_event(event, str(reply_code))
+                if content != expected_content:
+                    raise ValueError("assistant_reply_content_not_allowlisted")
+                if generation_mode not in {"MODEL_VARIANT", "DETERMINISTIC_FALLBACK"}:
+                    raise ValueError("assistant_reply_generation_mode_invalid")
+                claim = self.db.execute(
+                    "SELECT lease_owner, lease_expires_at FROM task_assistant_reply_claims WHERE event_id = ?",
+                    (str(event_id),),
+                ).fetchone()
+                if claim is None or str(claim["lease_owner"]) != str(worker_id) or str(claim["lease_expires_at"]) <= now():
+                    raise QueueLeaseLost("assistant_reply_claim_lost")
+                reply_key = hashlib.sha256(
+                    f"assistant-reply:{event['event_id']}:{event['result_digest']}".encode("utf-8")
+                ).hexdigest()
+                reply_id = hashlib.sha256(f"assistant-reply-id:{reply_key}".encode("utf-8")).hexdigest()
+                created_at = now()
+                self.db.execute(
+                    """INSERT OR IGNORE INTO task_assistant_replies
+                    (reply_id, reply_key, event_id, task_id, owner_user_id, source_sequence, source_digest,
+                     role, message_kind, reply_code, content, generation_mode, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'ASSISTANT', 'RESULT_REPLY', ?, ?, ?, ?)""",
+                    (
+                        reply_id, reply_key, str(event["event_id"]), str(event["task_id"]),
+                        str(event["owner_user_id"]), int(event["sequence"]), str(event["result_digest"]),
+                        str(reply_code), expected_content, str(generation_mode), created_at,
+                    ),
+                )
+                self.db.execute(
+                    "DELETE FROM task_assistant_reply_claims WHERE event_id = ? AND lease_owner = ?",
+                    (str(event_id), str(worker_id)),
+                )
+                saved = self.db.execute(
+                    "SELECT * FROM task_assistant_replies WHERE event_id = ?", (str(event_id),)
+                ).fetchone()
+                if saved is None:
+                    raise RuntimeError("assistant_reply_persistence_failed")
+                self.db.commit()
+                return dict(saved)
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def task_assistant_replies(
+        self,
+        task_id: str,
+        *,
+        owner_user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read server-created replies only when both task and source-event owners match."""
+        query = (
+            "SELECT r.reply_id, r.task_id, r.owner_user_id, r.event_id, r.source_sequence, r.source_digest, "
+            "r.role, r.message_kind, r.reply_code, r.content, r.generation_mode, r.created_at "
+            "FROM task_assistant_replies AS r JOIN task_owners AS o "
+            "ON o.task_id = r.task_id AND o.user_id = r.owner_user_id "
+            "JOIN task_result_events AS e ON e.event_id = r.event_id AND e.task_id = r.task_id "
+            "AND e.owner_user_id = r.owner_user_id AND e.sequence = r.source_sequence "
+            "AND e.result_digest = r.source_digest WHERE r.task_id = ?"
+        )
+        params: tuple[Any, ...] = (str(task_id),)
+        if owner_user_id is not None:
+            query += " AND r.owner_user_id = ?"
+            params = (str(task_id), str(owner_user_id))
+        query += " ORDER BY r.source_sequence, r.created_at"
+        with self._db_lock:
+            rows = self.db.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def append_task_message(
+        self,
+        task_id: str,
+        content: str,
+        *,
+        owner_user_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a follow-up as pending without changing task state or plan."""
+        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState
+
+        task_id = str(task_id)
+        if not isinstance(content, str):
+            raise ValueError("task_message_must_be_string")
+        content = content.strip()
+        if not content:
+            raise ValueError("task_message_required")
+        if len(content) > MAX_TASK_MESSAGE_LENGTH:
+            raise ValueError("task_message_too_long")
+        if owner_user_id is not None and (not isinstance(owner_user_id, str) or not owner_user_id.strip() or len(owner_user_id) > 256):
+            raise ValueError("task_owner_invalid")
+        if idempotency_key is not None and not request_fingerprint:
+            raise ValueError("message_request_fingerprint_required")
+        self._db_lock.acquire()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            owner = self.db.execute("SELECT user_id FROM task_owners WHERE task_id = ?", (task_id,)).fetchone()
+            if owner_user_id is not None and (owner is None or str(owner["user_id"]) != owner_user_id):
+                raise KeyError("task_not_found")
+            task_row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
+            queue_row = self.db.execute("SELECT queue_status FROM task_queue WHERE task_id = ?", (task_id,)).fetchone()
+            if task_row is None or queue_row is None:
+                raise KeyError("task_not_found")
+            try:
+                state = TaskState.from_dict(json.loads(str(task_row["state_json"])))
+            except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("task_state_untrusted") from exc
+            queue_status = str(queue_row["queue_status"])
+            if idempotency_key is not None:
+                existing = self.db.execute(
+                    "SELECT * FROM task_messages WHERE task_id = ? AND idempotency_key = ?",
+                    (task_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["request_fingerprint"]) != str(request_fingerprint):
+                        raise ValueError("message_idempotency_conflict")
+                    if (
+                        str(existing["status"]) == "PENDING"
+                        and (state.status in TERMINAL_STATUSES or queue_status in {"COMPLETED", "FAILED", "BLOCKED"})
+                    ):
+                        raise ValueError("conversation_terminal")
+                    result = dict(existing)
+                    result["replayed"] = True
+                    self.db.commit()
+                    return result
+            if state.status == "EXECUTION_UNKNOWN" or queue_status == "EXECUTION_UNKNOWN":
+                raise ValueError("conversation_execution_unknown")
+            if state.status in TERMINAL_STATUSES or queue_status in {"COMPLETED", "FAILED", "BLOCKED"}:
+                raise ValueError("conversation_terminal")
+            eligible = (
+                state.status == "QUEUED" and queue_status == "QUEUED"
+            ) or (
+                state.status == "WAITING_APPROVAL" and queue_status in {"WAITING_APPROVAL", "QUEUED", "LEASED"}
+            ) or (
+                queue_status == "LEASED" and state.status in {"PLANNING", "EXECUTING", "OBSERVING", "VERIFYING"}
+            )
+            if state.status == "READY" and queue_status == "LEASED" and state.pending_actions:
+                eligible = any(
+                    isinstance(record, dict)
+                    and record.get("step_id") == state.current_step
+                    and record.get("status") == "VERIFIED"
+                    and key in state.completed_actions
+                    for key, record in state.action_records.items()
+                )
+            if not eligible:
+                raise ValueError("conversation_not_accepting_messages")
+            totals = self.db.execute(
+                "SELECT COUNT(*) AS message_count, COALESCE(SUM(length(content)), 0) AS total_chars "
+                "FROM task_messages WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if int(totals["message_count"] or 0) >= MAX_TASK_CONVERSATION_MESSAGES:
+                raise ValueError("conversation_message_limit")
+            if int(totals["total_chars"] or 0) + len(content) > MAX_TASK_CONVERSATION_CHARS:
+                raise ValueError("conversation_size_limit")
+            stamp = now()
+            message_id = str(uuid.uuid4())
+            sequence = self._allocate_task_conversation_sequence_in_transaction(task_id)
+            self.db.execute(
+                """INSERT INTO task_messages
+                (message_id, task_id, sequence, role, message_kind, content, status,
+                 idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint)
+                VALUES (?, ?, ?, 'USER', 'FOLLOW_UP', ?, 'PENDING', ?, ?, ?, '', '')""",
+                (message_id, task_id, sequence, content, idempotency_key, str(request_fingerprint or ""), stamp),
+            )
+            result = dict(self.db.execute("SELECT * FROM task_messages WHERE message_id = ?", (message_id,)).fetchone())
+            result["replayed"] = False
+            self.db.commit()
+            return result
+        except Exception:
+            self.db.rollback()
+            raise
+        finally:
+            self._db_lock.release()
+
+    def pending_task_messages_for_worker(self, task_id: str) -> list[dict[str, Any]]:
+        """Read pending follow-ups only under the active worker lease at a verified checkpoint."""
+        if not self.has_active_lease_context(task_id):
+            raise QueueLeaseLost("conversation_worker_lease_required")
+        with self._db_lock:
+            self._assert_active_lease(str(task_id))
+            self._assert_verified_conversation_checkpoint_in_transaction(str(task_id))
+            rows = self.db.execute(
+                "SELECT message_id, task_id, sequence, content, created_at FROM task_messages "
+                "WHERE task_id = ? AND message_kind = 'FOLLOW_UP' AND status = 'PENDING' ORDER BY sequence",
+                (str(task_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _queue_status_for_task_status(status: str) -> str:
         return {
@@ -1761,7 +3071,7 @@ class Store:
 
     def _mark_expired_lease_in_transaction(self, row: sqlite3.Row, stamp: str) -> dict[str, Any]:
         """Fence an expired worker and conservatively persist an unknown outcome."""
-        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState
+        from private_agent.core.task_state import StateIntegrityError, TERMINAL_STATUSES, TaskState, TaskStopReasonCode
 
         task_id = str(row["task_id"])
         state_row = self.db.execute(
@@ -1805,6 +3115,14 @@ class Store:
                     )
                 else:
                     state.touch()
+                state.set_stop_reason(
+                    TaskStopReasonCode.EXECUTION_UNKNOWN,
+                    step_id=state.current_step or None,
+                    action_id=next(
+                        (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                        None,
+                    ),
+                )
                 self._persist_task_state_in_transaction(
                     state.to_dict(),
                     "EXECUTION_UNKNOWN",
@@ -2023,7 +3341,7 @@ class Store:
                 raise QueueLeaseLost(f"queue_lease_expired:{task_id}")
 
             if state_status is not None:
-                from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+                from private_agent.core.task_state import TaskState, TaskStopReasonCode, TERMINAL_STATUSES
 
                 state_row = self.db.execute(
                     "SELECT state_json FROM task_states WHERE task_id = ?",
@@ -2044,6 +3362,14 @@ class Store:
                                 phase="EXECUTION_UNKNOWN",
                                 successful=False,
                             )
+                        state.set_stop_reason(
+                            TaskStopReasonCode.EXECUTION_UNKNOWN,
+                            step_id=state.current_step or None,
+                            action_id=next(
+                                (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                                None,
+                            ),
+                        )
                     elif state_status == "FAILED" and state.status not in TERMINAL_STATUSES:
                         state.result = {
                             **state.result,
@@ -2051,6 +3377,14 @@ class Store:
                             "errors": list(state.result.get("errors", [])) + [error_message or error_code or "worker_failed"],
                         }
                         state.checkpoint("WORKER_FAILED", status="FAILED", phase="WORKER_FAILED", successful=False)
+                        state.set_stop_reason(
+                            TaskStopReasonCode.WORKER_FAILED,
+                            step_id=state.current_step or None,
+                            action_id=next(
+                                (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                                None,
+                            ),
+                        )
                     self._persist_task_state_in_transaction(
                         state.to_dict(),
                         "EXECUTION_UNKNOWN" if state_status == "EXECUTION_UNKNOWN" else "WORKER_FAILED",
@@ -2109,7 +3443,7 @@ class Store:
             if current is None or current["queue_status"] != "LEASED" or current["lease_id"] != lease_id or current["worker_id"] != worker_id:
                 raise QueueLeaseLost(f"queue_lease_lost:{task_id}")
 
-            from private_agent.core.task_state import TaskState, TERMINAL_STATUSES
+            from private_agent.core.task_state import TaskState, TaskStopReasonCode, TERMINAL_STATUSES
 
             state_row = self.db.execute(
                 "SELECT state_json FROM task_states WHERE task_id = ?",
@@ -2137,6 +3471,14 @@ class Store:
                         )
                     else:
                         state.touch()
+                    state.set_stop_reason(
+                        TaskStopReasonCode.EXECUTION_UNKNOWN,
+                        step_id=state.current_step or None,
+                        action_id=next(
+                            (key for key, record in state.action_records.items() if record.get("step_id") == state.current_step),
+                            None,
+                        ),
+                    )
                     self._persist_task_state_in_transaction(
                         state.to_dict(),
                         "EXECUTION_UNKNOWN",
@@ -2180,53 +3522,71 @@ class Store:
         task through Orchestrator resume and current SecurityController checks.
         """
         stamp = now()
-        self._db_lock.acquire()
+        gate = self._approval_gate
+        policy_lock = getattr(gate, "policy_version_lock", None)
+        current_policy_version = getattr(gate, "current_policy_version", None)
+        if (
+            policy_lock is None
+            or not callable(getattr(policy_lock, "acquire", None))
+            or not callable(getattr(policy_lock, "release", None))
+            or not callable(current_policy_version)
+        ):
+            raise ValueError("approval_policy_unavailable")
+        policy_lock.acquire()
         try:
-            self.db.execute("BEGIN IMMEDIATE")
-            queue = self.db.execute(
-                "SELECT queue_status FROM task_queue WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            state = self.db.execute(
-                "SELECT state_json FROM task_states WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            if queue is None or state is None:
-                raise ValueError(f"task_not_found:{task_id}")
-            from private_agent.core.task_state import TaskState
+            with self._db_lock:
+                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    queue = self.db.execute(
+                        "SELECT queue_status FROM task_queue WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    state = self.db.execute(
+                        "SELECT state_json FROM task_states WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    if queue is None or state is None:
+                        raise ValueError(f"task_not_found:{task_id}")
+                    from private_agent.core.task_state import TaskState
 
-            payload = json.loads(state["state_json"])
-            task_state = TaskState.from_dict(payload)
-            if queue["queue_status"] != "WAITING_APPROVAL" or task_state.status != "WAITING_APPROVAL":
-                raise ValueError("task_not_waiting_approval")
-            if not task_state.approval_ids:
-                raise ValueError("approval_not_approved")
-            for action_id, approval_id in task_state.approval_ids.items():
-                approval = self.get_approval_request(str(approval_id))
-                if (
-                    not approval
-                    or approval.get("status") != "APPROVED"
-                    or str(approval.get("task_id", "")) != str(task_id)
-                    or str(approval.get("action_id", "")) != str(action_id)
-                ):
-                    raise ValueError("approval_not_approved")
-            updated = self.db.execute(
-                """UPDATE task_queue
-                   SET queue_status = 'QUEUED', available_at = ?,
-                       last_error_code = '', last_error_message = '', updated_at = ?
-                 WHERE task_id = ? AND queue_status = 'WAITING_APPROVAL'""",
-                (stamp, stamp, task_id),
-            )
-            if updated.rowcount != 1:
-                raise QueueLeaseLost(f"queue_requeue_lost:{task_id}")
-            self.db.commit()
-            return {"task_id": str(task_id), "queue_status": "QUEUED"}
-        except Exception:
-            self.db.rollback()
-            raise
-
+                    payload = json.loads(state["state_json"])
+                    task_state = TaskState.from_dict(payload)
+                    if queue["queue_status"] != "WAITING_APPROVAL" or task_state.status != "WAITING_APPROVAL":
+                        raise ValueError("task_not_waiting_approval")
+                    if not task_state.approval_ids:
+                        raise ValueError("approval_not_approved")
+                    current_version = current_policy_version()
+                    for action_id, approval_id in task_state.approval_ids.items():
+                        approval = self.get_approval_request(str(approval_id))
+                        if (
+                            not approval
+                            or approval.get("status") != "APPROVED"
+                            or str(approval.get("task_id", "")) != str(task_id)
+                            or str(approval.get("action_id", "")) != str(action_id)
+                        ):
+                            raise ValueError("approval_not_approved")
+                        try:
+                            approval_version = int(approval.get("policy_version", -1))
+                        except (TypeError, ValueError):
+                            raise ValueError("approval_not_approved") from None
+                        if approval_version != current_version:
+                            raise ValueError("approval_policy_stale")
+                    updated = self.db.execute(
+                        """UPDATE task_queue
+                           SET queue_status = 'QUEUED', available_at = ?,
+                               last_error_code = '', last_error_message = '', updated_at = ?
+                         WHERE task_id = ? AND queue_status = 'WAITING_APPROVAL'""",
+                        (stamp, stamp, task_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise QueueLeaseLost(f"queue_requeue_lost:{task_id}")
+                    self.db.commit()
+                    return {"task_id": str(task_id), "queue_status": "QUEUED"}
+                except Exception:
+                    self.db.rollback()
+                    raise
         finally:
-            self._db_lock.release()
+            policy_lock.release()
 
     def waiting_approval_task_ids(self, *, limit: int = 100) -> list[str]:
         """Return a bounded snapshot for worker approval reconciliation."""
@@ -2782,11 +4142,70 @@ class Store:
         )
         return conflict
 
+    def _suppress_knowledge_attestations_for_conflict(self, conflict: KnowledgeConflict) -> None:
+        if conflict.status != "OPEN":
+            return
+        claim_ids = sorted(
+            {item for item in (conflict.claim_id, conflict.conflicting_claim_id) if item}
+        )
+        if not claim_ids:
+            return
+        rows = self.db.execute(
+            "SELECT * FROM knowledge_attestations ORDER BY created_at, attestation_id"
+        ).fetchall()
+        if self._knowledge_attestor is None:
+            if rows:
+                raise KnowledgeValidationError("knowledge_attestation_key_missing")
+            return
+        for row in rows:
+            try:
+                attestation = KnowledgeAttestation.from_dict(
+                    json.loads(str(row["attestation_json"]))
+                )
+            except (KnowledgeValidationError, TypeError, ValueError):
+                if str(row["claim_id"]) in claim_ids:
+                    raise KnowledgeValidationError("knowledge_attestation_invalid")
+                continue
+            signed_claim_id = str(attestation.claim_snapshot["claim_id"])
+            if signed_claim_id not in claim_ids:
+                if str(row["claim_id"]) in claim_ids:
+                    raise KnowledgeValidationError("knowledge_attestation_invalid")
+                continue
+            if not self._knowledge_attestor.verify(attestation):
+                raise KnowledgeValidationError("knowledge_attestation_invalid")
+            updated = self._knowledge_attestor.suppress_for_conflict(
+                attestation, conflict.conflict_id
+            )
+            attestation_json = json.dumps(
+                updated.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            cursor = self.db.execute(
+                """UPDATE knowledge_attestations
+                   SET attestation_id = ?, claim_id = ?, source_id = ?, claim_version = ?,
+                       key_id = ?, signature = ?, attestation_json = ?, created_at = ?
+                   WHERE attestation_id = ?""",
+                (
+                    updated.attestation_id,
+                    updated.claim_snapshot["claim_id"],
+                    updated.source_snapshot["source_id"],
+                    updated.claim_snapshot["version"],
+                    updated.key_id,
+                    updated.signature,
+                    attestation_json,
+                    updated.verified_at,
+                    row["attestation_id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KnowledgeValidationError("knowledge_attestation_conflict_update_failed")
+
     def save_knowledge_conflict(self, conflict: KnowledgeConflict) -> KnowledgeConflict:
         if not isinstance(conflict, KnowledgeConflict):
             raise KnowledgeValidationError("conflict_type_required")
         with self._lease_write(self._knowledge_lease_task_id()):
-            return self._insert_knowledge_conflict(conflict)
+            saved = self._insert_knowledge_conflict(conflict)
+            self._suppress_knowledge_attestations_for_conflict(saved)
+            return saved
 
     def list_knowledge_conflicts(self, claim_id: str | None = None) -> list[dict[str, Any]]:
         if claim_id is None:
@@ -2853,6 +4272,194 @@ class Store:
                 "evidence": [item.to_dict() for item in saved_evidence],
             }
 
+    def issue_attested_knowledge_bundle(
+        self,
+        source: KnowledgeSource,
+        claim: KnowledgeClaim,
+        evidence: list[KnowledgeEvidence],
+        *,
+        issuer_authorizer: Callable[
+            [KnowledgeSource, KnowledgeClaim, list[KnowledgeEvidence]], str | None
+        ],
+        verified_at: str | None = None,
+        attestation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue and persist a bundle using a server-supplied issuer decision.
+
+        The callback must derive its identity from authenticated server context
+        and validate the associated persisted review; it must not accept a
+        reviewer identity supplied by an API caller.
+        """
+        if self._knowledge_attestor is None:
+            raise KnowledgeValidationError("knowledge_attestation_key_missing")
+        issuer = self._knowledge_attestor.with_issuer_authorizer(issuer_authorizer)
+        attestation = issuer.issue(
+            source,
+            claim,
+            evidence,
+            verified_at=verified_at,
+            attestation_id=attestation_id,
+        )
+        return self.save_attested_knowledge_bundle(source, claim, evidence, attestation)
+
+    def save_attested_knowledge_bundle(
+        self,
+        source: KnowledgeSource,
+        claim: KnowledgeClaim,
+        evidence: list[KnowledgeEvidence],
+        attestation: KnowledgeAttestation,
+    ) -> dict[str, Any]:
+        """Persist a reviewed bundle while keeping its ordinary claim row advisory."""
+        if not isinstance(source, KnowledgeSource) or not isinstance(claim, KnowledgeClaim):
+            raise KnowledgeValidationError("bundle_types_required")
+        if not isinstance(evidence, list) or not evidence or len(evidence) > 32:
+            raise KnowledgeValidationError("bundle_evidence_required")
+        if any(not isinstance(item, KnowledgeEvidence) for item in evidence):
+            raise KnowledgeValidationError("bundle_evidence_types_required")
+        if not isinstance(attestation, KnowledgeAttestation):
+            raise KnowledgeValidationError("knowledge_attestation_required")
+        if self._knowledge_attestor is None:
+            raise KnowledgeValidationError("knowledge_attestation_key_missing")
+        if not source.content_bound or not self._knowledge_attestor.verify(attestation):
+            raise KnowledgeValidationError("knowledge_attestation_invalid")
+        source_snapshot = source.to_dict()
+        claim_snapshot = claim.to_dict()
+        evidence_snapshots = sorted(
+            (item.to_dict() for item in evidence),
+            key=lambda item: (item["evidence_id"], item["evidence_fingerprint"]),
+        )
+        if (
+            source_snapshot != attestation.source_snapshot
+            or claim_snapshot != attestation.claim_snapshot
+            or evidence_snapshots != attestation.evidence_snapshots
+        ):
+            raise KnowledgeValidationError("knowledge_attestation_bundle_mismatch")
+        if any(item.claim_id != claim.claim_id or item.source_id != source.source_id for item in evidence):
+            raise KnowledgeValidationError("bundle_provenance_mismatch")
+        encoded_bundle = json.dumps(
+            {"source": source_snapshot, "claim": claim_snapshot, "evidence": evidence_snapshots},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(encoded_bundle.encode("utf-8")) > 256 * 1024:
+            raise KnowledgeValidationError("bundle_too_large")
+        attestation_json = json.dumps(
+            attestation.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(attestation_json.encode("utf-8")) > 256 * 1024:
+            raise KnowledgeValidationError("knowledge_attestation_too_large")
+
+        with self._lease_write(self._knowledge_lease_task_id()):
+            saved_source = self._insert_knowledge_source(source)
+            saved_claim = self._insert_knowledge_claim(claim)
+            saved_evidence: list[KnowledgeEvidence] = []
+            for item in evidence:
+                saved_evidence.append(self._insert_knowledge_evidence(item))
+            if (
+                saved_source.to_dict() != attestation.source_snapshot
+                or saved_claim.claim_id != claim.claim_id
+                or saved_claim.claim_fingerprint != claim.claim_fingerprint
+            ):
+                raise KnowledgeValidationError("knowledge_attestation_persisted_identity_mismatch")
+            saved_evidence_snapshots = sorted(
+                (item.to_dict() for item in saved_evidence),
+                key=lambda item: (item["evidence_id"], item["evidence_fingerprint"]),
+            )
+            if saved_evidence_snapshots != attestation.evidence_snapshots:
+                raise KnowledgeValidationError("knowledge_attestation_persisted_evidence_mismatch")
+            open_conflicts = self.db.execute(
+                """SELECT conflict_id FROM knowledge_conflicts
+                   WHERE status = 'OPEN' AND (claim_id = ? OR conflicting_claim_id = ?)
+                   ORDER BY conflict_id""",
+                (claim.claim_id, claim.claim_id),
+            ).fetchall()
+            for conflict_row in open_conflicts:
+                attestation = self._knowledge_attestor.suppress_for_conflict(
+                    attestation, str(conflict_row["conflict_id"])
+                )
+            attestation_json = json.dumps(
+                attestation.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if len(attestation_json.encode("utf-8")) > 256 * 1024:
+                raise KnowledgeValidationError("knowledge_attestation_too_large")
+            existing = self.db.execute(
+                "SELECT attestation_json, signature FROM knowledge_attestations WHERE attestation_id = ?",
+                (attestation.attestation_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["attestation_json"] != attestation_json or existing["signature"] != attestation.signature:
+                    raise KnowledgeValidationError("knowledge_attestation_id_conflict")
+            else:
+                self.db.execute(
+                    """INSERT INTO knowledge_attestations
+                       (attestation_id, claim_id, source_id, claim_version, key_id, signature,
+                        attestation_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        attestation.attestation_id,
+                        claim.claim_id,
+                        source.source_id,
+                        claim.version,
+                        attestation.key_id,
+                        attestation.signature,
+                        attestation_json,
+                        attestation.verified_at,
+                    ),
+                )
+            if not self._attestation_matches_persisted_rows(attestation):
+                raise KnowledgeValidationError("knowledge_attestation_persistence_check_failed")
+            return {
+                "source": saved_source.to_dict(),
+                "claim": saved_claim.to_dict(),
+                "evidence": [item.to_dict() for item in saved_evidence],
+                "attestation": attestation.to_dict(),
+            }
+
+    def _attestation_matches_persisted_rows(self, attestation: KnowledgeAttestation) -> bool:
+        if self._knowledge_attestor is None or not self._knowledge_attestor.verify(attestation):
+            return False
+        source_row = self.db.execute(
+            "SELECT * FROM knowledge_sources WHERE source_id = ?",
+            (attestation.source_snapshot["source_id"],),
+        ).fetchone()
+        claim_row = self.db.execute(
+            "SELECT * FROM knowledge_claims WHERE claim_id = ?",
+            (attestation.claim_snapshot["claim_id"],),
+        ).fetchone()
+        if source_row is None or claim_row is None:
+            return False
+        try:
+            stored_source = self._knowledge_source_from_row(source_row).to_dict()
+            stored_claim = self._knowledge_claim_from_row(claim_row).to_dict()
+        except (KnowledgeValidationError, TypeError, ValueError):
+            return False
+        if stored_source != attestation.source_snapshot:
+            return False
+        if (
+            stored_claim["status"] != "PROPOSED"
+            or stored_claim["verification_status"] != "unverified"
+            or stored_claim["last_verified_at"] != ""
+        ):
+            return False
+        for field_name in ("status", "verification_status", "last_verified_at"):
+            stored_claim[field_name] = attestation.claim_snapshot[field_name]
+        if stored_claim != attestation.claim_snapshot:
+            return False
+        evidence_rows = self.db.execute(
+            """SELECT * FROM knowledge_evidence
+               WHERE claim_id = ? AND source_id = ? ORDER BY evidence_id""",
+            (attestation.claim_snapshot["claim_id"], attestation.source_snapshot["source_id"]),
+        ).fetchall()
+        try:
+            stored_evidence = sorted(
+                (self._knowledge_evidence_from_row(row).to_dict() for row in evidence_rows),
+                key=lambda item: (item["evidence_id"], item["evidence_fingerprint"]),
+            )
+        except (KnowledgeValidationError, TypeError, ValueError):
+            return False
+        return stored_evidence == attestation.evidence_snapshots
+
     @staticmethod
     def _knowledge_as_of(value: str | None) -> datetime:
         raw = value or now()
@@ -2864,6 +4471,45 @@ class Store:
             raise KnowledgeValidationError("as_of_timezone_required")
         return parsed.astimezone(timezone.utc)
 
+    def _verified_knowledge_attestations(
+        self,
+    ) -> tuple[dict[str, KnowledgeAttestation], dict[str, int]]:
+        if self._knowledge_attestor is None:
+            return {}, {}
+        result: dict[str, KnowledgeAttestation] = {}
+        source_ids: dict[str, set[str]] = {}
+        rows = self.db.execute(
+            "SELECT * FROM knowledge_attestations ORDER BY created_at, attestation_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["attestation_json"]))
+                attestation = KnowledgeAttestation.from_dict(payload)
+            except (KnowledgeValidationError, TypeError, ValueError):
+                continue
+            try:
+                row_claim_version = int(row["claim_version"])
+            except (TypeError, ValueError):
+                continue
+            if (
+                row["attestation_id"] != attestation.attestation_id
+                or row["claim_id"] != attestation.claim_snapshot["claim_id"]
+                or row["source_id"] != attestation.source_snapshot["source_id"]
+                or row_claim_version != int(attestation.claim_snapshot["version"])
+                or row["key_id"] != attestation.key_id
+                or row["signature"] != attestation.signature
+                or not self._attestation_matches_persisted_rows(attestation)
+            ):
+                continue
+            claim_id = attestation.claim_snapshot["claim_id"]
+            source_ids.setdefault(claim_id, set()).add(attestation.source_snapshot["source_id"])
+            previous = result.get(claim_id)
+            if previous is None or (attestation.claim_snapshot["version"], attestation.verified_at) > (
+                previous.claim_snapshot["version"], previous.verified_at
+            ):
+                result[claim_id] = attestation
+        return result, {claim_id: len(items) for claim_id, items in source_ids.items()}
+
     def search_knowledge_claims(
         self,
         query: str,
@@ -2872,9 +4518,12 @@ class Store:
         as_of: str | None = None,
         max_age_seconds: int = 30 * 24 * 60 * 60,
         include_unverified: bool = False,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(query, str) or not query.strip():
             raise KnowledgeValidationError("knowledge_query_required")
+        if task_id is not None and (not isinstance(task_id, str) or not task_id.strip()):
+            raise KnowledgeValidationError("knowledge_task_scope_invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
             raise KnowledgeValidationError("knowledge_query_limit_invalid")
         if not isinstance(max_age_seconds, int) or isinstance(max_age_seconds, bool) or max_age_seconds < 1 or max_age_seconds > 10 * 365 * 24 * 60 * 60:
@@ -2884,57 +4533,101 @@ class Store:
         if not terms:
             return []
         rows = self.db.execute("SELECT * FROM knowledge_claims").fetchall()
+        attested_claims, attested_source_counts = self._verified_knowledge_attestations()
         open_conflicts: dict[str, int] = {}
         for row in self.db.execute("SELECT claim_id, conflicting_claim_id FROM knowledge_conflicts WHERE status = 'OPEN'").fetchall():
             open_conflicts[str(row["claim_id"])] = open_conflicts.get(str(row["claim_id"]), 0) + 1
             open_conflicts[str(row["conflicting_claim_id"])] = open_conflicts.get(str(row["conflicting_claim_id"]), 0) + 1
-        source_counts = {
-            str(row["claim_id"]): int(row["count"])
-            for row in self.db.execute(
-                "SELECT claim_id, COUNT(DISTINCT source_id) AS count FROM knowledge_evidence GROUP BY claim_id"
-            ).fetchall()
-        }
-        # Without a trusted attestation boundary, no persisted evidence is
-        # eligible to make a claim active or verified.
-        evidence_state: dict[str, int] = {}
         results: list[dict[str, Any]] = []
+        current_owner_user_id = self.task_owner_user_id(task_id) if task_id is not None else None
         for row in rows:
-            status = str(row["status"])
-            verification_status = str(row["verification_status"])
+            attestation = attested_claims.get(str(row["claim_id"]))
+            if task_id is not None and attestation is not None:
+                source_snapshot = attestation.source_snapshot
+                claim_snapshot = attestation.claim_snapshot
+                source_metadata = source_snapshot.get("metadata")
+                claim_metadata = claim_snapshot.get("metadata")
+                source_metadata = source_metadata if isinstance(source_metadata, dict) else {}
+                claim_metadata = claim_metadata if isinstance(claim_metadata, dict) else {}
+                bound_task_ids: set[str] = set()
+                for metadata in [source_metadata, claim_metadata, *(item.get("metadata", {}) for item in attestation.evidence_snapshots)]:
+                    if not isinstance(metadata, dict):
+                        continue
+                    bound_task_id = metadata.get("task_id")
+                    if isinstance(bound_task_id, str) and bound_task_id:
+                        bound_task_ids.add(bound_task_id)
+                owner_review_bound = bool(
+                    source_metadata.get("review_id")
+                    or claim_metadata.get("review_id")
+                    or str(source_snapshot.get("source_id", "")).startswith("source-review-")
+                    or str(source_snapshot.get("canonical_uri", "")).startswith("local://bug-bounty/reviews/")
+                )
+                if bound_task_ids or owner_review_bound:
+                    if len(bound_task_ids) != 1 or current_owner_user_id is None:
+                        continue
+                    bound_task_id = next(iter(bound_task_ids))
+                    if self.task_owner_user_id(bound_task_id) != current_owner_user_id:
+                        continue
+            claim_snapshot = attestation.claim_snapshot if attestation is not None else None
+            status = str(claim_snapshot["status"] if claim_snapshot is not None else "PROPOSED")
+            verification_status = str(
+                claim_snapshot["verification_status"] if claim_snapshot is not None else "unverified"
+            )
             if status in {"RETIRED", "QUARANTINED"}:
                 continue
             text = f"{row['subject']} {row['predicate']} {row['object_text']} {row['domain']}".lower()
             score = sum(term in text for term in terms)
             if not score:
                 continue
-            valid_from = self._knowledge_as_of(str(row["valid_from"])) if row["valid_from"] else None
-            valid_until = self._knowledge_as_of(str(row["valid_until"])) if row["valid_until"] else None
+            valid_from_raw = claim_snapshot["valid_from"] if claim_snapshot is not None else ""
+            valid_until_raw = claim_snapshot["valid_until"] if claim_snapshot is not None else ""
+            valid_from = self._knowledge_as_of(str(valid_from_raw)) if valid_from_raw else None
+            valid_until = self._knowledge_as_of(str(valid_until_raw)) if valid_until_raw else None
             if valid_from is not None and reference < valid_from:
                 continue
             if valid_until is not None and reference >= valid_until:
                 continue
-            last_verified = self._knowledge_as_of(str(row["last_verified_at"])) if row["last_verified_at"] else None
-            is_fresh = bool(last_verified is not None and (reference - last_verified).total_seconds() <= max_age_seconds)
-            is_verified = verification_status == "verified"
+            attested_at = self._knowledge_as_of(attestation.verified_at) if attestation is not None else None
+            age_seconds = (reference - attested_at).total_seconds() if attested_at is not None else None
+            is_fresh = bool(age_seconds is not None and 0 <= age_seconds <= max_age_seconds)
+            is_verified = bool(attestation is not None and verification_status == "verified")
             is_active = (
                 status == "SUPPORTED"
                 and is_verified
                 and is_fresh
-                and evidence_state.get(str(row["claim_id"]), 0) > 0
+                and bool(attestation.evidence_snapshots if attestation is not None else [])
                 and not open_conflicts.get(str(row["claim_id"]), 0)
+                and not (attestation.conflict_suppression_ids if attestation is not None else [])
             )
             if not include_unverified and not is_active:
                 continue
             item = dict(row)
-            item["metadata"] = json.loads(str(row["metadata_json"]))
+            if claim_snapshot is not None:
+                item.update(claim_snapshot)
+                item["last_verified_at"] = attestation.verified_at
+            else:
+                item.update(
+                    {
+                        "status": "PROPOSED",
+                        "verification_status": "unverified",
+                        "last_verified_at": "",
+                    }
+                )
+            if "metadata" not in item:
+                item["metadata"] = json.loads(str(row["metadata_json"]))
             item.pop("metadata_json", None)
             item.update(
                 {
-                    "source_count": source_counts.get(str(row["claim_id"]), 0),
+                    "source_count": attested_source_counts.get(str(row["claim_id"]), 0),
                     "conflict_count": open_conflicts.get(str(row["claim_id"]), 0),
                     "is_verified": is_verified,
                     "is_fresh": is_fresh,
                     "is_active": is_active,
+                    "is_attested": attestation is not None,
+                    "attestation_id": attestation.attestation_id if attestation is not None else "",
+                    "conflict_suppression_ids": (
+                        list(attestation.conflict_suppression_ids) if attestation is not None else []
+                    ),
                     "match_score": score,
                 }
             )
@@ -2947,14 +4640,10 @@ class Store:
             raise KnowledgeValidationError("knowledge_query_invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:
             raise KnowledgeValidationError("knowledge_query_limit_invalid")
-        terms = [t.lower() for t in query.split() if len(t) > 2]
-        rows = self.db.execute("SELECT * FROM knowledge_items ORDER BY confidence DESC, updated_at DESC").fetchall()
-        scored = []
-        for row in rows:
-            text = f"{row['concept']} {row['content']} {row['domain']}".lower()
-            score = sum(term in text for term in terms)
-            if score: scored.append((score, dict(row)))
-        result = [item for _, item in sorted(scored, key=lambda x: (x[0], x[1]['confidence']), reverse=True)[:limit]]
+        # Legacy knowledge_items do not bind their status, reliability, source,
+        # evidence, or verification time to a trusted provenance attestation.
+        # Fail closed for planner retrieval without changing or deleting rows.
+        result: list[dict[str, Any]] = []
         self._emit_observability(
             "MEMORY_RETRIEVED",
             metadata={"memory_type": "knowledge", "result_count": len(result)},
@@ -3135,10 +4824,33 @@ class Store:
             row = self.db.execute("SELECT * FROM experiences WHERE task_id = ?", (task_id,)).fetchone()
         return dict(row) if row else None
 
-    def all_experiences(self) -> list[dict[str, Any]]:
+    def all_experiences(self, *, owner_user_id: str | None = None) -> list[dict[str, Any]]:
         with self._db_lock:
-            rows = self.db.execute("SELECT * FROM experiences ORDER BY created_at DESC").fetchall()
+            if owner_user_id is None:
+                rows = self.db.execute("SELECT * FROM experiences ORDER BY created_at DESC").fetchall()
+            elif not isinstance(owner_user_id, str) or not owner_user_id.strip():
+                return []
+            else:
+                rows = self.db.execute(
+                    """SELECT e.* FROM experiences AS e
+                       JOIN task_owners AS o ON o.task_id = e.task_id
+                       WHERE o.user_id = ?
+                       ORDER BY e.created_at DESC""",
+                    (owner_user_id,),
+                ).fetchall()
         return [dict(row) for row in rows]
+
+    def experience_task_ids_for_owner(self, owner_user_id: str) -> set[str]:
+        if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+            return set()
+        with self._db_lock:
+            rows = self.db.execute(
+                """SELECT e.task_id FROM experiences AS e
+                   JOIN task_owners AS o ON o.task_id = e.task_id
+                   WHERE o.user_id = ?""",
+                (owner_user_id,),
+            ).fetchall()
+        return {str(row["task_id"]) for row in rows}
 
     def save_reflection(self, insight: Any) -> None:
         payload = insight.to_dict() if hasattr(insight, "to_dict") else insight
@@ -3426,8 +5138,8 @@ class Store:
         """Persist a final approval transition only for the bound gate.
 
         Public storage callers can create pending requests, but cannot write a
-        final decision. The gate-bound transition also rechecks the persisted
-        binding inside the same transaction before replacing the row.
+        final decision. The gate-bound transition rechecks the persisted binding
+        and the current policy version in one SQLite write transaction.
         """
         if self._approval_gate is not gate:
             raise ValueError("approval_transition_requires_gate")
@@ -3436,27 +5148,52 @@ class Store:
         if str(payload.get("status", "")) not in {"APPROVED", "DENIED", "CANCELLED", "EXPIRED"}:
             raise ValueError("approval_transition_invalid_status")
         task_id = str(payload["task_id"])
+        approving = payload["status"] == "APPROVED"
+        policy_lock = getattr(gate, "policy_version_lock", None)
+        current_policy_version = getattr(gate, "current_policy_version", None)
+        if approving and (
+            policy_lock is None
+            or not callable(getattr(policy_lock, "acquire", None))
+            or not callable(getattr(policy_lock, "release", None))
+            or not callable(current_policy_version)
+        ):
+            raise ValueError("approval_policy_unavailable")
+        if approving:
+            policy_lock.acquire()
         binding_fields = (
             "approval_id", "task_id", "action_id", "tool_or_skill",
             "requested_capabilities", "risk_level", "reason", "planned_effect",
             "input_fingerprint", "policy_version", "requested_at", "expires_at", "goal",
         )
-        with self._lease_write(task_id if enforce_lease else None):
-            row = self.db.execute(
-                "SELECT approval_json FROM approval_requests WHERE approval_id = ?",
-                (payload["approval_id"],),
-            ).fetchone()
-            if row is None:
-                raise ValueError("approval_not_found")
-            try:
-                current = json.loads(row["approval_json"])
-            except (TypeError, ValueError) as exc:
-                raise ValueError("approval_payload_corrupt") from exc
-            if not isinstance(current, dict) or current.get("status") != "PENDING":
-                raise ValueError("approval_transition_requires_pending")
-            if any(current.get(field) != payload.get(field) for field in binding_fields):
-                raise ValueError("approval_binding_mismatch")
-            self._write_approval_payload(payload, task_id)
+        try:
+            with self._lease_write(task_id if enforce_lease else None):
+                row = self.db.execute(
+                    "SELECT approval_json FROM approval_requests WHERE approval_id = ?",
+                    (payload["approval_id"],),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("approval_not_found")
+                try:
+                    current = json.loads(row["approval_json"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("approval_payload_corrupt") from exc
+                if not isinstance(current, dict) or current.get("status") != "PENDING":
+                    raise ValueError("approval_transition_requires_pending")
+                if any(current.get(field) != payload.get(field) for field in binding_fields):
+                    raise ValueError("approval_binding_mismatch")
+                if approving:
+                    try:
+                        current_version = current_policy_version()
+                        approved_version = int(payload.get("policy_version", -1))
+                    except Exception as exc:
+                        raise ValueError("approval_policy_unavailable") from exc
+                    if approved_version != current_version:
+                        raise ValueError("approval_policy_stale")
+                self._write_approval_payload(payload, task_id)
+                self._persist_task_result_event_for_current_state_in_transaction(task_id)
+        finally:
+            if approving:
+                policy_lock.release()
 
     def get_approval_request(self, approval_id: str) -> dict[str, Any] | None:
         with self._db_lock:

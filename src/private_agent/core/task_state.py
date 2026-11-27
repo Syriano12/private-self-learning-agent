@@ -2,15 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
+from private_agent.core.planning_provenance import (
+    PLANNING_MODES,
+    UNKNOWN,
+    planning_mode_from_plan,
+    plan_version_from_state,
+)
 
 from private_agent.core.experience import sanitize_value
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 MAX_TASK_GOAL_LENGTH = 4000
+_STOP_REASON_REFERENCE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_LEGACY_STATE_FIELDS = frozenset(
+    {
+        "task_id", "goal", "status", "current_phase", "current_step", "plan_version",
+        "plan_fingerprint", "plan", "completed_actions", "pending_actions", "failed_actions",
+        "observations", "verification_results", "recovery_state", "action_records", "approval_ids",
+        "security_decisions", "context", "result", "state_version", "state_fingerprint",
+        "created_at", "updated_at", "last_checkpoint_at", "last_successful_checkpoint",
+    }
+)
 TASK_STATUSES = {
     "CREATED",
     "QUEUED",
@@ -49,6 +67,75 @@ class StateIntegrityError(ValueError):
 
 class InvalidStateTransition(StateIntegrityError):
     """Raised when a state machine transition is not explicitly allowed."""
+
+
+class TaskStopReasonCode(str, Enum):
+    """Closed, non-free-text causes set only at explicit stop transitions."""
+
+    APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+    POLICY_BLOCKED = "POLICY_BLOCKED"
+    EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"
+    TASK_FAILED = "TASK_FAILED"
+    WORKER_FAILED = "WORKER_FAILED"
+
+
+@dataclass(frozen=True)
+class TaskStopReason:
+    """Safe public projection of a stop cause; never stores explanatory text."""
+
+    code: TaskStopReasonCode
+    step_id: str | None = None
+    action_id: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "code", TaskStopReasonCode(self.code))
+        except (TypeError, ValueError) as exc:
+            raise StateIntegrityError("task_stop_reason_code_invalid") from exc
+        for name in ("step_id", "action_id"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or _STOP_REASON_REFERENCE.fullmatch(value) is None
+            ):
+                raise StateIntegrityError(f"task_stop_reason_{name}_invalid")
+
+    @classmethod
+    def create(
+        cls,
+        code: TaskStopReasonCode,
+        *,
+        step_id: Any = None,
+        action_id: Any = None,
+    ) -> "TaskStopReason":
+        def safe_reference(value: Any) -> str | None:
+            if isinstance(value, str) and _STOP_REASON_REFERENCE.fullmatch(value):
+                return value
+            return None
+
+        return cls(
+            code=code,
+            step_id=safe_reference(step_id),
+            action_id=safe_reference(action_id),
+        )
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TaskStopReason":
+        if not isinstance(payload, dict) or "code" not in payload:
+            raise StateIntegrityError("task_stop_reason_must_be_object")
+        if set(payload) - {"code", "step_id", "action_id"}:
+            raise StateIntegrityError("task_stop_reason_fields_invalid")
+        try:
+            code = TaskStopReasonCode(payload["code"])
+        except (TypeError, ValueError) as exc:
+            raise StateIntegrityError("task_stop_reason_code_invalid") from exc
+        return cls(code=code, step_id=payload.get("step_id"), action_id=payload.get("action_id"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code.value,
+            "step_id": self.step_id,
+            "action_id": self.action_id,
+        }
 
 
 def utc_now() -> str:
@@ -118,6 +205,7 @@ class TaskState:
     security_decisions: dict[str, dict[str, Any]] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
+    stop_reason: TaskStopReason | None = None
     state_version: int = STATE_VERSION
     state_fingerprint: str = ""
     created_at: str = field(default_factory=utc_now)
@@ -145,18 +233,30 @@ class TaskState:
     def from_dict(cls, payload: dict[str, Any]) -> "TaskState":
         if not isinstance(payload, dict):
             raise StateIntegrityError("state_must_be_object")
-        required = {
-            "task_id", "goal", "status", "current_phase", "current_step", "plan_version",
-            "plan_fingerprint", "plan", "completed_actions", "pending_actions", "failed_actions",
-            "observations", "verification_results", "recovery_state", "action_records", "approval_ids",
-            "security_decisions", "context", "result", "state_version", "state_fingerprint",
-            "created_at", "updated_at", "last_checkpoint_at", "last_successful_checkpoint",
-        }
+        try:
+            serialized_version = int(payload["state_version"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise StateIntegrityError("state_version_invalid") from exc
+        if serialized_version not in {1, STATE_VERSION}:
+            raise StateIntegrityError(f"unsupported_state_version:{serialized_version}")
+        required = _LEGACY_STATE_FIELDS | ({"stop_reason"} if serialized_version == STATE_VERSION else set())
         missing = sorted(required - set(payload))
         if missing:
             raise StateIntegrityError(f"missing_state_fields:{','.join(missing)}")
-        if int(payload["state_version"]) != STATE_VERSION:
-            raise StateIntegrityError(f"unsupported_state_version:{payload['state_version']}")
+        migrating_legacy = serialized_version == 1
+        if migrating_legacy:
+            # v1 fingerprints covered only the original fields. Ignore any
+            # unversioned extension (including a forged stop_reason), verify
+            # the original payload, then migrate with an unavailable reason.
+            legacy_payload = {name: payload[name] for name in _LEGACY_STATE_FIELDS}
+            legacy_fingerprint = payload["state_fingerprint"]
+            legacy_payload["state_fingerprint"] = ""
+            if (
+                not isinstance(legacy_fingerprint, str)
+                or not legacy_fingerprint
+                or canonical_fingerprint(sanitize_value(legacy_payload)) != legacy_fingerprint
+            ):
+                raise StateIntegrityError("state_fingerprint_mismatch")
         state = cls(
             task_id=str(payload["task_id"]),
             goal=str(payload["goal"]),
@@ -177,13 +277,20 @@ class TaskState:
             security_decisions=dict(payload["security_decisions"]),
             context=dict(payload["context"]),
             result=dict(payload["result"]),
-            state_version=int(payload["state_version"]),
-            state_fingerprint=str(payload["state_fingerprint"]),
+            stop_reason=(
+                None
+                if migrating_legacy or payload["stop_reason"] is None
+                else TaskStopReason.from_dict(payload["stop_reason"])
+            ),
+            state_version=STATE_VERSION,
+            state_fingerprint="" if migrating_legacy else str(payload["state_fingerprint"]),
             created_at=str(payload["created_at"]),
             updated_at=str(payload["updated_at"]),
             last_checkpoint_at=str(payload["last_checkpoint_at"]),
             last_successful_checkpoint=str(payload["last_successful_checkpoint"]),
         )
+        if migrating_legacy:
+            state.refresh_fingerprint()
         state.validate()
         return state
 
@@ -208,6 +315,7 @@ class TaskState:
             "security_decisions": self.security_decisions,
             "context": self.context,
             "result": self.result,
+            "stop_reason": self.stop_reason.to_dict() if self.stop_reason is not None else None,
             "state_version": self.state_version,
             "state_fingerprint": self.state_fingerprint,
             "created_at": self.created_at,
@@ -230,11 +338,27 @@ class TaskState:
         self.updated_at = utc_now()
         self.refresh_fingerprint()
 
+    def set_stop_reason(
+        self,
+        code: TaskStopReasonCode | None,
+        *,
+        step_id: Any = None,
+        action_id: Any = None,
+    ) -> None:
+        self.stop_reason = (
+            None
+            if code is None
+            else TaskStopReason.create(code, step_id=step_id, action_id=action_id)
+        )
+        self.touch()
+
     def transition(self, status: str, *, phase: str | None = None, step_id: str | None = None) -> None:
         if status not in TASK_STATUSES:
             raise InvalidStateTransition(f"unknown_task_status:{status}")
         if status not in _ALLOWED_TRANSITIONS.get(self.status, set()):
             raise InvalidStateTransition(f"invalid_transition:{self.status}->{status}")
+        if self.status in {"WAITING_APPROVAL", "EXECUTION_UNKNOWN"} and status != self.status:
+            self.stop_reason = None
         self.status = status
         if phase is not None:
             self.current_phase = phase
@@ -269,7 +393,12 @@ class TaskState:
             raise StateIntegrityError("plan_not_json_safe") from exc
         # JSON round-tripping detaches nested planner objects without invoking
         # arbitrary __deepcopy__ hooks from an untrusted provider.
-        self.plan = json.loads(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+        detached_plan = json.loads(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+        planning_mode = detached_plan.get("planning_mode", UNKNOWN)
+        if not isinstance(planning_mode, str) or planning_mode not in PLANNING_MODES:
+            raise StateIntegrityError("plan_planning_mode_invalid")
+        detached_plan["planning_mode"] = planning_mode
+        self.plan = detached_plan
         self.plan_version = int(version if version is not None else self.plan_version + 1)
         self.plan_fingerprint = plan_fingerprint(self.plan)
         actions = plan_actions(self.plan, self.plan_version)
@@ -299,12 +428,19 @@ class TaskState:
                 "observation": None,
                 "verification": None,
                 "approval_id": "",
+                "planning_mode": planning_mode_from_plan(self.plan),
+                "plan_version": plan_version_from_state({"plan_version": self.plan_version if self.plan else 0}),
                 "updated_at": utc_now(),
             },
         )
 
     def mark_action(self, key: str, *, status: str, step_id: str, tool_name: str, input_fingerprint: str, **fields: Any) -> None:
         record = self.action_records.setdefault(key, {"action_key": key})
+        fields.setdefault("planning_mode", planning_mode_from_plan(self.plan))
+        fields.setdefault(
+            "plan_version",
+            plan_version_from_state({"plan_version": self.plan_version if self.plan else 0}),
+        )
         record.update(
             {
                 "action_key": key,
@@ -328,13 +464,29 @@ class TaskState:
             raise StateIntegrityError(f"unsupported_state_version:{self.state_version}")
         if self.status not in TASK_STATUSES:
             raise StateIntegrityError(f"unknown_task_status:{self.status}")
+        if self.stop_reason is not None:
+            if not isinstance(self.stop_reason, TaskStopReason):
+                raise StateIntegrityError("task_stop_reason_invalid")
+            allowed_statuses = {
+                TaskStopReasonCode.APPROVAL_REQUIRED: {"WAITING_APPROVAL"},
+                TaskStopReasonCode.POLICY_BLOCKED: {"BLOCKED"},
+                TaskStopReasonCode.EXECUTION_UNKNOWN: {"EXECUTION_UNKNOWN", "BLOCKED"},
+                TaskStopReasonCode.TASK_FAILED: {"FAILED"},
+                TaskStopReasonCode.WORKER_FAILED: {"FAILED"},
+            }
+            if self.status not in allowed_statuses[self.stop_reason.code]:
+                raise StateIntegrityError("task_stop_reason_status_mismatch")
         if not self.task_id or not self.goal:
             raise StateIntegrityError("task_identity_required")
         if not isinstance(self.plan, dict):
             raise StateIntegrityError("plan_must_be_object")
         if _contains_redacted(self.plan):
             raise StateIntegrityError("redacted_execution_input_requires_resolution")
+        valid_actions: set[str] = set()
         if self.plan:
+            planning_mode = self.plan.get("planning_mode", UNKNOWN)
+            if not isinstance(planning_mode, str) or planning_mode not in PLANNING_MODES:
+                raise StateIntegrityError("plan_planning_mode_invalid")
             if self.plan_version < 1 or not self.plan_fingerprint:
                 raise StateIntegrityError("plan_version_and_fingerprint_required")
             if plan_fingerprint(self.plan) != self.plan_fingerprint:
@@ -351,7 +503,27 @@ class TaskState:
         if self.status == "COMPLETED":
             verification = self.result.get("verification", {})
             if verification.get("verified") is not True:
-                raise StateIntegrityError("completed_without_persisted_verification")
+                details = verification.get("details", {}) if isinstance(verification, dict) else {}
+                step_statuses = details.get("step_statuses", []) if isinstance(details, dict) else []
+                limited_static_completion = (
+                    self.result.get("final_status") == "COMPLETED"
+                    and verification.get("status") == "INSUFFICIENT"
+                    and verification.get("verification_scope") == "STATIC_ONLY"
+                    and verification.get("security_impact_verified") is False
+                    and details.get("code") == "security_impact_not_verified"
+                    and details.get("verification_scope") == "STATIC_ONLY"
+                    and details.get("security_impact_verified") is False
+                    and isinstance(step_statuses, list)
+                    and len(step_statuses) == len(valid_actions)
+                    and details.get("step_count") == len(valid_actions)
+                    and all(item == "VERIFIED" for item in step_statuses)
+                    and bool(valid_actions)
+                    and len(self.completed_actions) == len(valid_actions)
+                    and set(self.completed_actions) == valid_actions
+                    and all(self.action_records.get(key, {}).get("status") == "VERIFIED" for key in valid_actions)
+                )
+                if not limited_static_completion:
+                    raise StateIntegrityError("completed_without_persisted_verification")
         expected = self.state_fingerprint
         if not expected:
             raise StateIntegrityError("state_fingerprint_required")

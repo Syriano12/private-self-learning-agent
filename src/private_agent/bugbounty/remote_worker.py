@@ -493,6 +493,8 @@ class RemoteWorkerProtocol:
                     raise WorkerProtocolError("worker_lease_fenced")
                 if datetime.fromisoformat(str(row["lease_expires_at"])) <= self._now():
                     self.store.db.execute("UPDATE remote_worker_jobs SET status = 'EXECUTION_UNKNOWN', last_error_code = 'lease_expired', updated_at = ? WHERE job_id = ?", (stamp, job_id))
+                    # Preserve the conservative outcome before raising; the handler below rolls back errors.
+                    self.store.db.commit()
                     raise WorkerProtocolError("execution_unknown")
                 self.store.db.execute(
                     "UPDATE remote_worker_jobs SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ? WHERE job_id = ? AND status = 'LEASED' AND lease_id = ? AND worker_id = ?",
@@ -533,6 +535,8 @@ class RemoteWorkerProtocol:
                     raise WorkerProtocolError("worker_lease_fenced")
                 if datetime.fromisoformat(str(row["lease_expires_at"])) <= self._now():
                     self.store.db.execute("UPDATE remote_worker_jobs SET status = 'EXECUTION_UNKNOWN', last_error_code = 'lease_expired', updated_at = ? WHERE job_id = ?", (stamp, job_id))
+                    # Preserve the conservative outcome before raising; the handler below rolls back errors.
+                    self.store.db.commit()
                     raise WorkerProtocolError("execution_unknown")
                 status = "FAILED" if sanitized["status"] in {"FAILED", "UNAVAILABLE", "INCOMPLETE"} else "COMPLETED"
                 self.store.db.execute(
