@@ -727,6 +727,7 @@ class ApprovalResponse(APIModel):
 class TaskStateResponse(APIModel):
     task_id: str
     goal: str
+    task_kind: str
     status: str
     current_phase: str
     current_step: str
@@ -1818,6 +1819,7 @@ class AgentAPIService:
         return TaskStateResponse(
             task_id=state.task_id,
             goal=str(_public_value(state.goal)),
+            task_kind="BUG_BOUNTY" if state.context.get("task_kind") == "bug_bounty" else "GENERAL",
             status=state.status,
             current_phase=state.current_phase,
             current_step=state.current_step,
