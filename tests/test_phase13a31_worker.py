@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from private_agent.auth import AuthManager, AuthPrincipal
 from private_agent.core.llm import GeminiProvider, LLMConfig
 from private_agent.core.planner import Planner
 from private_agent.storage import KnowledgeItem, QueueLeaseLost, Store
@@ -248,6 +249,106 @@ def test_gemini_planner_failure_is_failed_without_fake_plan_or_tool_side_effect(
     assert service.orchestrator.tools._tools["safe"].calls == 0
     assert store.task_queue_record(created["task_id"])["queue_status"] == "FAILED"
     store.close()
+
+
+def test_gemini_read_timeout_fails_worker_and_persists_visible_state_without_execution(tmp_path: Path) -> None:
+    calls = 0
+    tool = APITestTool("safe")
+
+    class PlanningOnlyGeminiProvider(GeminiProvider):
+        skip_assistant_replies = False
+
+        @property
+        def is_configured(self) -> bool:
+            return bool(self.config.api_key.strip()) and not self.skip_assistant_replies
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(request.content)
+        assert "responseJsonSchema" in payload["generationConfig"]
+        assert "responseSchema" not in payload["generationConfig"]
+        plan_schema = payload["generationConfig"]["responseJsonSchema"]["properties"]["plan"]
+        items = plan_schema["properties"]["steps"]["items"]
+        assert items["properties"]["tool"]["enum"] == ["safe"]
+        assert "input" not in items["properties"]
+        tool_inputs = plan_schema["properties"]["tool_inputs"]
+        assert tool_inputs["required"] == ["safe"]
+        fields = tool_inputs["properties"]["safe"]["items"]["properties"]["fields"]
+        assert set(fields["properties"]) == {"value"}
+        # Do not issue a second explanatory-reply request after the planned
+        # timeout; the one mocked call is reserved for planning.
+        provider.skip_assistant_replies = True
+        raise httpx.ReadTimeout("controlled synthetic planning timeout", request=request)
+
+    provider = PlanningOnlyGeminiProvider(
+        LLMConfig(api_key="synthetic-test-key", max_retries=0),
+        transport=httpx.MockTransport(handler),
+        sleep_fn=lambda _: None,
+    )
+    service, store, _ = make_service(tmp_path, tool, planner=Planner(provider))
+    owner = AuthManager(store, owner_email="synthetic-owner@example.test").initialize_owner(
+        "synthetic-owner@example.test", "synthetic-owner-password"
+    )
+    created = store.create_queued_task(
+        "complete a safe API task",
+        initial_message="complete a safe API task",
+        owner_user_id=owner.user_id,
+    )
+    task_id = created["task_id"]
+    assert store.task_queue_record(task_id)["queue_status"] == "QUEUED"
+
+    result = BackgroundWorker(service.orchestrator, worker_id="worker-gemini-timeout").run_once()
+
+    assert calls == 1
+    assert result["status"] == "FAILED"
+    assert result["error_code"] == "worker_failed"
+    assert "Gemini request failed" in result["error"]
+    assert tool.calls == 0
+    state = store.get_task_state(task_id)
+    assert state["status"] == "FAILED"
+    assert state["plan"] == {}
+    assert state["plan_version"] == 0
+    assert state["recovery_state"] == {}
+    assert state["completed_actions"] == []
+    assert state["pending_actions"] == []
+    assert state["failed_actions"] == []
+    assert state["action_records"] == {}
+    assert store.task_queue_record(task_id)["queue_status"] == "FAILED"
+    store.close()
+
+    reopened_service, reopened_store, _ = make_service(tmp_path, tool)
+    principal = AuthPrincipal(
+        subject=owner.user_id,
+        user_id=owner.user_id,
+        email=owner.email,
+        role=owner.role,
+    )
+    body = reopened_service.get_task(task_id, principal=principal)
+    assert body.status == "FAILED"
+    assert body.queue_status == "FAILED"
+    assert body.plan_version == 0
+    assert body.recovery_state == {}
+    assert body.completed_actions == []
+    assert body.pending_actions == []
+    assert body.failed_actions == []
+    assert body.actions == []
+    assert body.stop_reason.code == "WORKER_FAILED"
+
+    conversation_body = reopened_service.get_task_conversation(task_id, principal=principal)
+    assert conversation_body.task_status == "FAILED"
+    assert conversation_body.queue_status == "FAILED"
+    assert conversation_body.messages
+    system_results = [item.result_event for item in conversation_body.items if item.item_type == "SYSTEM_RESULT"]
+    assert system_results
+    assert system_results[-1] is not None
+    assert system_results[-1].role == "SYSTEM"
+    assert system_results[-1].message_kind == "RESULT"
+    assert system_results[-1].task_status == "FAILED"
+    assert system_results[-1].verification_status == "FAILED"
+    assert conversation_body.result_events[-1].event_id == system_results[-1].event_id
+    assert reopened_store.get_task_state(task_id)["recovery_state"] == {}
+    reopened_store.close()
 
 
 def test_interruption_after_execution_is_unknown_and_not_automatically_reexecuted(tmp_path: Path) -> None:

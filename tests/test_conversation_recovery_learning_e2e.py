@@ -33,7 +33,7 @@ FUTURE_GOAL = "Please research local artifact alpha for a future verified recove
 
 
 class LocalDeterministicProvider(LLMProvider):
-    """Test-only provider that proposes JSON; Planner still validates every plan."""
+    """Test-only integration fixture; it proves wiring, never model intelligence."""
 
     def __init__(self) -> None:
         self.contexts: list[dict[str, Any]] = []
@@ -50,6 +50,23 @@ class LocalDeterministicProvider(LLMProvider):
         context = json.loads(user_prompt)
         self.contexts.append(context)
         goal = str(context["goal"])
+
+        def structured(plan: dict[str, Any], *, recovery: bool) -> dict[str, Any]:
+            return {
+                "goal_spec": {
+                    "normalized_goal": goal,
+                    "intent": "attempted recovery mutation" if recovery else "synthetic local recovery objective",
+                    "deliverables": ["verified local result"],
+                    "constraints": ["synthetic local tools only"],
+                    "success_criteria": ["verified SQLite task result"],
+                    "missing_information": [],
+                    "clarification_required": False,
+                    "clarification_question": "",
+                    "priority": 1 if recovery else 4,
+                    "risk_level": "HIGH" if recovery else "LOW",
+                },
+                "plan": plan,
+            }
 
         if "current_plan" in context:
             data = {
@@ -69,14 +86,18 @@ class LocalDeterministicProvider(LLMProvider):
                         "id": "primary-step",
                         "objective": "verify the local recovery result with the alternative",
                         "tool": "tool_b",
-                        "input": {"value": "alpha"},
+                        "input": {},
                         "reason": "registered alternative selected after INVALID_OUTPUT",
                         "depends_on": ["safe-prerequisite"],
+                        "input_bindings": {
+                            "value": {"source_step_id": "safe-prerequisite", "output_key": "result"}
+                        },
                         "success_criteria": {"required_fields": ["result"]},
                     },
                 ],
             }
-            return LLMResponse(data, json.dumps(data, sort_keys=True), "local-deterministic")
+            result = structured(data, recovery=True)
+            return LLMResponse(result, json.dumps(result, sort_keys=True), "local-deterministic")
 
         alternative = next(
             (
@@ -93,7 +114,7 @@ class LocalDeterministicProvider(LLMProvider):
         selected = "tool_b" if alternative == "tool_b" else "tool_a"
         self.initial_choices.append(selected)
         steps = []
-        if selected == "tool_b":
+        if selected == "tool_b" or goal == SUPPORT_GOAL:
             steps.append(
                 {
                     "id": "safe-prerequisite",
@@ -105,14 +126,24 @@ class LocalDeterministicProvider(LLMProvider):
                     "success_criteria": {"required_fields": ["result"]},
                 }
             )
+        has_prerequisite = selected == "tool_b" or goal == SUPPORT_GOAL
         steps.append(
             {
                 "id": "primary-step",
                 "objective": "verify the local recovery result",
                 "tool": selected,
-                "input": {"value": "alpha"},
+                "input": {} if has_prerequisite else {"value": "alpha"},
                 "reason": "deterministic local plan using registered tools only",
-                "depends_on": ["safe-prerequisite"] if selected == "tool_b" else [],
+                "depends_on": ["safe-prerequisite"] if has_prerequisite else [],
+                **(
+                    {
+                        "input_bindings": {
+                            "value": {"source_step_id": "safe-prerequisite", "output_key": "result"}
+                        }
+                    }
+                    if has_prerequisite
+                    else {}
+                ),
                 "success_criteria": {"required_fields": ["result"]},
             }
         )
@@ -121,7 +152,29 @@ class LocalDeterministicProvider(LLMProvider):
             "rationale": "Deterministic local plan; learned guidance is advisory and server validation remains authoritative",
             "steps": steps,
         }
-        return LLMResponse(data, json.dumps(data, sort_keys=True), "local-deterministic")
+        result = structured(data, recovery=False)
+        return LLMResponse(result, json.dumps(result, sort_keys=True), "local-deterministic")
+
+
+class InvalidFixtureProvider(LLMProvider):
+    """Returns the saved synthetic invalid response; never contacts a model service."""
+
+    is_configured = False
+
+    def __init__(self, response: dict[str, Any]) -> None:
+        self.response = response
+        self.calls = 0
+
+    def generate_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: dict[str, Any],
+    ) -> LLMResponse:
+        del system_prompt, user_prompt, response_schema
+        self.calls += 1
+        return LLMResponse(self.response, json.dumps(self.response, sort_keys=True), "saved-fixture")
 
 
 class LocalTool:
@@ -253,6 +306,7 @@ def _run_support_task(
     goal: str = SUPPORT_GOAL,
 ) -> tuple[Store, str, LocalDeterministicProvider]:
     provider = LocalDeterministicProvider()
+    initial_provider = provider
     store, service, orchestrator = _build_components(database, calls, provider)
     auth = AuthManager(store)
     if initialize_owner:
@@ -269,11 +323,23 @@ def _run_support_task(
         assert state["plan"]["steps"][0]["id"] == "safe-prerequisite"
         assert state["plan"]["steps"][0]["tool"] == "safe_probe"
         assert state["plan"]["steps"][1]["tool"] == "tool_b"
+        assert state["plan_version"] == 2
+        assert state["plan"]["steps"][1]["input"] == {}
+        assert state["plan"]["steps"][1]["input_bindings"] == {
+            "value": {"source_step_id": "safe-prerequisite", "output_key": "result"}
+        }
         approval_id = str(state["approval_ids"]["primary-step"])
         prerequisite = _records_for_step(state, "safe-prerequisite")
         assert len(prerequisite) == 1 and prerequisite[0]["status"] == "VERIFIED"
         assert len(_calls_for(calls, "safe_probe", task_id)) == 1
         assert len(_calls_for(calls, "tool_a", task_id)) == 1
+        dependency_result = f"verified-local:safe_probe:local-check:task={task_id}"
+        expected_initial_input = (
+            {"value": dependency_result}
+            if goal == SUPPORT_GOAL or initial_provider.initial_choices == ["tool_b"]
+            else {"value": "alpha"}
+        )
+        assert _calls_for(calls, "tool_a", task_id)[0]["inputs"] == expected_initial_input
         assert _calls_for(calls, "tool_b", task_id) == []
         messages = client.get(f"/api/v1/tasks/{task_id}/messages")
         assert messages.status_code == 200
@@ -317,8 +383,16 @@ def _run_support_task(
         assert len(_calls_for(calls, "safe_probe", task_id)) == 1
         assert len(_calls_for(calls, "tool_a", task_id)) == 1
         assert len(_calls_for(calls, "tool_b", task_id)) == 1
+        assert _calls_for(calls, "tool_b", task_id)[0]["inputs"] == {"value": dependency_result}
         state = store.get_task_state(task_id)
         assert state is not None and state["status"] == "COMPLETED"
+        saved_goal_spec = state["plan"]["goal_spec"]
+        assert saved_goal_spec["goal_spec_version"] == 1
+        assert saved_goal_spec["analysis_mode"] == "PROVIDER"
+        assert saved_goal_spec["intent"] == "synthetic local recovery objective"
+        assert saved_goal_spec["priority"] == 4 and saved_goal_spec["risk_level"] == "LOW"
+        recovery_context = next(context for context in initial_provider.contexts if "current_plan" in context)
+        assert recovery_context["current_plan"]["goal_spec"] == saved_goal_spec
         failed_primary = [
             record for record in _records_for_step(state, "primary-step")
             if record.get("tool_name") == "tool_a"
@@ -343,7 +417,7 @@ def _run_support_task(
     assert failed_action["recovery"]["replacement_tool"] == "tool_b"
     assert experience["final_outcome"] == "COMPLETED"
     assert experience["verification_status"] == "VERIFIED"
-    return store, task_id, provider
+    return store, task_id, initial_provider
 
 
 def test_conversation_approval_restart_and_future_verified_recovery_learning(tmp_path: Path) -> None:
@@ -417,7 +491,8 @@ def test_conversation_approval_restart_and_future_verified_recovery_learning(tmp
         plan = store.get_task_state(future_id)["plan"]
         assert [step["tool"] for step in plan["steps"]] == ["safe_probe", "tool_b"]
         assert len(_calls_for(calls, "tool_a", future_id)) == 0
-        assert len(_calls_for(calls, "safe_probe", future_id)) == 0
+        assert len(_calls_for(calls, "safe_probe", future_id)) == 1
+        assert _calls_for(calls, "safe_probe", future_id)[0]["inputs"] == {"value": "local-check"}
         approval_id = str(store.get_task_state(future_id)["approval_ids"]["primary-step"])
         approval = store.get_approval_request(approval_id)
         assert approval is not None and approval["status"] == "PENDING"
@@ -1000,3 +1075,49 @@ def test_execution_unknown_experiences_cannot_generate_failure_patterns_after_re
         assert SQLiteLearningMemory(store).list() == []
     finally:
         store.close()
+
+
+def test_saved_invalid_provider_response_fails_closed_and_persists_clean_task_state(tmp_path: Path) -> None:
+    database = tmp_path / "invalid-planning-response.sqlite3"
+    calls: dict[str, list[dict[str, Any]]] = {name: [] for name in ("tool_a", "tool_b", "safe_probe")}
+    response = json.loads(
+        (Path(__file__).parent / "fixtures" / "gemini_invalid_synthetic_response.json").read_text(encoding="utf-8")
+    )
+    provider = InvalidFixtureProvider(response)
+    store, service, orchestrator = _build_components(database, calls, provider)  # type: ignore[arg-type]
+    auth = AuthManager(store)
+    auth.initialize_owner(auth.owner_email, OWNER_PASSWORD)
+
+    try:
+        with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+            csrf = _login(client, auth.owner_email)
+            task_id = _create_task(
+                client,
+                csrf,
+                "Synthetic-only fictional garden planning regression task",
+                "saved-invalid-provider-response",
+            )
+            result = BackgroundWorker(orchestrator, worker_id="invalid-response-worker").run_once()
+            assert result["status"] == "FAILED", result
+            assert result["task_id"] == task_id
+            assert provider.calls == 1
+            assert all(not tool_calls for tool_calls in calls.values())
+
+            state = store.get_task_state(task_id)
+            assert state is not None and state["status"] == "FAILED"
+            assert state["action_records"] == {}
+            queue = store.task_queue_record(task_id)
+            assert queue is not None and queue["queue_status"] == "FAILED"
+    finally:
+        store.close()
+
+    reopened = Store(database)
+    try:
+        state = reopened.get_task_state(task_id)
+        assert state is not None and state["status"] == "FAILED"
+        assert state["action_records"] == {}
+        queue = reopened.task_queue_record(task_id)
+        assert queue is not None and queue["queue_status"] == "FAILED"
+        assert all(not tool_calls for tool_calls in calls.values())
+    finally:
+        reopened.close()

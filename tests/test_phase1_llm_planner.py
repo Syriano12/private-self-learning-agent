@@ -14,6 +14,7 @@ from private_agent.core.llm import (
     LLMRateLimitError,
     LLMStructuredOutputError,
 )
+from private_agent.core.intelligence import GeneralIntelligenceEngine
 from private_agent.core.planner import PLAN_RESPONSE_SCHEMA, PlanValidationError, Planner
 from private_agent.tools.bug_investigation import BugInvestigationTool
 from private_agent.tools.research import ToolRegistry, WebResearchTool
@@ -227,7 +228,26 @@ def test_planner_passes_goal_tools_memory_constraints_and_permissions_to_provide
     assert context["constraints"] == {"max_steps": 3}
     assert context["permissions"] == {"web_research": "public_read"}
     assert context["available_tools"][0]["input_schema"]["required"] == ["query"]
-    assert fake.calls[0]["response_schema"] == PLAN_RESPONSE_SCHEMA
+    assert fake.calls[0]["response_schema"] == GeneralIntelligenceEngine.response_schema(
+        PLAN_RESPONSE_SCHEMA,
+        expected_goal="compare local agents",
+        tool_input_schemas={
+            item["name"]: item["input_schema"]
+            for item in context["available_tools"]
+        },
+    )
+    step_items = fake.calls[0]["response_schema"]["properties"]["plan"]["properties"]["steps"]["items"]
+    assert step_items["properties"]["tool"]["enum"] == ["web_research"]
+    assert "input" not in step_items["properties"]
+    assert "input_bindings" not in step_items["properties"]
+    web_inputs = fake.calls[0]["response_schema"]["properties"]["plan"]["properties"]["tool_inputs"]
+    assert web_inputs["required"] == ["web_research"]
+    web_fields = web_inputs["properties"]["web_research"]["items"]["properties"]["fields"]
+    assert web_fields["required"] == ["query"]
+    assert set(web_fields["properties"]) == {"query", "limit"}
+    assert web_fields["properties"]["limit"]["properties"]["value"]["minimum"] == 1
+    assert result.goal_spec is not None
+    assert result.goal_spec.analysis_mode == "LEGACY_COMPATIBILITY"
 
 
 def test_different_goals_produce_different_plans_without_keyword_routing() -> None:
