@@ -194,14 +194,28 @@ class Orchestrator:
                 return None
         else:
             resolved_input = dict(step.input)
+        execution_binding: dict[str, Any] | None = None
         if step.specialist_assignment:
+            registry = self.specialist_registry
+            if registry is None:
+                return None
+            execution_binding = registry.execution_binding(
+                step.specialist_assignment,
+                tool=tool,
+                objective=step.objective,
+                inputs=step.input,
+                input_bindings=step.input_bindings,
+                resolved_inputs=resolved_input,
+            )
+            if execution_binding is None:
+                return None
             action = self.security.action_for_tool(
                 state.task_id,
                 step.id,
                 tool,
                 resolved_input,
                 goal=str(plan.goal),
-                specialist_binding=step.specialist_assignment,
+                specialist_binding=execution_binding,
             )
         else:
             action = self.security.action_for_tool(
@@ -222,6 +236,14 @@ class Orchestrator:
         state.security_decisions[decision.action_id] = decision.to_dict()
         if decision.approval_id:
             state.approval_ids[decision.action_id] = decision.approval_id
+        resolved_input_digest = (
+            execution_binding.get("resolved_input_digest") if isinstance(execution_binding, dict) else None
+        )
+        if isinstance(resolved_input_digest, str):
+            # Keep the stable plan/action key unchanged; persist the resolved
+            # input commitment as separate provenance on the durable action.
+            state.action_record(state.action_key_for_step(step))["resolved_input_digest"] = resolved_input_digest
+            state.touch()
         self.store.save_event(
             state.task_id,
             "security_bound_action_preflight",

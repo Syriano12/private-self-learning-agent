@@ -326,13 +326,14 @@ class GenericExecutor:
                 tool=tool,
                 objective=step.objective,
                 inputs=step.input,
+                input_bindings=step.input_bindings,
             )
         ):
             return finish(StepResult.blocked(
                 step.id,
                 step.tool,
                 "specialist_assignment_untrusted",
-                "The server could not revalidate the specialist assignment against the current tool policy",
+                "The server could not revalidate the specialist assignment against current tool policy and input bindings",
                 details={"step_id": step.id},
                 metadata=self._timed(base_metadata, started),
             ))
@@ -420,7 +421,33 @@ class GenericExecutor:
             "goal": str(execution_context.metadata.get("goal", "")),
         }
         if step.specialist_assignment:
-            action_kwargs["specialist_binding"] = step.specialist_assignment
+            if self.specialist_registry is None:
+                return finish(StepResult.blocked(
+                    step.id,
+                    step.tool,
+                    "specialist_assignment_untrusted",
+                    "The specialist registry is unavailable for execution binding",
+                    details={"step_id": step.id},
+                    metadata=self._timed(base_metadata, started),
+                ))
+            execution_binding = self.specialist_registry.execution_binding(
+                step.specialist_assignment,
+                tool=tool,
+                objective=step.objective,
+                inputs=step.input,
+                input_bindings=step.input_bindings,
+                resolved_inputs=resolved_input,
+            )
+            if execution_binding is None:
+                return finish(StepResult.blocked(
+                    step.id,
+                    step.tool,
+                    "specialist_assignment_untrusted",
+                    "The resolved tool input could not be bound to the server-issued specialist assignment",
+                    details={"step_id": step.id},
+                    metadata=self._timed(base_metadata, started),
+                ))
+            action_kwargs["specialist_binding"] = execution_binding
         security_action = trusted_controller.action_for_tool(
             execution_context.task_id,
             step.id,

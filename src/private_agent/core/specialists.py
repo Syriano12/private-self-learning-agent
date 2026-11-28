@@ -20,8 +20,10 @@ _ASSIGNMENT_FIELDS = frozenset(
         "capability_digest",
         "tool_contract_digest",
         "output_schema_digest",
+        "input_bindings_digest",
     }
 )
+_LEGACY_ASSIGNMENT_FIELDS = _ASSIGNMENT_FIELDS - {"input_bindings_digest"}
 _SAFE_CAPABILITIES = frozenset({"READ_WORKSPACE"})
 _SAFE_LOCAL_TOOLS = frozenset(
     {
@@ -37,6 +39,30 @@ _SAFE_LOCAL_TOOLS = frozenset(
 def _digest(value: Any) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _normalize_input_bindings(value: Any) -> dict[str, dict[str, str]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("specialist_input_bindings_invalid")
+    normalized: dict[str, dict[str, str]] = {}
+    for target, binding in value.items():
+        if (
+            not isinstance(target, str)
+            or not target
+            or not isinstance(binding, dict)
+            or set(binding) != {"source_step_id", "output_key"}
+        ):
+            raise ValueError("specialist_input_bindings_invalid")
+        source_step_id = binding.get("source_step_id")
+        output_key = binding.get("output_key")
+        if not isinstance(source_step_id, str) or not source_step_id:
+            raise ValueError("specialist_input_bindings_invalid")
+        if not isinstance(output_key, str) or not output_key:
+            raise ValueError("specialist_input_bindings_invalid")
+        normalized[target] = {"source_step_id": source_step_id, "output_key": output_key}
+    return normalized
 
 
 def _capabilities(tool: Any, field: str) -> frozenset[str]:
@@ -170,6 +196,7 @@ class SpecialistRegistry:
         tool: Any,
         objective: str,
         inputs: dict[str, Any],
+        input_bindings: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(specialist_id, str) or not specialist_id:
             raise ValueError("specialist_id_required")
@@ -185,6 +212,7 @@ class SpecialistRegistry:
             raise ValueError("specialist_capability_exceeds_grant")
         if not isinstance(objective, str) or not objective.strip() or not isinstance(inputs, dict):
             raise ValueError("specialist_assignment_context_invalid")
+        normalized_bindings = _normalize_input_bindings(input_bindings)
         return {
             "assignment_id": uuid.uuid4().hex,
             "specialist_id": profile.specialist_id,
@@ -198,6 +226,7 @@ class SpecialistRegistry:
                 {key: value for key, value in contract.items() if key != "output_schema_digest"}
             ),
             "output_schema_digest": contract["output_schema_digest"],
+            "input_bindings_digest": _digest(normalized_bindings),
         }
 
     def validate_assignment(
@@ -207,8 +236,21 @@ class SpecialistRegistry:
         tool: Any,
         objective: str,
         inputs: dict[str, Any],
+        input_bindings: dict[str, dict[str, str]] | None = None,
     ) -> bool:
-        if not isinstance(assignment, dict) or set(assignment) != _ASSIGNMENT_FIELDS:
+        if not isinstance(assignment, dict):
+            return False
+        fields = frozenset(assignment)
+        legacy_assignment = fields == _LEGACY_ASSIGNMENT_FIELDS
+        if fields != _ASSIGNMENT_FIELDS and not legacy_assignment:
+            return False
+        try:
+            normalized_bindings = _normalize_input_bindings(input_bindings)
+        except Exception:
+            return False
+        # A pre-binding assignment has no provenance for dependency-derived
+        # inputs. Preserve it only for an unbound step; bound steps fail closed.
+        if legacy_assignment and normalized_bindings:
             return False
         if any(
             not isinstance(value, str) or not value
@@ -228,14 +270,64 @@ class SpecialistRegistry:
             return False
         try:
             expected = self.create_assignment(
-                assignment["specialist_id"], tool=tool, objective=objective, inputs=inputs
+                assignment["specialist_id"],
+                tool=tool,
+                objective=objective,
+                inputs=inputs,
+                input_bindings=normalized_bindings,
             )
         except Exception:
             return False
         # The server-issued ID is stable across persistence/restart; recompute all
         # policy and context bindings while preserving that original ID.
         expected["assignment_id"] = assignment["assignment_id"]
+        if legacy_assignment:
+            expected.pop("input_bindings_digest")
         return assignment == expected
+
+    def execution_binding(
+        self,
+        assignment: Any,
+        *,
+        tool: Any,
+        objective: str,
+        inputs: dict[str, Any],
+        input_bindings: dict[str, dict[str, str]] | None,
+        resolved_inputs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return an ephemeral receipt binding a valid assignment to actual inputs.
+
+        The assignment binds the raw inputs and declared dataflow edges. This
+        receipt is created only after the executor resolves and verifies those
+        edges; SecurityController then fingerprints it together with the exact
+        resolved input before authorization.
+        """
+        if not isinstance(inputs, dict) or not isinstance(resolved_inputs, dict):
+            return None
+        try:
+            normalized_bindings = _normalize_input_bindings(input_bindings)
+            expected_keys = set(inputs) | set(normalized_bindings)
+            if set(resolved_inputs) != expected_keys:
+                return None
+            if any(resolved_inputs.get(key) != value for key, value in inputs.items()):
+                return None
+            resolved_digest = _digest(resolved_inputs)
+        except Exception:
+            return None
+        if not self.validate_assignment(
+            assignment,
+            tool=tool,
+            objective=objective,
+            inputs=inputs,
+            input_bindings=normalized_bindings,
+        ):
+            return None
+        # For an unbound step, the raw input is already the exact effective
+        # input. Keep the original assignment shape so early preflight and
+        # execution produce the same authorization fingerprint.
+        if not normalized_bindings:
+            return dict(assignment)
+        return {**assignment, "resolved_input_digest": resolved_digest}
 
     @classmethod
     def for_local_repository_tools(cls, tools: Any) -> "SpecialistRegistry":
