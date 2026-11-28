@@ -83,11 +83,16 @@ class SQLiteLearningMemory(LearningMemory):
         min_confidence: float = 0.70,
         min_relevance: float = 0.45,
         max_support_age_seconds: int = 180 * 24 * 60 * 60,
+        trusted_verifier_names: set[str] | frozenset[str] | None = None,
     ) -> None:
         self.store_backend = store
         self.min_confidence = max(0.0, min(1.0, float(min_confidence)))
         self.min_relevance = max(0.0, min(1.0, float(min_relevance)))
         self.max_support_age_seconds = max(1, int(max_support_age_seconds))
+        trusted_names = trusted_verifier_names or set()
+        if any(not isinstance(name, str) or not name.strip() for name in trusted_names):
+            raise ValueError("learning_trusted_verifier_name_invalid")
+        self.trusted_verifier_names = frozenset(name for name in trusted_names if name != "generic")
 
     def save(self, strategy: LearnedStrategy) -> None:
         self.store_backend.save_learned_strategy(strategy)
@@ -279,11 +284,15 @@ class SQLiteLearningMemory(LearningMemory):
                 return False
             verification = final_action.get("verification")
             evidence = verification.get("evidence") if isinstance(verification, dict) else None
+            verifier_type = verification.get("verifier_type") if isinstance(verification, dict) else None
             if (
                 final_action.get("execution_status") != "success"
                 or not isinstance(verification, dict)
                 or verification.get("status") != "VERIFIED"
                 or verification.get("verified") is not True
+                or verification.get("learning_trusted") is not True
+                or not isinstance(verifier_type, str)
+                or verifier_type not in self.trusted_verifier_names
                 or not isinstance(evidence, list)
                 or not any(isinstance(item, dict) for item in evidence)
             ):

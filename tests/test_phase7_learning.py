@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,13 +19,16 @@ from private_agent.core.learning import (
 )
 from private_agent.core.memory import SQLiteExperienceMemory
 from private_agent.core.orchestrator import Orchestrator
-from private_agent.core.planner import PlanValidationError, Planner
+from private_agent.core.observation import Observation
+from private_agent.core.planner import PlanStep, PlanValidationError, Planner, TaskPlan
+from private_agent.core.replanning import ReplanRequest, Replanner
+from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.reflection import (
     ReflectionEngine,
     ReflectionInsight,
     SQLiteReflectionMemory,
 )
-from private_agent.core.verification import VerificationResult
+from private_agent.core.verification import GenericVerifier, VerificationResult, VerifierRegistry
 from private_agent.bugbounty.reviews import FindingReview, FindingReviewRepository
 from private_agent.storage import Store
 from private_agent.tools.contracts import ToolResult
@@ -32,6 +37,8 @@ from private_agent.worker import BackgroundWorker
 
 
 OWNER_PASSWORD = "phase7-learning-owner-password-123"
+EXPECTED_SYNTHETIC_RESULT = "verified alternative evidence"
+TRUSTED_SYNTHETIC_VERIFIER_NAMES = frozenset({"independent_synthetic_fixture"})
 
 
 class LearningMemoryDouble(LearningMemory):
@@ -135,6 +142,153 @@ class ControlledTool:
         if self.outcomes:
             return self.outcomes.pop(0)
         return ToolResult.failed("tool_failed", "no configured outcome", no_side_effects=True)
+
+
+class IndependentSyntheticVerifier:
+    """Test-only oracle that checks the tool output against a separate local fixture."""
+
+    name = "independent_synthetic_fixture"
+
+    def verify(self, observation: Observation, criteria: dict[str, Any]) -> VerificationResult:
+        if observation.execution_status != "success":
+            return VerificationResult(
+                "FAILED",
+                "Synthetic execution did not succeed",
+                verifier_type="untrusted-self-claim",
+                details={"independent_fixture_check": True},
+            )
+        output = observation.observed_output
+        if not isinstance(output, dict) or output.get("result") != EXPECTED_SYNTHETIC_RESULT:
+            return VerificationResult(
+                "FAILED",
+                "Output did not match the independent local fixture",
+                verifier_type="untrusted-self-claim",
+                details={"independent_fixture_check": True},
+            )
+        digest = hashlib.sha256(EXPECTED_SYNTHETIC_RESULT.encode("utf-8")).hexdigest()
+        return VerificationResult(
+            "VERIFIED",
+            "Independent verifier matched the expected synthetic fixture value",
+            evidence=[{"type": "synthetic_fixture_digest", "sha256": digest}],
+            verifier_type="untrusted-self-claim",
+            details={"independent_fixture_check": True, "expected_sha256": digest},
+        )
+
+
+class SelfClaimingVerifier:
+    name = "self_claiming_verifier"
+
+    def verify(self, observation: Observation, criteria: dict[str, Any]) -> VerificationResult:
+        return VerificationResult(
+            "VERIFIED",
+            "Verifier-controlled claims must not establish trust",
+            evidence=[{"type": "claimed_evidence"}],
+            verifier_type="independent_synthetic_fixture",
+            learning_trusted=True,
+        )
+
+
+class ReplacementSyntheticVerifier:
+    name = "independent_synthetic_fixture"
+
+    def verify(self, observation: Observation, criteria: dict[str, Any]) -> VerificationResult:
+        return VerificationResult(
+            "VERIFIED",
+            "Replacement verifier controlled the response",
+            evidence=[{"type": "replacement_claim"}],
+            details={"replacement_used": True},
+        )
+
+
+def trusted_synthetic_verifiers() -> VerifierRegistry:
+    return VerifierRegistry(
+        [IndependentSyntheticVerifier()],
+        trusted_for_learning=set(TRUSTED_SYNTHETIC_VERIFIER_NAMES),
+    )
+
+
+def trusted_learning_memory(store: Store) -> SQLiteLearningMemory:
+    return SQLiteLearningMemory(store, trusted_verifier_names=set(TRUSTED_SYNTHETIC_VERIFIER_NAMES))
+
+
+def test_learning_trust_comes_from_server_allowlist_not_verifier_result_claims() -> None:
+    observation = Observation(
+        task_id="task-synthetic",
+        step_id="step-synthetic",
+        tool_name="tool_b",
+        execution_status="success",
+        observed_output={"result": EXPECTED_SYNTHETIC_RESULT},
+    )
+    generic = VerifierRegistry(
+        [GenericVerifier()],
+        trusted_for_learning={"generic"},
+    )
+    generic_result = generic.verify("generic", observation, {"required_fields": ["result"]})
+    assert generic_result.status == "VERIFIED"
+    assert generic_result.verifier_type == "generic"
+    assert generic_result.learning_trusted is False
+    assert generic.trusted_for_learning_names == frozenset()
+
+    self_claiming = VerifierRegistry([SelfClaimingVerifier()])
+    claimed_result = self_claiming.verify("self_claiming_verifier", observation)
+    assert claimed_result.status == "VERIFIED"
+    assert claimed_result.verifier_type == "self_claiming_verifier"
+    assert claimed_result.learning_trusted is False
+
+    allowlisted = trusted_synthetic_verifiers()
+    synthetic_result = allowlisted.verify("independent_synthetic_fixture", observation)
+    assert synthetic_result.status == "VERIFIED"
+    assert synthetic_result.verifier_type == "independent_synthetic_fixture"
+    assert synthetic_result.learning_trusted is True
+    with pytest.raises(ValueError, match="verifier_name_already_registered"):
+        allowlisted.register(ReplacementSyntheticVerifier())
+    assert allowlisted.is_trusted_for_learning("independent_synthetic_fixture") is True
+
+    replaced_registry = trusted_synthetic_verifiers()
+    replaced_registry._verifiers["independent_synthetic_fixture"] = ReplacementSyntheticVerifier()
+    replaced_result = replaced_registry.verify("independent_synthetic_fixture", observation)
+    assert replaced_result.details["replacement_used"] is True
+    assert replaced_result.learning_trusted is False
+    assert "independent_synthetic_fixture" not in replaced_registry.trusted_for_learning_names
+
+
+class CapturingPlanner(Planner):
+    def __init__(self, verifier_name: str = "") -> None:
+        super().__init__()
+        self.experience_contexts: list[list[dict[str, Any]]] = []
+        self.verifier_name = verifier_name
+
+    def create(
+        self,
+        goal: str,
+        tools: ToolRegistry,
+        prior_knowledge: list[dict[str, Any]],
+        *,
+        constraints: dict[str, Any] | None = None,
+        permissions: dict[str, str] | None = None,
+        retrieved_experiences: list[dict[str, Any]] | None = None,
+        reflection_insights: list[dict[str, Any]] | None = None,
+        learned_strategies: list[dict[str, Any]] | None = None,
+        clarification_answers: list[dict[str, Any]] | None = None,
+        task_id: str = "",
+    ) -> TaskPlan:
+        self.experience_contexts.append(list(retrieved_experiences or []))
+        plan = super().create(
+            goal,
+            tools,
+            prior_knowledge,
+            constraints=constraints,
+            permissions=permissions,
+            retrieved_experiences=retrieved_experiences,
+            reflection_insights=reflection_insights,
+            learned_strategies=learned_strategies,
+            clarification_answers=clarification_answers,
+            task_id=task_id,
+        )
+        if self.verifier_name:
+            for step in plan.steps:
+                step.verifier = self.verifier_name
+        return plan
 
 
 def registry(*tools: ControlledTool) -> ToolRegistry:
@@ -318,7 +472,7 @@ def test_planner_passes_canonical_persisted_strategy_to_provider_as_advisory_con
     store, tools, _, _, training_ids, learned = _train_verified_recovery_experiences(path)
     try:
         strategy = learned.to_dict()
-        Planner(provider, learning_memory=SQLiteLearningMemory(store)).create(
+        Planner(provider, learning_memory=trusted_learning_memory(store)).create(
             "research topic Y", tools, [], learned_strategies=[strategy], task_id=training_ids[0]
         )
         assert provider.context["learned_strategies"] == [strategy]
@@ -514,7 +668,12 @@ def test_reflection_conflict_detection_covers_successful_original_and_failed_alt
     assert recovery.confidence < 0.70
 
 
-def _train_verified_recovery_experiences(path: Path, *, count: int = 2):
+def _train_verified_recovery_experiences(
+    path: Path,
+    *,
+    count: int = 2,
+    verifiers: VerifierRegistry | None = None,
+):
     assert count >= 1
     tool_a = ControlledTool(
         "tool_a",
@@ -532,7 +691,16 @@ def _train_verified_recovery_experiences(path: Path, *, count: int = 2):
     )
     tools = registry(tool_a, tool_b)
     store = Store(path)
-    agent = Orchestrator(store, tools, planner=Planner(), max_attempts=2)
+    verifier_registry = verifiers or trusted_synthetic_verifiers()
+    trusted_names = verifier_registry.trusted_for_learning_names
+    selected_verifier = next(iter(sorted(trusted_names)), "")
+    agent = Orchestrator(
+        store,
+        tools,
+        planner=CapturingPlanner(verifier_name=selected_verifier),
+        verifiers=verifier_registry,
+        max_attempts=2,
+    )
     auth = AuthManager(store)
     auth.initialize_owner(auth.owner_email, OWNER_PASSWORD)
     task_ids = []
@@ -563,7 +731,7 @@ def _train_verified_recovery_experiences(path: Path, *, count: int = 2):
             assert outcome["step_results"][-1]["tool_name"] == "tool_b"
             assert outcome["verification"]["verified"] is True
             task_ids.append(task_id)
-    learning = SQLiteLearningMemory(store)
+    learning = trusted_learning_memory(store)
     retrieved = learning.retrieve_relevant(
         {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": task_ids[0]}
     )
@@ -617,7 +785,11 @@ def test_single_verified_experience_below_default_support_threshold_does_not_ste
 
 def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(tmp_path: Path) -> None:
     path = tmp_path / "agent.sqlite3"
-    store, tools, tool_a, tool_b, training_ids, learned = _train_verified_recovery_experiences(path)
+    verifiers = trusted_synthetic_verifiers()
+    store, tools, tool_a, tool_b, training_ids, learned = _train_verified_recovery_experiences(
+        path,
+        verifiers=verifiers,
+    )
     assert _first_planned_tool(store, training_ids[0]) == "tool_a"
     assert _first_planned_tool(store, training_ids[1]) == "tool_a"
     goal = "research topic alpha follow-up"
@@ -632,10 +804,13 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
 
     reopened = Store(path)
     try:
-        memory = SQLiteLearningMemory(reopened)
+        memory = trusted_learning_memory(reopened)
         restored = memory.get(strategy_id)
         assert restored is not None
         assert restored.to_dict() == learned.to_dict()
+        with pytest.raises(ValueError, match="verifier_name_already_registered"):
+            verifiers.register(ReplacementSyntheticVerifier())
+        assert verifiers.is_trusted_for_learning("independent_synthetic_fixture") is True
         assert ReflectionEngine(SQLiteExperienceMemory(reopened)).min_supporting_experiences == 2
         retrieved = memory.retrieve_relevant(
             {"goal": goal, "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": training_ids[0]}
@@ -649,8 +824,16 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
             assert payload["identity"]["verification_status"] == "VERIFIED"
             assert payload["actions"][-1]["verification"]["status"] == "VERIFIED"
             assert payload["actions"][-1]["verification"]["verified"] is True
+            assert payload["actions"][-1]["verification"]["verifier_type"] == "independent_synthetic_fixture"
+            assert payload["actions"][-1]["verification"]["details"]["independent_fixture_check"] is True
 
-        future_agent = Orchestrator(reopened, tools, planner=Planner(), max_attempts=2)
+        future_agent = Orchestrator(
+            reopened,
+            tools,
+            planner=CapturingPlanner(verifier_name="independent_synthetic_fixture"),
+            verifiers=verifiers,
+            max_attempts=2,
+        )
         future_service = AgentAPIService(future_agent, token=None)
         with TestClient(create_app(service=future_service), raise_server_exceptions=False) as client:
             login = client.post(
@@ -669,8 +852,11 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
             outcome = BackgroundWorker(future_agent, worker_id="phase7-learning-future-worker").run_once()
             assert outcome["status"] == "COMPLETED", outcome
             future_state = reopened.get_task_state(future_task_id)
-            assert future_state is not None
-            future = future_state["result"]
+        assert future_state is not None
+        future = future_state["result"]
+        planning_experiences = future_state["context"]["retrieved_experiences"]
+        assert {item["experience_id"] for item in planning_experiences} == set(training_ids)
+        assert all(item["identity"]["verification_status"] == "VERIFIED" for item in planning_experiences)
         assert future["learned_strategies_used"]
         assert future["learned_strategies_used"][0]["strategy_id"] == strategy_id
         assert len(future["step_results"]) == 1
@@ -686,10 +872,169 @@ def test_before_after_behavioral_proof_reopens_storage_and_verifies_future_task(
         assert authorization["decision"] == "ALLOW"
         assert future["verification"]["status"] == "VERIFIED"
         assert future["verification"]["verified"] is True
+        independent_verification = future["final_step_outcomes"][-1]["verification"]
+        assert independent_verification["verifier_type"] == "independent_synthetic_fixture"
+        assert independent_verification["details"]["independent_fixture_check"] is True
+        assert independent_verification["evidence"][0]["type"] == "synthetic_fixture_digest"
         assert future["final_status"] == "COMPLETED"
         assert _first_planned_tool(reopened, future_task_id) == "tool_b"
         assert tool_a.calls == 4, "the future similar task must not execute the previously failing tool again"
         assert tool_b.calls == 3
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("invalid_support", ["unverified", "mismatched", "stale", "conflicted", "missing-tool"])
+def test_orchestrator_does_not_forward_unrevalidated_experiences(
+    tmp_path: Path,
+    invalid_support: str,
+) -> None:
+    path = tmp_path / f"untrusted-{invalid_support}.sqlite3"
+    verifiers = trusted_synthetic_verifiers()
+    store, tools, tool_a, tool_b, training_ids, strategy = _train_verified_recovery_experiences(
+        path,
+        verifiers=verifiers,
+    )
+    support_id = strategy.supporting_experience_ids[0]
+    if invalid_support == "conflicted":
+        row = store.get_learned_strategy(strategy.strategy_id)
+        payload = json.loads(row["strategy_json"])
+        payload["metadata"]["conflicting_experience_ids"] = ["conflicting-support"]
+        with store.db:
+            store.db.execute(
+                "UPDATE learned_strategies SET strategy_json = ? WHERE strategy_id = ?",
+                (json.dumps(payload, ensure_ascii=False), strategy.strategy_id),
+            )
+    elif invalid_support != "missing-tool":
+        row = store.get_experience(support_id)
+        payload = json.loads(row["experience_json"])
+        if invalid_support == "unverified":
+            payload["actions"][-1]["verification"]["status"] = "FAILED"
+            payload["actions"][-1]["verification"]["verified"] = False
+        elif invalid_support == "mismatched":
+            payload["identity"]["verification_status"] = "FAILED"
+        else:
+            payload["created_at"] = "2000-01-01T00:00:00+00:00"
+        with store.db:
+            store.db.execute(
+                "UPDATE experiences SET experience_json = ?, created_at = ? WHERE task_id = ?",
+                (json.dumps(payload, ensure_ascii=False), payload["created_at"], support_id),
+            )
+
+    execution_tools = registry(tool_a) if invalid_support == "missing-tool" else tools
+    permissions = {"tool_a": "public_read"}
+    if invalid_support != "missing-tool":
+        permissions["tool_b"] = "public_read"
+    baseline = Planner().create(
+        "research topic alpha follow-up",
+        execution_tools,
+        [],
+        permissions=permissions,
+    )
+    assert baseline.steps[0].tool == "tool_a"
+    tool_a.outcomes = [ToolResult.success({"result": EXPECTED_SYNTHETIC_RESULT})]
+    planner = CapturingPlanner(verifier_name="independent_synthetic_fixture")
+    agent = Orchestrator(store, execution_tools, planner=planner, verifiers=verifiers, max_attempts=2)
+    service = AgentAPIService(agent, token=None)
+    try:
+        with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+            login = client.post(
+                "/api/v1/auth/login",
+                json={"email": AuthManager(store).owner_email, "password": OWNER_PASSWORD},
+            )
+            assert login.status_code == 200, login.text
+            csrf = str(client.cookies.get("vulnora_csrf"))
+            created = client.post(
+                "/api/v1/tasks",
+                json={"goal": "research topic alpha follow-up"},
+                headers={"X-CSRF-Token": csrf, "Idempotency-Key": f"untrusted-memory-{invalid_support}"},
+            )
+            assert created.status_code == 201, created.text
+            task_id = str(created.json()["task_id"])
+            outcome = BackgroundWorker(agent, worker_id=f"untrusted-memory-{invalid_support}").run_once()
+            assert outcome["status"] == "COMPLETED", outcome
+        state = store.get_task_state(task_id)
+        assert state is not None
+        assert planner.experience_contexts[0] == []
+        assert state["context"]["retrieved_experiences"] == []
+        if invalid_support != "missing-tool":
+            assert state["context"]["learned_strategies_used"] == []
+        assert _first_planned_tool(store, task_id) == "tool_a"
+        assert tool_a.calls == 5
+        assert tool_b.calls == 2
+        assert set(training_ids) == set(strategy.supporting_experience_ids)
+    finally:
+        store.close()
+
+
+def test_learned_action_execution_unknown_is_not_replayed_after_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "learned-execution-unknown.sqlite3"
+    verifiers = trusted_synthetic_verifiers()
+    store, tools, tool_a, tool_b, _training_ids, _learned = _train_verified_recovery_experiences(
+        path,
+        verifiers=verifiers,
+    )
+    store.close()
+
+    store = Store(path)
+
+    def interrupt_after_execution(checkpoint_type: str, state: dict[str, Any]) -> None:
+        if checkpoint_type == "AFTER_EXECUTION":
+            raise RuntimeError("controlled interruption after synthetic effect")
+
+    agent = Orchestrator(
+        store,
+        tools,
+        planner=CapturingPlanner(verifier_name="independent_synthetic_fixture"),
+        verifiers=verifiers,
+        checkpoint_hook=interrupt_after_execution,
+        max_attempts=2,
+    )
+    service = AgentAPIService(agent, token=None)
+    try:
+        with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+            login = client.post(
+                "/api/v1/auth/login",
+                json={"email": AuthManager(store).owner_email, "password": OWNER_PASSWORD},
+            )
+            assert login.status_code == 200, login.text
+            csrf = str(client.cookies.get("vulnora_csrf"))
+            created = client.post(
+                "/api/v1/tasks",
+                json={"goal": "research topic alpha follow-up"},
+                headers={"X-CSRF-Token": csrf, "Idempotency-Key": "learned-unknown-effect"},
+            )
+            assert created.status_code == 201, created.text
+            task_id = str(created.json()["task_id"])
+            result = BackgroundWorker(agent, worker_id="learned-unknown-worker").run_once()
+            assert result["status"] == "EXECUTION_UNKNOWN", result
+
+        state = store.get_task_state(task_id)
+        assert state is not None and state["status"] == "EXECUTION_UNKNOWN"
+        assert state["plan"]["steps"][0]["tool"] == "tool_b"
+        assert tool_a.calls == 4
+        assert tool_b.calls == 3, "the synthetic effect should occur exactly once before the interruption"
+        assert store.get_experience(task_id) is None
+    finally:
+        store.close()
+
+    reopened = Store(path)
+    try:
+        resumed_agent = Orchestrator(
+            reopened,
+            tools,
+            planner=CapturingPlanner(verifier_name="independent_synthetic_fixture"),
+            verifiers=verifiers,
+            max_attempts=2,
+        )
+        idle_result = BackgroundWorker(resumed_agent, worker_id="learned-reopened-worker").run_once()
+        assert idle_result == {"status": "NO_TASK", "processed": False, "task_id": ""}
+        recovered_state = reopened.get_task_state(task_id)
+        assert recovered_state is not None and recovered_state["status"] == "EXECUTION_UNKNOWN"
+        assert tools.get("tool_b") is tool_b
+        assert tool_a.calls == 4
+        assert tool_b.calls == 3, "reopening and polling must not duplicate the uncertain effect"
+        assert reopened.get_experience(task_id) is None
     finally:
         reopened.close()
 
@@ -699,7 +1044,7 @@ def test_trusted_retrieved_strategy_only_guides_compatible_permitted_fallback(tm
         tmp_path / "trusted-fallback.sqlite3"
     )
     try:
-        memory = SQLiteLearningMemory(store)
+        memory = trusted_learning_memory(store)
         goal = "research topic alpha follow-up"
         task_id = training_ids[0]
         context = {
@@ -765,7 +1110,7 @@ def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invali
     store, tools, _, _, training_ids, strategy = _train_verified_recovery_experiences(
         tmp_path / f"{invalid_support}.sqlite3"
     )
-    memory = SQLiteLearningMemory(store)
+    memory = trusted_learning_memory(store)
     query = {"goal": "research topic alpha future", "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": training_ids[0]}
     assert memory.retrieve_relevant(query)
 
@@ -824,11 +1169,166 @@ def test_invalid_or_conflicted_support_cannot_change_plan(tmp_path: Path, invali
     store.close()
 
 
+def test_generic_verifier_claim_in_sqlite_cannot_reactivate_strategy(tmp_path: Path) -> None:
+    store, _, _, _, training_ids, strategy = _train_verified_recovery_experiences(
+        tmp_path / "generic-provenance.sqlite3"
+    )
+    support_id = strategy.supporting_experience_ids[0]
+    row = store.get_experience(support_id)
+    payload = json.loads(row["experience_json"])
+    verification = payload["actions"][-1]["verification"]
+    verification["verifier_type"] = "generic"
+    verification["learning_trusted"] = True
+    with store.db:
+        store.db.execute(
+            "UPDATE experiences SET experience_json = ? WHERE task_id = ?",
+            (json.dumps(payload, ensure_ascii=False), support_id),
+        )
+
+    memory = SQLiteLearningMemory(
+        store,
+        trusted_verifier_names={"generic", *TRUSTED_SYNTHETIC_VERIFIER_NAMES},
+    )
+    query = {
+        "goal": "research topic alpha future",
+        "task_type": "general",
+        "tools": ["tool_a", "tool_b"],
+        "task_id": training_ids[0],
+    }
+    assert memory.retrieve_relevant(query) == []
+    store.close()
+
+
+@pytest.mark.parametrize("invalidate_support", [False, True])
+def test_recovery_replanning_only_receives_revalidated_memory(
+    tmp_path: Path,
+    invalidate_support: bool,
+) -> None:
+    path = tmp_path / f"recovery-memory-{invalidate_support}.sqlite3"
+    verifiers = trusted_synthetic_verifiers()
+    store, tools, tool_a, tool_b, training_ids, strategy = _train_verified_recovery_experiences(
+        path,
+        verifiers=verifiers,
+    )
+    if invalidate_support:
+        support_id = strategy.supporting_experience_ids[0]
+        row = store.get_experience(support_id)
+        payload = json.loads(row["experience_json"])
+        payload["actions"][-1]["verification"]["learning_trusted"] = False
+        with store.db:
+            store.db.execute(
+                "UPDATE experiences SET experience_json = ? WHERE task_id = ?",
+                (json.dumps(payload, ensure_ascii=False), support_id),
+            )
+
+    class FixedInitialPlanner:
+        max_steps = 4
+
+        def create(self, goal: str, available_tools: ToolRegistry, prior_knowledge: list[dict[str, Any]], **kwargs: Any):
+            plan = Planner().create(
+                goal,
+                available_tools,
+                prior_knowledge,
+                permissions=kwargs.get("permissions"),
+                constraints=kwargs.get("constraints"),
+                task_id=kwargs.get("task_id", ""),
+            )
+            for step in plan.steps:
+                step.verifier = "independent_synthetic_fixture"
+            return plan
+
+    class FixedChangeToolRecovery(RecoveryManager):
+        def choose(
+            self,
+            step: PlanStep,
+            diagnosis: Any,
+            *,
+            available_tools: list[dict[str, Any]],
+            alternative_plan: PlanStep | None = None,
+            allow_replan: bool = False,
+        ) -> RecoveryDecision:
+            return RecoveryDecision(
+                "CHANGE_TOOL",
+                "Use the registered local alternative after the synthetic failure",
+                step.id,
+                step.tool,
+                replacement_tool="tool_b",
+            )
+
+    class CapturingReplanner(Replanner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.provider = object()  # Force Orchestrator through the ReplanRequest path.
+            self.request: ReplanRequest | None = None
+
+        def replan(
+            self,
+            request: ReplanRequest,
+            available_tools: ToolRegistry,
+            *,
+            replacement_tool: str = "",
+        ) -> TaskPlan:
+            self.request = request
+            return self.replan_step(
+                request.current_plan,
+                step_id=request.diagnosis.failed_step,
+                tool_name=replacement_tool,
+                inputs={},
+                tools=available_tools,
+                permissions=request.permissions,
+            )
+
+    tool_a.outcomes.append(ToolResult.failed("network_error", "controlled local failure", no_side_effects=True))
+    tool_b.outcomes.append(ToolResult.success({"result": EXPECTED_SYNTHETIC_RESULT}))
+    replanner = CapturingReplanner()
+    agent = Orchestrator(
+        store,
+        tools,
+        planner=FixedInitialPlanner(),  # type: ignore[arg-type]
+        recovery_manager=FixedChangeToolRecovery(max_recovery_attempts=1),
+        replanner=replanner,
+        verifiers=verifiers,
+        max_attempts=2,
+    )
+    service = AgentAPIService(agent, token=None)
+    try:
+        with TestClient(create_app(service=service), raise_server_exceptions=False) as client:
+            login = client.post(
+                "/api/v1/auth/login",
+                json={"email": AuthManager(store).owner_email, "password": OWNER_PASSWORD},
+            )
+            assert login.status_code == 200, login.text
+            csrf = str(client.cookies.get("vulnora_csrf"))
+            created = client.post(
+                "/api/v1/tasks",
+                json={"goal": "research topic alpha follow-up"},
+                headers={"X-CSRF-Token": csrf, "Idempotency-Key": f"recovery-memory-{invalidate_support}"},
+            )
+            assert created.status_code == 201, created.text
+            task_id = str(created.json()["task_id"])
+            worker_result = BackgroundWorker(agent, worker_id=f"recovery-memory-worker-{invalidate_support}").run_once()
+            assert worker_result["status"] == "COMPLETED", worker_result
+
+        assert replanner.request is not None
+        if invalidate_support:
+            assert replanner.request.retrieved_experiences == []
+            assert replanner.request.learned_strategies == []
+        else:
+            assert {item["experience_id"] for item in replanner.request.retrieved_experiences} >= set(training_ids)
+            assert [item["strategy_id"] for item in replanner.request.learned_strategies] == [strategy.strategy_id]
+        state = store.get_task_state(task_id)
+        assert state is not None and state["status"] == "COMPLETED"
+        assert tool_a.calls == 5
+        assert tool_b.calls == 3
+    finally:
+        store.close()
+
+
 def test_inadequate_similarity_unavailable_or_forbidden_tool_cannot_change_plan(tmp_path: Path) -> None:
     store, tools, tool_a, tool_b, training_ids, strategy = _train_verified_recovery_experiences(
         tmp_path / "eligibility.sqlite3"
     )
-    memory = SQLiteLearningMemory(store)
+    memory = trusted_learning_memory(store)
     similar_query = {
         "goal": "research topic alpha follow-up",
         "task_type": "general",

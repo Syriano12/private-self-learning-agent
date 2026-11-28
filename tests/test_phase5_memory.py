@@ -512,7 +512,7 @@ def test_orchestrator_retrieves_before_planning_and_stores_through_interface(tmp
     registry.register(Tool())
     result = Orchestrator(Store(tmp_path / "agent.sqlite3"), registry, planner=planner, experience_memory=memory).run("goal")
     assert memory.retrieval_queries[0].goal == "goal"
-    assert planner.retrieved[0]["experience_id"] == "previous"
+    assert planner.retrieved == [], "unlinked operational history must not enter planner context"
     assert result["verification"]["verified"] is True
     assert len(memory.stored) == 1
-    assert memory.stored[0].context["retrieved_experiences"][0]["experience_id"] == "previous"
+    assert memory.stored[0].context["retrieved_experiences"] == []
