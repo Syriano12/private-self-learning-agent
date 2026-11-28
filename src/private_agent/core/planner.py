@@ -550,6 +550,7 @@ class Planner:
                             tool=tool,
                             objective=objective,
                             inputs=step_input,
+                            input_bindings=normalized_bindings,
                         )
                     except Exception as exc:
                         reason = str(exc) if isinstance(exc, ValueError) else "specialist_assignment_invalid"
