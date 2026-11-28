@@ -234,6 +234,10 @@ class CapabilityCandidateAssessmentResponse(APIModel):
 
 class TaskMessageRequest(APIModel):
     content: str = Field(min_length=1, max_length=MAX_TASK_MESSAGE_LENGTH)
+    clarification_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
 
     @field_validator("content")
     @classmethod
@@ -512,6 +516,7 @@ class TaskMessageResponse(APIModel):
     message_kind: str
     content: str
     status: str
+    clarification_id: str = ""
     created_at: str
     consumed_at: str = ""
     consumed_checkpoint: str = ""
@@ -563,6 +568,13 @@ class TaskConversationItemResponse(APIModel):
         return self
 
 
+class TaskClarificationResponse(APIModel):
+    task_id: str
+    clarification_id: str
+    question: str
+    missing_information: list[str]
+
+
 class TaskAssistantReplyResponse(APIModel):
     reply_id: str
     conversation_id: str
@@ -583,6 +595,7 @@ class TaskConversationResponse(APIModel):
     queue_status: str
     items: list[TaskConversationItemResponse] = Field(default_factory=list)
     messages: list[TaskMessageResponse]
+    current_clarification: TaskClarificationResponse | None = None
     result_events: list[TaskResultEventResponse] = Field(default_factory=list)
     assistant_replies: list[TaskAssistantReplyResponse] = Field(default_factory=list)
     assistant_reply_supported: bool = False
@@ -605,6 +618,8 @@ class TaskConversationResponse(APIModel):
             event.event_id for event in self.result_events
         ]:
             raise ValueError("task_conversation_items_mismatch")
+        if self.current_clarification is not None and self.current_clarification.task_id != self.task_id:
+            raise ValueError("task_clarification_task_mismatch")
         event_bindings = {(event.event_id, event.sequence) for event in self.result_events}
         if any((reply.source_event_id, reply.source_sequence) not in event_bindings for reply in self.assistant_replies):
             raise ValueError("task_conversation_assistant_reply_mismatch")
@@ -626,6 +641,7 @@ class TaskStatusFilter(str, Enum):
     OBSERVING = "OBSERVING"
     VERIFYING = "VERIFYING"
     WAITING_APPROVAL = "WAITING_APPROVAL"
+    WAITING_CLARIFICATION = "WAITING_CLARIFICATION"
     BLOCKED = "BLOCKED"
     FAILED = "FAILED"
     COMPLETED = "COMPLETED"
@@ -2098,6 +2114,21 @@ class AgentAPIService:
             raise APIError(400, "invalid_conversation_limit", "Invalid conversation page size", task_id=task_id)
         state = self._state(task_id)
         queue = self.store.task_queue_record(task_id) or {}
+        current_clarification = None
+        if state.status == "WAITING_CLARIFICATION":
+            pending_clarifications = [
+                item for item in state.context.get("clarifications", [])
+                if isinstance(item, dict) and item.get("status") == "PENDING"
+            ]
+            if len(pending_clarifications) != 1:
+                raise APIError(409, "task_clarification_untrusted", "Current clarification is unavailable", task_id=task_id)
+            item = pending_clarifications[0]
+            current_clarification = TaskClarificationResponse(
+                task_id=task_id,
+                clarification_id=str(item["request_id"]),
+                question=str(item["question"]),
+                missing_information=list(item["missing_information"]),
+            )
         owner_user_id = (
             principal.user_id
             if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
@@ -2125,6 +2156,7 @@ class AgentAPIService:
                     message_kind=str(source["message_kind"]),
                     content=str(source["content"]),
                     status=str(source["status"]),
+                    clarification_id=str(source.get("clarification_id", "")),
                     created_at=str(source["created_at"]),
                     consumed_at=str(source.get("consumed_at", "")),
                     consumed_checkpoint=str(source.get("consumed_checkpoint", "")),
@@ -2172,6 +2204,7 @@ class AgentAPIService:
             queue_status=str(queue.get("queue_status", "")),
             items=items,
             messages=messages,
+            current_clarification=current_clarification,
             result_events=result_events,
             assistant_replies=[
                 TaskAssistantReplyResponse(
@@ -2200,6 +2233,7 @@ class AgentAPIService:
         task_id: str,
         content: str,
         *,
+        clarification_id: str | None = None,
         idempotency_key: str | None = None,
         request_id: str = "",
         principal: AuthenticatedPrincipal | None = None,
@@ -2213,28 +2247,46 @@ class AgentAPIService:
             if not _IDEMPOTENCY_PATTERN.fullmatch(idempotency_key):
                 raise APIError(400, "invalid_idempotency_key", "Invalid Idempotency-Key", task_id=task_id)
             key = idempotency_key
+        fingerprint_payload = {"task_id": task_id, "content": content.strip()}
+        if clarification_id is not None:
+            fingerprint_payload["clarification_id"] = clarification_id
         fingerprint = hashlib.sha256(
-            json.dumps({"task_id": task_id, "content": content.strip()}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
         try:
-            stored = self.store.append_task_message(
-                task_id,
-                content,
-                owner_user_id=(
-                    principal.user_id
-                    if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
-                    else None
-                ),
-                idempotency_key=key,
-                request_fingerprint=fingerprint if key else None,
+            owner_user_id = (
+                principal.user_id
+                if principal is not None and not principal.is_legacy and principal.role != ROLE_OWNER
+                else None
             )
+            if clarification_id is not None:
+                stored = self.store.answer_task_clarification(
+                    task_id,
+                    clarification_id,
+                    content,
+                    owner_user_id=owner_user_id,
+                    idempotency_key=key,
+                    request_fingerprint=fingerprint if key else None,
+                )
+            else:
+                stored = self.store.append_task_message(
+                    task_id,
+                    content,
+                    owner_user_id=owner_user_id,
+                    idempotency_key=key,
+                    request_fingerprint=fingerprint if key else None,
+                )
         except KeyError as exc:
             raise APIError(404, "task_not_found", "Task was not found", task_id=task_id) from exc
         except ValueError as exc:
             code = str(exc)
             if code in {"message_idempotency_conflict"}:
                 raise APIError(409, code, "Idempotency-Key was already used for another message", task_id=task_id) from exc
-            if code in {"conversation_execution_unknown", "conversation_terminal", "conversation_not_accepting_messages", "conversation_message_limit", "conversation_size_limit"}:
+            if code in {
+                "conversation_execution_unknown", "conversation_terminal", "conversation_not_accepting_messages",
+                "conversation_message_limit", "conversation_size_limit", "clarification_id_required",
+                "clarification_not_current", "clarification_queue_state_mismatch",
+            }:
                 raise APIError(409, code, "Task cannot accept a follow-up message in its current state", task_id=task_id) from exc
             status_code = 413 if code == "task_message_too_long" else 422
             raise APIError(status_code, code, "Task message could not be stored", task_id=task_id) from exc
@@ -2247,6 +2299,7 @@ class AgentAPIService:
             message_kind=str(stored["message_kind"]),
             content=str(stored["content"]),
             status=str(stored["status"]),
+            clarification_id=str(stored.get("clarification_id", "")),
             created_at=str(stored["created_at"]),
             consumed_at=str(stored.get("consumed_at", "")),
             consumed_checkpoint=str(stored.get("consumed_checkpoint", "")),
@@ -3745,6 +3798,7 @@ def create_app(
         return service.append_task_message(
             task_id,
             payload.content,
+            clarification_id=payload.clarification_id,
             idempotency_key=idempotency_key,
             request_id=_request_id(request),
             principal=principal,

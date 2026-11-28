@@ -20,6 +20,10 @@ from private_agent.core.experience import sanitize_value
 STATE_VERSION = 2
 MAX_TASK_GOAL_LENGTH = 4000
 _STOP_REASON_REFERENCE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_CLARIFICATION_ID = re.compile(r"^[0-9a-f-]{36}$")
+MAX_CLARIFICATION_REQUESTS = 16
+MAX_CLARIFICATION_ITEMS = 16
+MAX_CLARIFICATION_ITEM_LENGTH = 200
 _LEGACY_STATE_FIELDS = frozenset(
     {
         "task_id", "goal", "status", "current_phase", "current_step", "plan_version",
@@ -39,6 +43,7 @@ TASK_STATUSES = {
     "OBSERVING",
     "VERIFYING",
     "WAITING_APPROVAL",
+    "WAITING_CLARIFICATION",
     "BLOCKED",
     "FAILED",
     "COMPLETED",
@@ -46,15 +51,16 @@ TASK_STATUSES = {
 TERMINAL_STATUSES = {"BLOCKED", "FAILED", "COMPLETED"}
 
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    "CREATED": {"CREATED", "PLANNING", "READY", "WAITING_APPROVAL", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
-    "QUEUED": {"QUEUED", "PLANNING", "READY", "WAITING_APPROVAL", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
-    "PLANNING": {"PLANNING", "READY", "WAITING_APPROVAL", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
+    "CREATED": {"CREATED", "PLANNING", "READY", "WAITING_APPROVAL", "WAITING_CLARIFICATION", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
+    "QUEUED": {"QUEUED", "PLANNING", "READY", "WAITING_APPROVAL", "WAITING_CLARIFICATION", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
+    "PLANNING": {"PLANNING", "READY", "WAITING_APPROVAL", "WAITING_CLARIFICATION", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
     "READY": {"READY", "EXECUTING", "WAITING_APPROVAL", "COMPLETED", "BLOCKED", "FAILED", "EXECUTION_UNKNOWN"},
     "EXECUTING": {"EXECUTING", "OBSERVING", "EXECUTION_UNKNOWN", "BLOCKED", "FAILED"},
     "EXECUTION_UNKNOWN": {"EXECUTION_UNKNOWN", "OBSERVING", "VERIFYING", "READY", "BLOCKED", "FAILED"},
     "OBSERVING": {"OBSERVING", "VERIFYING", "EXECUTION_UNKNOWN", "READY", "BLOCKED", "FAILED"},
     "VERIFYING": {"VERIFYING", "READY", "COMPLETED", "BLOCKED", "FAILED"},
     "WAITING_APPROVAL": {"WAITING_APPROVAL", "READY", "BLOCKED", "FAILED"},
+    "WAITING_CLARIFICATION": {"WAITING_CLARIFICATION", "QUEUED", "READY", "BLOCKED", "FAILED"},
     "BLOCKED": {"BLOCKED"},
     "FAILED": {"FAILED"},
     "COMPLETED": {"COMPLETED"},
@@ -73,6 +79,7 @@ class TaskStopReasonCode(str, Enum):
     """Closed, non-free-text causes set only at explicit stop transitions."""
 
     APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+    CLARIFICATION_REQUIRED = "CLARIFICATION_REQUIRED"
     POLICY_BLOCKED = "POLICY_BLOCKED"
     EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"
     TASK_FAILED = "TASK_FAILED"
@@ -376,7 +383,7 @@ class TaskState:
             raise InvalidStateTransition(f"unknown_task_status:{status}")
         if status not in _ALLOWED_TRANSITIONS.get(self.status, set()):
             raise InvalidStateTransition(f"invalid_transition:{self.status}->{status}")
-        if self.status in {"WAITING_APPROVAL", "EXECUTION_UNKNOWN"} and status != self.status:
+        if self.status in {"WAITING_APPROVAL", "WAITING_CLARIFICATION", "EXECUTION_UNKNOWN"} and status != self.status:
             self.stop_reason = None
         self.status = status
         if phase is not None:
@@ -489,6 +496,7 @@ class TaskState:
                 raise StateIntegrityError("task_stop_reason_invalid")
             allowed_statuses = {
                 TaskStopReasonCode.APPROVAL_REQUIRED: {"WAITING_APPROVAL"},
+                TaskStopReasonCode.CLARIFICATION_REQUIRED: {"WAITING_CLARIFICATION"},
                 TaskStopReasonCode.POLICY_BLOCKED: {"BLOCKED"},
                 TaskStopReasonCode.EXECUTION_UNKNOWN: {"EXECUTION_UNKNOWN", "BLOCKED"},
                 TaskStopReasonCode.TASK_FAILED: {"FAILED"},
@@ -496,6 +504,48 @@ class TaskState:
             }
             if self.status not in allowed_statuses[self.stop_reason.code]:
                 raise StateIntegrityError("task_stop_reason_status_mismatch")
+        clarifications = self.context.get("clarifications", [])
+        if not isinstance(clarifications, list) or len(clarifications) > MAX_CLARIFICATION_REQUESTS:
+            raise StateIntegrityError("task_clarifications_invalid")
+        request_ids: set[str] = set()
+        pending_clarifications = 0
+        for item in clarifications:
+            required_fields = {
+                "request_id", "question", "missing_information", "status",
+                "answer_message_id", "created_at", "answered_at",
+            }
+            if not isinstance(item, dict) or set(item) != required_fields:
+                raise StateIntegrityError("task_clarification_fields_invalid")
+            request_id = item.get("request_id")
+            question = item.get("question")
+            missing = item.get("missing_information")
+            status = item.get("status")
+            answer_id = item.get("answer_message_id")
+            if (
+                not isinstance(request_id, str) or _CLARIFICATION_ID.fullmatch(request_id) is None
+                or request_id in request_ids
+                or not isinstance(question, str) or not question.strip() or len(question) > 1000
+                or not isinstance(missing, list) or not 1 <= len(missing) <= MAX_CLARIFICATION_ITEMS
+                or any(not isinstance(value, str) or not value.strip() or len(value) > MAX_CLARIFICATION_ITEM_LENGTH for value in missing)
+                or status not in {"PENDING", "ANSWERED"}
+                or not isinstance(item.get("created_at"), str) or not item["created_at"]
+                or not isinstance(item.get("answered_at"), str)
+            ):
+                raise StateIntegrityError("task_clarification_invalid")
+            request_ids.add(request_id)
+            if status == "PENDING":
+                pending_clarifications += 1
+                if answer_id != "" or item["answered_at"] != "":
+                    raise StateIntegrityError("task_clarification_pending_answer_invalid")
+            elif (
+                not isinstance(answer_id, str) or _STOP_REASON_REFERENCE.fullmatch(answer_id) is None
+                or not item["answered_at"]
+            ):
+                raise StateIntegrityError("task_clarification_answer_invalid")
+        if pending_clarifications > 1 or (pending_clarifications and self.status != "WAITING_CLARIFICATION"):
+            raise StateIntegrityError("task_clarification_status_mismatch")
+        if (self.status == "WAITING_CLARIFICATION") != (pending_clarifications == 1):
+            raise StateIntegrityError("task_clarification_request_missing")
         if not self.task_id or not self.goal:
             raise StateIntegrityError("task_identity_required")
         if not isinstance(self.plan, dict):

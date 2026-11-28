@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,8 @@ import pytest
 from private_agent import storage as storage_module
 from private_agent.api import APIError
 from private_agent.auth import AuthManager, AuthPrincipal, ROLE_OPERATOR
-from private_agent.core.planner import PlanStep, TaskPlan
+from private_agent.core.llm import LLMProvider, LLMResponse
+from private_agent.core.planner import PlanStep, Planner, TaskPlan
 from private_agent.core.task_state import TaskState, action_fingerprint
 from private_agent.storage import QueueLeaseLost, Store
 from private_agent.worker import BackgroundWorker
@@ -100,7 +102,7 @@ def test_schema_12_migrates_to_conversation_schema_14(tmp_path: Path, monkeypatc
     migrated.close()
 
 
-def test_schema_13_conversation_layout_migrates_to_18_without_losing_messages(tmp_path: Path) -> None:
+def test_schema_13_conversation_layout_migrates_to_21_without_losing_messages(tmp_path: Path) -> None:
     path = tmp_path / "schema-13-conversation.sqlite3"
     store = Store(path)
     created = store.create_queued_task(
@@ -124,7 +126,7 @@ def test_schema_13_conversation_layout_migrates_to_18_without_losing_messages(tm
     ).fetchone()
     assert migrated.db.execute(
         "SELECT schema_version FROM task_state_schema ORDER BY schema_version DESC LIMIT 1"
-    ).fetchone()["schema_version"] == 18
+    ).fetchone()["schema_version"] == 21
     migrated.close()
 
 
@@ -679,3 +681,300 @@ def test_pending_message_idempotency_replay_rejects_terminal_task(tmp_path: Path
     assert messages[0]["message_id"] == message.message_id
     assert messages[0]["status"] == "PENDING"
     store.close()
+
+
+class ClarificationFixtureProvider(LLMProvider):
+    """Local deterministic proposal source; tests wiring and server guards, not reasoning quality."""
+
+    def __init__(self) -> None:
+        self.contexts: list[dict] = []
+
+    def generate_json(self, *, system_prompt: str, user_prompt: str, response_schema: dict) -> LLMResponse:
+        del system_prompt, response_schema
+        context = json.loads(user_prompt)
+        self.contexts.append(context)
+        goal = str(context["goal"])
+        base_goal_spec = {
+            "normalized_goal": goal,
+            "intent": "prepare a bounded fictional camping checklist",
+            "deliverables": ["verified checklist result"],
+            "constraints": ["fictional setting", "registered synthetic tools only"],
+            "success_criteria": ["server verifies the tool result"],
+            "missing_information": [],
+            "clarification_required": False,
+            "clarification_question": "",
+            "priority": 3,
+            "risk_level": "LOW",
+        }
+        if len(self.contexts) == 1:
+            goal_spec = {
+                **base_goal_spec,
+                "missing_information": ["the fictional campsite and expected weather"],
+                "clarification_required": True,
+                "clarification_question": "Which fictional campsite and weather should the checklist use?",
+            }
+            proposal = {
+                "goal_spec": goal_spec,
+                "plan": {
+                    "goal": goal,
+                    "rationale": "A location-specific checklist cannot be planned safely without the missing setting.",
+                    "steps": [],
+                },
+            }
+        else:
+            answers = context.get("clarification_answers", [])
+            if not answers:
+                raise AssertionError("clarification answer was not passed into replanning context")
+            answer = str(answers[0]["answer"])
+            proposal = {
+                "goal_spec": base_goal_spec,
+                "plan": {
+                    "goal": goal,
+                    "rationale": "Use the user's fictional campsite and weather answer in one safe synthetic action.",
+                    "steps": [{
+                        "id": "build-fictional-checklist",
+                        "objective": "build a fictional packing checklist for the clarified setting",
+                        "tool": "synthetic_checklist",
+                        "input": {"value": answer},
+                        "reason": "The locally registered tool is safe and its required input comes from the bound answer.",
+                        "depends_on": [],
+                        "success_criteria": {"required_fields": ["result"]},
+                    }],
+                },
+            }
+        return LLMResponse(proposal, json.dumps(proposal, sort_keys=True), "local-deterministic-fixture")
+
+
+class SyntheticChecklistTool(APITestTool):
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        }
+
+
+def test_clarification_round_trip_survives_restart_then_replans_executes_and_verifies(tmp_path: Path) -> None:
+    tool = SyntheticChecklistTool("synthetic_checklist")
+    service, store, _ = make_service(tmp_path, tool)
+    provider = ClarificationFixtureProvider()
+    service.orchestrator.planner = Planner(provider)
+    client = client_for(service)
+    created = client.post(
+        "/api/v1/tasks",
+        json={"goal": "Prepare a packing checklist for a fictional weekend camping trip"},
+        headers=auth_headers(key="clarification-create"),
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["task_id"]
+
+    waiting = BackgroundWorker(service.orchestrator, worker_id="clarification-first-worker").run_once()
+    assert waiting["status"] == "WAITING_CLARIFICATION", waiting
+    assert tool.calls == 0
+    waiting_state = TaskState.from_dict(store.get_task_state(task_id))
+    assert waiting_state.status == "WAITING_CLARIFICATION"
+    assert waiting_state.stop_reason is not None
+    assert waiting_state.stop_reason.code.value == "CLARIFICATION_REQUIRED"
+    assert not waiting_state.plan
+    assert store.task_queue_record(task_id)["queue_status"] == "WAITING_CLARIFICATION"
+    assert store.task_messages(task_id)[0]["message_kind"] == "INITIAL"
+
+    first_conversation = client.get(f"/api/v1/tasks/{task_id}/messages", headers=auth_headers())
+    assert first_conversation.status_code == 200, first_conversation.text
+    question = first_conversation.json()["current_clarification"]
+    assert question["task_id"] == task_id
+    assert question["clarification_id"]
+    assert question["missing_information"] == ["the fictional campsite and expected weather"]
+    assert question["question"].startswith("Which fictional campsite")
+
+    # Reopen the same SQLite database before answering: the question/task binding must survive restart.
+    store.close()
+    restarted_service, restarted_store, _ = make_service(tmp_path, tool)
+    restarted_service.orchestrator.planner = Planner(provider)
+    restarted_client = client_for(restarted_service)
+    resumed_question = restarted_client.get(
+        f"/api/v1/tasks/{task_id}/messages", headers=auth_headers()
+    ).json()["current_clarification"]
+    assert resumed_question == question
+
+    unbound_answer = restarted_client.post(
+        f"/api/v1/tasks/{task_id}/messages",
+        json={"content": "Juniper Ridge, cool and rainy"},
+        headers=auth_headers(key="clarification-missing-id"),
+    )
+    assert unbound_answer.status_code == 409
+    assert unbound_answer.json()["error_code"] == "clarification_id_required"
+    stale_answer = restarted_client.post(
+        f"/api/v1/tasks/{task_id}/messages",
+        json={"content": "Juniper Ridge, cool and rainy", "clarification_id": "00000000-0000-0000-0000-000000000000"},
+        headers=auth_headers(key="clarification-stale-id"),
+    )
+    assert stale_answer.status_code == 409
+    assert stale_answer.json()["error_code"] == "clarification_not_current"
+
+    answer_payload = {
+        "content": "Juniper Ridge, cool and rainy",
+        "clarification_id": question["clarification_id"],
+    }
+    answer = restarted_client.post(
+        f"/api/v1/tasks/{task_id}/messages",
+        json=answer_payload,
+        headers=auth_headers(key="clarification-answer"),
+    )
+    replay = restarted_client.post(
+        f"/api/v1/tasks/{task_id}/messages",
+        json=answer_payload,
+        headers=auth_headers(key="clarification-answer"),
+    )
+    assert answer.status_code == 202, answer.text
+    assert answer.json()["message_kind"] == "CLARIFICATION_ANSWER"
+    assert answer.json()["clarification_id"] == question["clarification_id"]
+    assert replay.status_code == 202 and replay.json()["idempotent_replay"] is True
+    assert replay.json()["message_id"] == answer.json()["message_id"]
+    assert restarted_store.task_queue_record(task_id)["queue_status"] == "QUEUED"
+
+    completed = BackgroundWorker(
+        restarted_service.orchestrator,
+        worker_id="clarification-resumed-worker",
+    ).run_once()
+    assert completed["status"] == "COMPLETED", completed
+    assert provider.contexts[1]["clarification_answers"] == [{
+        "clarification_id": question["clarification_id"],
+        "question": question["question"],
+        "missing_information": question["missing_information"],
+        "answer": "Juniper Ridge, cool and rainy",
+    }]
+    assert tool.calls == 1
+    final_state = TaskState.from_dict(restarted_store.get_task_state(task_id))
+    assert final_state.plan_version == 1
+    assert final_state.plan["steps"][0]["input"]["value"] == "Juniper Ridge, cool and rainy"
+    assert final_state.status == "COMPLETED"
+    assert final_state.result["verification"]["verified"] is True
+    answer_message = next(
+        item for item in restarted_store.task_messages(task_id) if item["message_id"] == answer.json()["message_id"]
+    )
+    assert answer_message["status"] == "CONSUMED"
+    assert answer_message["consumed_checkpoint"] == "PLAN_CREATED"
+    finished_conversation = restarted_client.get(
+        f"/api/v1/tasks/{task_id}/messages", headers=auth_headers()
+    ).json()
+    assert finished_conversation["current_clarification"] is None
+    assert any(item["message_kind"] == "CLARIFICATION_ANSWER" for item in finished_conversation["messages"])
+    restarted_store.close()
+
+
+def test_owner_backed_clarification_persists_wait_state_and_result_event(tmp_path: Path) -> None:
+    tool = SyntheticChecklistTool("synthetic_checklist")
+    service, store, _ = make_service(tmp_path, tool, token=None)
+    owner = AuthManager(store).create_user(
+        "clarification-owner@example.test", "strong-password-for-tests", ROLE_OPERATOR
+    )
+    provider = ClarificationFixtureProvider()
+    service.orchestrator.planner = Planner(provider)
+    goal = "Prepare a packing checklist for a fictional weekend camping trip"
+    created = store.create_queued_task(
+        goal, initial_message=goal, owner_user_id=owner.user_id
+    )
+    task_id = str(created["task_id"])
+
+    waiting = BackgroundWorker(service.orchestrator, worker_id="owner-clarification-worker").run_once()
+
+    assert waiting["status"] == "WAITING_CLARIFICATION", waiting
+    assert tool.calls == 0
+    state = TaskState.from_dict(store.get_task_state(task_id))
+    assert state.status == "WAITING_CLARIFICATION"
+    assert store.task_queue_record(task_id)["queue_status"] == "WAITING_CLARIFICATION"
+    events = store.task_result_events(task_id, owner_user_id=owner.user_id)
+    assert events[-1]["task_status"] == "WAITING_CLARIFICATION"
+    assert events[-1]["verification_status"] == "IN_PROGRESS"
+
+    client = client_for(service)
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "clarification-owner@example.test", "password": "strong-password-for-tests"},
+    )
+    assert login.status_code == 200, login.text
+    conversation = client.get(f"/api/v1/tasks/{task_id}/messages").json()
+    assert conversation["task_status"] == "WAITING_CLARIFICATION"
+    assert conversation["queue_status"] == "WAITING_CLARIFICATION"
+    assert conversation["current_clarification"]["task_id"] == task_id
+    assert conversation["current_clarification"]["question"]
+    assert conversation["current_clarification"]["missing_information"]
+    assert conversation["result_events"][-1]["task_status"] == "WAITING_CLARIFICATION"
+    assert conversation["result_events"][-1]["verification_status"] == "IN_PROGRESS"
+    assert conversation["result_events"][-1]["approval_pending_count"] == 0
+    store.close()
+
+
+def test_missing_information_and_server_permission_both_fail_closed(tmp_path: Path) -> None:
+    tool = SyntheticChecklistTool("synthetic_checklist")
+    service, store, _ = make_service(tmp_path, tool)
+    provider = ClarificationFixtureProvider()
+    service.orchestrator.planner = Planner(provider)
+    client = client_for(service)
+    created = client.post(
+        "/api/v1/tasks",
+        json={"goal": "Prepare a packing checklist for a fictional weekend camping trip"},
+        headers=auth_headers(key="clarification-negative-create"),
+    )
+    task_id = created.json()["task_id"]
+    waiting = BackgroundWorker(service.orchestrator, worker_id="clarification-negative-first").run_once()
+    assert waiting["status"] == "WAITING_CLARIFICATION"
+    assert tool.calls == 0
+
+    question = client.get(f"/api/v1/tasks/{task_id}/messages", headers=auth_headers()).json()["current_clarification"]
+    answer = client.post(
+        f"/api/v1/tasks/{task_id}/messages",
+        json={"content": "Juniper Ridge, cool and rainy", "clarification_id": question["clarification_id"]},
+        headers=auth_headers(key="clarification-negative-answer"),
+    )
+    assert answer.status_code == 202
+    # Simulate no server-granted permission. The provider cannot grant it, and the tool must not run.
+    service.orchestrator.approved_permissions.clear()
+    rejected = BackgroundWorker(service.orchestrator, worker_id="clarification-negative-second").run_once()
+    assert rejected["status"] == "FAILED", rejected
+    assert "permission_not_granted:synthetic_checklist" in rejected["error"]
+    assert tool.calls == 0
+    failed_state = TaskState.from_dict(store.get_task_state(task_id))
+    assert failed_state.status == "FAILED"
+    assert failed_state.action_records == {}
+    assert store.task_queue_record(task_id)["queue_status"] == "FAILED"
+    answer_message = next(item for item in store.task_messages(task_id) if item["message_id"] == answer.json()["message_id"])
+    assert answer_message["status"] == "PENDING"
+    store.close()
+
+
+def test_provider_timeout_before_plan_fails_durably_without_tool_execution(tmp_path: Path) -> None:
+    class TimeoutProvider(LLMProvider):
+        calls = 0
+
+        def generate_json(self, *, system_prompt: str, user_prompt: str, response_schema: dict) -> LLMResponse:
+            del system_prompt, user_prompt, response_schema
+            self.calls += 1
+            raise TimeoutError("synthetic provider timeout")
+
+    tool = SyntheticChecklistTool("synthetic_checklist")
+    service, store, _ = make_service(tmp_path, tool)
+    provider = TimeoutProvider()
+    service.orchestrator.planner = Planner(provider)
+    created = store.create_queued_task("Prepare a fictional checklist", initial_message="Prepare a fictional checklist")
+    failed = BackgroundWorker(service.orchestrator, worker_id="clarification-timeout-worker").run_once()
+    assert failed["status"] == "FAILED", failed
+    assert provider.calls == 1
+    assert tool.calls == 0
+    state = TaskState.from_dict(store.get_task_state(created["task_id"]))
+    assert state.status == "FAILED"
+    assert state.action_records == {}
+    assert state.completed_actions == []
+    assert store.task_queue_record(created["task_id"])["queue_status"] == "FAILED"
+    store.close()
+
+    reopened = Store(tmp_path / "api.sqlite3")
+    persisted = TaskState.from_dict(reopened.get_task_state(created["task_id"]))
+    assert persisted.status == "FAILED"
+    assert persisted.action_records == {}
+    assert persisted.completed_actions == []
+    assert reopened.task_queue_record(created["task_id"])["queue_status"] == "FAILED"
+    assert tool.calls == 0
+    reopened.close()

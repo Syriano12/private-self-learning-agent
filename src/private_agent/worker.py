@@ -865,11 +865,23 @@ class BackgroundWorker:
                 with self.store.lease_context(task_id, str(claim["lease_id"]), self.worker_id):
                     task_payload = self.store.get_task_state(task_id)
                     task_context = None
+                    clarification_answers: list[dict[str, Any]] = []
                     if isinstance(task_payload, dict):
                         persisted_state = TaskState.from_dict(task_payload)
                         if persisted_state.context.get("task_kind") == "bug_bounty":
                             task_context = dict(persisted_state.context)
-                    result = self.orchestrator.run(str(claim["goal"]), task_id=task_id, task_context=task_context)
+                        elif isinstance(persisted_state.context.get("clarifications"), list):
+                            task_context = {
+                                "clarifications": list(persisted_state.context["clarifications"]),
+                            }
+                        clarification_answers = self.store.pending_clarification_answers_for_worker(task_id)
+                    result = self.orchestrator.run(
+                        str(claim["goal"]),
+                        task_id=task_id,
+                        task_context=task_context,
+                        clarification_answers=clarification_answers,
+                        clarification_message_ids=[str(item["message_id"]) for item in clarification_answers],
+                    )
                     heartbeat.raise_if_lost()
                     payload = self.store.get_task_state(task_id)
                     heartbeat.raise_if_lost()
@@ -990,6 +1002,8 @@ class BackgroundWorker:
         if state is not None:
             if state.status == "WAITING_APPROVAL":
                 return "WAITING_APPROVAL"
+            if state.status == "WAITING_CLARIFICATION":
+                return "WAITING_CLARIFICATION"
             if state.status in {"COMPLETED", "FAILED", "BLOCKED", "EXECUTION_UNKNOWN"}:
                 return state.status
         final_status = str(result.get("final_status", "FAILED"))
