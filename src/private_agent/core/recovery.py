@@ -99,6 +99,14 @@ class RecoveryManager:
             return self._abort(step, "Failure is not recoverable", terminal)
 
         preferred = diagnosis.suggested_recovery
+        if preferred == "REPLAN" and allow_replan:
+            return RecoveryDecision(
+                "REPLAN",
+                "Request a validated replacement plan to resolve conflicting verified specialist results",
+                step.id,
+                step.tool,
+                details={"failure_type": diagnosis.failure_type},
+            )
         if preferred == "CHANGE_TOOL":
             replacement = self._find_alternative(step.tool, available_tools, step_attempts)
             if replacement:

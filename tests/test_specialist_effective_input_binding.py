@@ -118,7 +118,7 @@ def _context(*, verified: bool = True) -> ExecutionContext:
         task_id="synthetic-specialist-binding-task",
         previous_results={"source": StepResult.success("source", "inspect_repository_structure", {"path": "workspace/synthetic.txt"})},
         approved_permissions={"public_read"},
-        metadata={"goal": _payload()["goal"]},
+        metadata={"goal": _payload()["goal"], "plan_version": 1},
         verified_result_ids={"source"} if verified else set(),
     )
 
@@ -132,10 +132,16 @@ def _digest(value: Any) -> str:
 def test_unbound_current_or_legacy_assignment_cannot_cover_dependency_input(legacy: bool) -> None:
     tools, _, reader, specialists = _setup()
     payload = _payload()
-    plan = Planner(specialists=specialists).validate(payload, goal=payload["goal"], tools=tools)
+    plan = Planner(specialists=specialists).validate(
+        payload, goal=payload["goal"], tools=tools, task_id=_context().task_id
+    )
     step = plan.steps[1]
     unbound_assignment = specialists.create_assignment(
-        "local_repository_analyst", tool=reader, objective=step.objective, inputs=step.input
+        "local_repository_analyst",
+        tool=reader,
+        objective=step.objective,
+        inputs=step.input,
+        task_id=_context().task_id,
     )
     if legacy:
         unbound_assignment.pop("input_bindings_digest")
@@ -152,7 +158,9 @@ def test_unbound_current_or_legacy_assignment_cannot_cover_dependency_input(lega
 def test_assignment_attests_to_binding_and_exact_resolved_input_before_authorization() -> None:
     tools, _, reader, specialists = _setup()
     payload = _payload()
-    plan = Planner(specialists=specialists).validate(payload, goal=payload["goal"], tools=tools)
+    plan = Planner(specialists=specialists).validate(
+        payload, goal=payload["goal"], tools=tools, task_id=_context().task_id
+    )
     step = plan.steps[1]
     security = CapturingSecurityController()
     executor = GenericExecutor(tools, security_controller=security, specialist_registry=specialists)
@@ -168,7 +176,7 @@ def test_assignment_attests_to_binding_and_exact_resolved_input_before_authoriza
     assert security.last_action is not None and security.last_action.input_fingerprint
 
 
-def test_legacy_assignment_remains_valid_for_an_unbound_step() -> None:
+def test_legacy_assignment_without_current_task_binding_is_rejected() -> None:
     tools, _, reader, specialists = _setup()
     goal = "Read a directly supplied synthetic repository path"
     objective = "Read the direct synthetic repository path"
@@ -180,6 +188,7 @@ def test_legacy_assignment_remains_valid_for_an_unbound_step() -> None:
         ]},
         goal=goal,
         tools=tools,
+        task_id="synthetic-legacy-assignment-task",
     )
     step = plan.steps[0]
     step.specialist_assignment.pop("input_bindings_digest")
@@ -188,11 +197,12 @@ def test_legacy_assignment_remains_valid_for_an_unbound_step() -> None:
     result = executor.execute_step(step, ExecutionContext(
         task_id="synthetic-legacy-assignment-task",
         approved_permissions={"public_read"},
-        metadata={"goal": goal},
+        metadata={"goal": goal, "plan_version": 1},
     ))
 
-    assert result.status == "success"
-    assert reader.calls == [{"path": "workspace/synthetic.txt"}]
+    assert result.status == "blocked"
+    assert result.error is not None and result.error.code == "specialist_assignment_untrusted"
+    assert reader.calls == []
 
 
 def test_unbound_specialist_approval_keeps_preflight_and_execution_fingerprints_equal() -> None:
@@ -207,6 +217,7 @@ def test_unbound_specialist_approval_keeps_preflight_and_execution_fingerprints_
         ]},
         goal=goal,
         tools=tools,
+        task_id="synthetic-unbound-approval-task",
     )
     step = plan.steps[0]
     execution_binding = specialists.execution_binding(
@@ -216,6 +227,7 @@ def test_unbound_specialist_approval_keeps_preflight_and_execution_fingerprints_
         inputs=step.input,
         input_bindings=step.input_bindings,
         resolved_inputs=step.input,
+        task_id="synthetic-unbound-approval-task",
     )
     assert execution_binding == step.specialist_assignment
 
@@ -249,7 +261,9 @@ def test_unbound_specialist_approval_keeps_preflight_and_execution_fingerprints_
 def test_changed_binding_edge_is_rejected_before_tool_side_effect() -> None:
     tools, _, reader, specialists = _setup()
     payload = _payload()
-    plan = Planner(specialists=specialists).validate(payload, goal=payload["goal"], tools=tools)
+    plan = Planner(specialists=specialists).validate(
+        payload, goal=payload["goal"], tools=tools, task_id=_context().task_id
+    )
     step = plan.steps[1]
     step.input_bindings["path"]["output_key"] = "content"
     executor = GenericExecutor(tools, security_controller=SecurityController(), specialist_registry=specialists)
@@ -264,7 +278,9 @@ def test_changed_binding_edge_is_rejected_before_tool_side_effect() -> None:
 def test_binding_from_unverified_dependency_still_fails_closed() -> None:
     tools, _, reader, specialists = _setup()
     payload = _payload()
-    plan = Planner(specialists=specialists).validate(payload, goal=payload["goal"], tools=tools)
+    plan = Planner(specialists=specialists).validate(
+        payload, goal=payload["goal"], tools=tools, task_id=_context().task_id
+    )
     step = plan.steps[1]
     executor = GenericExecutor(tools, security_controller=SecurityController(), specialist_registry=specialists)
 
@@ -278,7 +294,9 @@ def test_binding_from_unverified_dependency_still_fails_closed() -> None:
 def test_approved_bound_specialist_resume_reuses_exact_preflight_fingerprint(tmp_path: Any) -> None:
     tools, _, reader, specialists = _setup()
     payload = _payload()
-    plan = Planner(specialists=specialists).validate(payload, goal=payload["goal"], tools=tools)
+    plan = Planner(specialists=specialists).validate(
+        payload, goal=payload["goal"], tools=tools, task_id=_context().task_id
+    )
     step = plan.steps[1]
     store = Store(tmp_path / "specialist-bound-approval.sqlite3")
     security = CapturingSecurityController(

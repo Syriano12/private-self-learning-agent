@@ -11,8 +11,10 @@ from typing import Any
 _ASSIGNMENT_FIELDS = frozenset(
     {
         "assignment_id",
+        "task_id_digest",
         "specialist_id",
         "profile_version",
+        "context_limit_bytes",
         "tool_name",
         "objective_digest",
         "input_digest",
@@ -23,7 +25,8 @@ _ASSIGNMENT_FIELDS = frozenset(
         "input_bindings_digest",
     }
 )
-_LEGACY_ASSIGNMENT_FIELDS = _ASSIGNMENT_FIELDS - {"input_bindings_digest"}
+_PRE_TASK_ASSIGNMENT_FIELDS = _ASSIGNMENT_FIELDS - {"task_id_digest", "context_limit_bytes"}
+_LEGACY_ASSIGNMENT_FIELDS = _PRE_TASK_ASSIGNMENT_FIELDS - {"input_bindings_digest"}
 _SAFE_CAPABILITIES = frozenset({"READ_WORKSPACE"})
 _SAFE_LOCAL_TOOLS = frozenset(
     {
@@ -125,6 +128,7 @@ class SpecialistProfile:
     version: int
     tool_names: frozenset[str]
     granted_capabilities: frozenset[str]
+    max_context_bytes: int = 16384
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", self.specialist_id):
@@ -135,6 +139,12 @@ class SpecialistProfile:
             raise ValueError("specialist_tool_allowlist_invalid")
         if not self.granted_capabilities.issubset(_SAFE_CAPABILITIES):
             raise ValueError("specialist_capabilities_not_allowed")
+        if (
+            isinstance(self.max_context_bytes, bool)
+            or not isinstance(self.max_context_bytes, int)
+            or not 512 <= self.max_context_bytes <= 65536
+        ):
+            raise ValueError("specialist_context_limit_invalid")
 
     @property
     def capability_digest(self) -> str:
@@ -147,6 +157,7 @@ class SpecialistProfile:
             "tool_names": sorted(self.tool_names),
             "granted_capabilities": sorted(self.granted_capabilities),
             "capability_digest": self.capability_digest,
+            "max_context_bytes": self.max_context_bytes,
             "execution_mode": "same_task_tool_boundary",
         }
 
@@ -197,6 +208,7 @@ class SpecialistRegistry:
         objective: str,
         inputs: dict[str, Any],
         input_bindings: dict[str, dict[str, str]] | None = None,
+        task_id: str = "",
     ) -> dict[str, Any]:
         if not isinstance(specialist_id, str) or not specialist_id:
             raise ValueError("specialist_id_required")
@@ -212,11 +224,15 @@ class SpecialistRegistry:
             raise ValueError("specialist_capability_exceeds_grant")
         if not isinstance(objective, str) or not objective.strip() or not isinstance(inputs, dict):
             raise ValueError("specialist_assignment_context_invalid")
+        if not isinstance(task_id, str):
+            raise ValueError("specialist_task_id_invalid")
         normalized_bindings = _normalize_input_bindings(input_bindings)
         return {
             "assignment_id": uuid.uuid4().hex,
+            "task_id_digest": _digest(task_id),
             "specialist_id": profile.specialist_id,
             "profile_version": profile.version,
+            "context_limit_bytes": profile.max_context_bytes,
             "tool_name": contract["tool_name"],
             "objective_digest": _digest(objective),
             "input_digest": _digest(inputs),
@@ -237,12 +253,19 @@ class SpecialistRegistry:
         objective: str,
         inputs: dict[str, Any],
         input_bindings: dict[str, dict[str, str]] | None = None,
+        task_id: str = "",
     ) -> bool:
         if not isinstance(assignment, dict):
             return False
         fields = frozenset(assignment)
+        previous_assignment = fields == _PRE_TASK_ASSIGNMENT_FIELDS
         legacy_assignment = fields == _LEGACY_ASSIGNMENT_FIELDS
-        if fields != _ASSIGNMENT_FIELDS and not legacy_assignment:
+        if fields != _ASSIGNMENT_FIELDS and not previous_assignment and not legacy_assignment:
+            return False
+        if (previous_assignment or legacy_assignment) and task_id:
+            # Historical assignments did not bind a task and cannot authorize dispatch.
+            return False
+        if not isinstance(task_id, str):
             return False
         try:
             normalized_bindings = _normalize_input_bindings(input_bindings)
@@ -255,7 +278,7 @@ class SpecialistRegistry:
         if any(
             not isinstance(value, str) or not value
             for key, value in assignment.items()
-            if key not in {"profile_version", "effective_capabilities"}
+            if key not in {"profile_version", "context_limit_bytes", "effective_capabilities"}
         ):
             return False
         effective = assignment.get("effective_capabilities")
@@ -266,6 +289,13 @@ class SpecialistRegistry:
         version = assignment.get("profile_version")
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             return False
+        context_limit = assignment.get("context_limit_bytes")
+        if fields == _ASSIGNMENT_FIELDS and (
+            isinstance(context_limit, bool)
+            or not isinstance(context_limit, int)
+            or not 512 <= context_limit <= 65536
+        ):
+            return False
         if re.fullmatch(r"[a-f0-9]{32}", assignment["assignment_id"]) is None:
             return False
         try:
@@ -275,12 +305,16 @@ class SpecialistRegistry:
                 objective=objective,
                 inputs=inputs,
                 input_bindings=normalized_bindings,
+                task_id=task_id,
             )
         except Exception:
             return False
         # The server-issued ID is stable across persistence/restart; recompute all
         # policy and context bindings while preserving that original ID.
         expected["assignment_id"] = assignment["assignment_id"]
+        if previous_assignment or legacy_assignment:
+            expected.pop("task_id_digest")
+            expected.pop("context_limit_bytes")
         if legacy_assignment:
             expected.pop("input_bindings_digest")
         return assignment == expected
@@ -294,6 +328,7 @@ class SpecialistRegistry:
         inputs: dict[str, Any],
         input_bindings: dict[str, dict[str, str]] | None,
         resolved_inputs: dict[str, Any],
+        task_id: str = "",
     ) -> dict[str, Any] | None:
         """Return an ephemeral receipt binding a valid assignment to actual inputs.
 
@@ -320,6 +355,7 @@ class SpecialistRegistry:
             objective=objective,
             inputs=inputs,
             input_bindings=normalized_bindings,
+            task_id=task_id,
         ):
             return None
         # For an unbound step, the raw input is already the exact effective
@@ -328,6 +364,10 @@ class SpecialistRegistry:
         if not normalized_bindings:
             return dict(assignment)
         return {**assignment, "resolved_input_digest": resolved_digest}
+
+    def get_profile(self, specialist_id: str) -> SpecialistProfile | None:
+        """Return a registered immutable profile for server-side dispatch only."""
+        return self._profiles.get(specialist_id)
 
     @classmethod
     def for_local_repository_tools(cls, tools: Any) -> "SpecialistRegistry":
@@ -343,13 +383,28 @@ class SpecialistRegistry:
             ).issubset(_SAFE_CAPABILITIES):
                 eligible.add(name)
         registry = cls()
-        if eligible:
-            registry.register(
-                SpecialistProfile(
-                    specialist_id="local_repository_analyst",
-                    version=1,
-                    tool_names=frozenset(eligible),
-                    granted_capabilities=frozenset(_SAFE_CAPABILITIES),
+        profiles = (
+            ("local_repository_analyst", eligible, 16384),
+            (
+                "repository_reader",
+                eligible.intersection({"inspect_repository_structure", "list_repository_files", "read_repository_file"}),
+                8192,
+            ),
+            (
+                "repository_code_analyst",
+                eligible.intersection({"search_repository_code", "investigate_repository_bug"}),
+                16384,
+            ),
+        )
+        for specialist_id, tool_names, max_context_bytes in profiles:
+            if tool_names:
+                registry.register(
+                    SpecialistProfile(
+                        specialist_id=specialist_id,
+                        version=1,
+                        tool_names=frozenset(tool_names),
+                        granted_capabilities=frozenset(_SAFE_CAPABILITIES),
+                        max_context_bytes=max_context_bytes,
+                    )
                 )
-            )
         return registry

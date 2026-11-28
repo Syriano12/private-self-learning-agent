@@ -28,6 +28,7 @@ class ReplanRequest:
     retrieved_experiences: list[dict[str, Any]] = field(default_factory=list)
     reflection_insights: list[dict[str, Any]] = field(default_factory=list)
     learned_strategies: list[dict[str, Any]] = field(default_factory=list)
+    task_id: str = ""
 
 
 class Replanner:
@@ -64,6 +65,7 @@ class Replanner:
         inputs: dict[str, Any],
         tools: ToolRegistry,
         permissions: dict[str, str],
+        task_id: str = "",
     ) -> TaskPlan:
         steps = []
         found = False
@@ -82,7 +84,9 @@ class Replanner:
             "steps": steps,
         }
         try:
-            plan = self.planner.validate(payload, goal=current_plan.goal, tools=tools, permissions=permissions)
+            plan = self.planner.validate(
+                payload, goal=current_plan.goal, tools=tools, permissions=permissions, task_id=task_id
+            )
             plan.planning_mode = DETERMINISTIC_REPLAN
             plan.goal_spec = current_plan.goal_spec
             return plan
@@ -111,6 +115,7 @@ class Replanner:
                 planning_context=planning_context,
                 phase="recovery",
                 fallback_goal_spec=request.current_plan.goal_spec,
+                task_id=request.task_id,
             )
             plan.planning_mode = PROVIDER_VALIDATED
             return plan
@@ -176,6 +181,7 @@ class Replanner:
                 goal=request.current_plan.goal,
                 tools=tools,
                 permissions=request.permissions,
+                task_id=request.task_id,
             )
             plan.planning_mode = DETERMINISTIC_REPLAN
             plan.goal_spec = request.current_plan.goal_spec
