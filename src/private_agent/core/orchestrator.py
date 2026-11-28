@@ -109,7 +109,10 @@ class Orchestrator:
         self.experience_memory = experience_memory or SQLiteExperienceMemory(store)
         self.reflection_memory = reflection_memory or SQLiteReflectionMemory(store)
         self.reflection_engine = reflection_engine or ReflectionEngine(self.experience_memory, self.reflection_memory)
-        self.learning_memory = learning_memory or SQLiteLearningMemory(store)
+        self.learning_memory = learning_memory or SQLiteLearningMemory(
+            store,
+            trusted_verifier_names=self.verifiers.trusted_for_learning_names,
+        )
         if isinstance(self.planner, Planner):
             self.planner.set_learning_memory(self.learning_memory)
         self.learning_engine = learning_engine or LearningEngine(self.learning_memory)
@@ -638,24 +641,19 @@ class Orchestrator:
         # Legacy knowledge rows are advisory and have no source-bound trust
         # record. Only signed, fresh typed claims may enter planning context.
         prior = self.store.search_knowledge_claims(goal, task_id=task_id)
-        retrieved = self.experience_memory.retrieve(ExperienceQuery(goal=goal, task_id=task_id))
-        retrieved_payload = [item.to_dict() for item in retrieved]
         reflection_context = [
             insight.to_dict()
             for insight in self.reflection_memory.list_relevant({"goal": goal, "task_id": task_id}, limit=5)
         ]
-        learned_context = [
-            strategy.to_dict()
-            for strategy in self.learning_memory.retrieve_relevant(
-                {
-                    "goal": goal,
-                    "task_type": "bug_bounty" if state.context.get("task_kind") == "bug_bounty" else "general",
-                    "tools": [metadata["name"] for metadata in self.tools.available()],
-                    "task_id": task_id,
-                },
-                limit=5,
-            )
-        ]
+        retrieved_payload, learned_context = self._trusted_planning_memory_context(
+            experience_query=ExperienceQuery(goal=goal, task_id=task_id),
+            learning_query={
+                "goal": goal,
+                "task_type": "bug_bounty" if state.context.get("task_kind") == "bug_bounty" else "general",
+                "tools": [metadata["name"] for metadata in self.tools.available()],
+                "task_id": task_id,
+            },
+        )
         self._emit_observability(
             "MEMORY_RETRIEVED",
             task_id=task_id,
@@ -2853,6 +2851,88 @@ class Orchestrator:
         # execute_plan gates dependencies on execution success, not verification.
         return self.executor.execute_step(step, context)
 
+    def _trusted_planning_memory_context(
+        self,
+        *,
+        experience_query: ExperienceQuery,
+        learning_query: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return only canonical, currently revalidated SQLite guidance to planners."""
+        try:
+            retrieved = self.experience_memory.retrieve(experience_query)
+        except Exception:
+            retrieved = []
+        if not isinstance(self.experience_memory, SQLiteExperienceMemory):
+            # Custom memory adapters may be queried for compatibility, but their
+            # records are not provenance authorities for planning.
+            retrieved = []
+
+        try:
+            learned_candidates = (
+                self.learning_memory.retrieve_relevant(learning_query, limit=5)
+                if isinstance(self.learning_memory, SQLiteLearningMemory)
+                else []
+            )
+        except Exception:
+            learned_candidates = []
+
+        try:
+            available_tool_names = {
+                str(metadata["name"])
+                for metadata in self.tools.available()
+                if isinstance(metadata, dict) and isinstance(metadata.get("name"), str)
+            }
+        except Exception:
+            available_tool_names = set()
+
+        learned_context: list[dict[str, Any]] = []
+        supported_experience_ids: set[str] = set()
+        for candidate in learned_candidates:
+            strategy_id = getattr(candidate, "strategy_id", None)
+            if not isinstance(strategy_id, str) or not strategy_id:
+                continue
+            try:
+                canonical = self.learning_memory.get_for_planning(strategy_id, learning_query)
+            except Exception:
+                canonical = None
+            if canonical is None:
+                continue
+            learned_context.append(canonical.to_dict())
+            metadata = canonical.metadata if isinstance(canonical.metadata, dict) else {}
+            preferred = canonical.preferred_action if isinstance(canonical.preferred_action, dict) else {}
+            support_ids = canonical.supporting_experience_ids
+            if (
+                metadata.get("source_patterns") == ["successful_recovery_alternative"]
+                and preferred.get("type") == "prefer_tool"
+                and preferred.get("tool") in available_tool_names
+                and isinstance(support_ids, list)
+                and support_ids
+                and all(isinstance(item, str) and item for item in support_ids)
+            ):
+                supported_experience_ids.update(support_ids)
+
+        retrieved_payload: list[dict[str, Any]] = []
+        for item in retrieved:
+            identity = item.identity if isinstance(getattr(item, "identity", None), dict) else {}
+            strategy_used = item.strategy_used if isinstance(getattr(item, "strategy_used", None), list) else []
+            verifier_type = identity.get("learning_verifier_type")
+            if (
+                item.experience_id not in supported_experience_ids
+                or item.outcome != "COMPLETED"
+                or identity.get("verification_status") != "VERIFIED"
+                or not identity.get("verification_scope")
+                or identity.get("security_impact_verified") is False
+                or not strategy_used
+                or identity.get("verified_final_action_tool") != strategy_used[-1]
+                or identity.get("learning_verifier_trusted") is not True
+                or not self.verifiers.is_trusted_for_learning(verifier_type)
+                or not isinstance(item.verification_evidence, list)
+                or not item.verification_evidence
+            ):
+                continue
+            retrieved_payload.append(item.to_dict())
+        return retrieved_payload, learned_context
+
     def _apply_decision(
         self,
         current_plan: TaskPlan,
@@ -2862,18 +2942,22 @@ class Orchestrator:
         experience: ExperienceRecord,
     ) -> TaskPlan:
         permissions = self._permissions()
-        recovery_retrieved = [
-            item.to_dict()
-            for item in self.experience_memory.retrieve(
-                ExperienceQuery(
-                    goal=current_plan.goal,
-                    tools=[step.tool],
-                    failure_type=diagnosis.failure_type,
-                    recovery_strategy=decision.strategy,
-                    task_id=experience.task_id,
-                )
-            )
-        ]
+        recovery_retrieved, recovery_learning = self._trusted_planning_memory_context(
+            experience_query=ExperienceQuery(
+                goal=current_plan.goal,
+                tools=[step.tool],
+                failure_type=diagnosis.failure_type,
+                recovery_strategy=decision.strategy,
+                task_id=experience.task_id,
+            ),
+            learning_query={
+                "goal": current_plan.goal,
+                "task_type": "general",
+                "tools": [step.tool],
+                "failure_types": [diagnosis.failure_type],
+                "task_id": experience.task_id,
+            },
+        )
         recovery_reflections = [
             insight.to_dict()
             for insight in self.reflection_memory.list_relevant(
@@ -2883,19 +2967,6 @@ class Orchestrator:
                     "tools": [step.tool],
                     "failure_types": [diagnosis.failure_type],
                     "recovery_strategies": [decision.strategy],
-                    "task_id": experience.task_id,
-                },
-                limit=5,
-            )
-        ]
-        recovery_learning = [
-            strategy.to_dict()
-            for strategy in self.learning_memory.retrieve_relevant(
-                {
-                    "goal": current_plan.goal,
-                    "task_type": "general",
-                    "tools": [step.tool],
-                    "failure_types": [diagnosis.failure_type],
                     "task_id": experience.task_id,
                 },
                 limit=5,

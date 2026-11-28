@@ -19,6 +19,7 @@ class VerificationResult:
     evidence: list[dict[str, Any]] = field(default_factory=list)
     verifier_type: str = "generic"
     details: dict[str, Any] = field(default_factory=dict)
+    learning_trusted: bool = False
 
     def __post_init__(self) -> None:
         if self.status not in VERIFICATION_STATUSES:
@@ -36,6 +37,7 @@ class VerificationResult:
             "evidence": self.evidence,
             "verifier_type": self.verifier_type,
             "details": self.details,
+            "learning_trusted": self.learning_trusted,
             # Kept for compatibility with the Phase 1/2 result shape.
             "criteria": self.details.get("criteria", {}),
             "errors": self.details.get("errors", []),
@@ -256,16 +258,47 @@ class WebResearchVerifier:
 class VerifierRegistry:
     """Resolve verifiers by contract name; the executor remains verifier-agnostic."""
 
-    def __init__(self, verifiers: list[Verifier] | None = None) -> None:
+    def __init__(
+        self,
+        verifiers: list[Verifier] | None = None,
+        *,
+        trusted_for_learning: set[str] | None = None,
+    ) -> None:
         self._verifiers: dict[str, Verifier] = {}
         for verifier in verifiers or [GenericVerifier(), WebResearchVerifier()]:
             self.register(verifier)
+        trusted = trusted_for_learning or set()
+        if any(not isinstance(name, str) or not name.strip() for name in trusted):
+            raise ValueError("learning_trusted_verifier_name_invalid")
+        self._trusted_for_learning = frozenset(trusted)
+        self._trusted_verifier_instances = {
+            name: self._verifiers[name]
+            for name in self._trusted_for_learning
+            if name != GenericVerifier.name and name in self._verifiers
+        }
+
+    @property
+    def trusted_for_learning_names(self) -> frozenset[str]:
+        return frozenset(
+            name for name in self._trusted_for_learning
+            if name in self._trusted_verifier_instances
+            and self._verifiers.get(name) is self._trusted_verifier_instances[name]
+        )
+
+    def is_trusted_for_learning(self, name: str) -> bool:
+        return (
+            isinstance(name, str)
+            and name in self._trusted_verifier_instances
+            and self._verifiers.get(name) is self._trusted_verifier_instances[name]
+        )
 
     def register(self, verifier: Verifier) -> None:
         if not isinstance(getattr(verifier, "name", None), str) or not verifier.name.strip():
             raise ValueError("verifier_name_required")
         if not callable(getattr(verifier, "verify", None)):
             raise ValueError("verifier_method_required")
+        if verifier.name in self._verifiers:
+            raise ValueError(f"verifier_name_already_registered:{verifier.name}")
         self._verifiers[verifier.name] = verifier
 
     def get(self, name: str) -> Verifier:
@@ -288,6 +321,7 @@ class VerifierRegistry:
                 f"Verifier is not registered: {name}",
                 verifier_type=name,
                 details={"code": "unknown_verifier"},
+                learning_trusted=False,
             )
         try:
             result = verifier.verify(observation, criteria or {})
@@ -297,6 +331,7 @@ class VerifierRegistry:
                 "Verifier raised an exception",
                 verifier_type=name,
                 details={"code": "verification_exception", "exception_type": type(exc).__name__},
+                learning_trusted=False,
             )
         if not isinstance(result, VerificationResult):
             return VerificationResult(
@@ -304,6 +339,7 @@ class VerifierRegistry:
                 "Verifier returned a malformed result",
                 verifier_type=name,
                 details={"code": "malformed_verification_result"},
+                learning_trusted=False,
             )
         if observation.execution_status != "success" and result.status == "VERIFIED":
             return VerificationResult(
@@ -311,5 +347,13 @@ class VerifierRegistry:
                 "Verification cannot succeed when execution did not succeed",
                 verifier_type=name,
                 details={"code": "verification_requires_successful_execution", "execution_status": observation.execution_status},
+                learning_trusted=False,
             )
-        return result
+        return VerificationResult(
+            status=result.status,
+            reason=result.reason,
+            evidence=result.evidence,
+            verifier_type=name,
+            details=result.details,
+            learning_trusted=result.status == "VERIFIED" and self.is_trusted_for_learning(name),
+        )

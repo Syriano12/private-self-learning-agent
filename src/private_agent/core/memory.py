@@ -246,10 +246,14 @@ class SQLiteExperienceMemory(ExperienceMemory):
         evidence: list[dict[str, Any]] = []
         verified_action_tools: list[str] = []
         verified_final_action_tool = ""
+        learning_verifier_type = ""
+        learning_verifier_trusted = False
         for action in actions:
             tool_name = action.get("tool_name")
             if isinstance(tool_name, str) and tool_name:
                 verified_final_action_tool = ""
+                learning_verifier_type = ""
+                learning_verifier_trusted = False
             verification = action.get("verification")
             if not isinstance(verification, dict):
                 continue
@@ -265,10 +269,15 @@ class SQLiteExperienceMemory(ExperienceMemory):
             ):
                 verified_action_tools.append(tool_name)
                 verified_final_action_tool = tool_name
+                raw_verifier_type = verification.get("verifier_type")
+                learning_verifier_type = raw_verifier_type if isinstance(raw_verifier_type, str) else ""
+                learning_verifier_trusted = verification.get("learning_trusted") is True
                 remaining = self.max_evidence_per_experience - len(evidence)
                 evidence.extend(action_evidence[:remaining])
         identity["verified_action_tools"] = list(dict.fromkeys(verified_action_tools))
         identity["verified_final_action_tool"] = verified_final_action_tool
+        identity["learning_verifier_type"] = learning_verifier_type
+        identity["learning_verifier_trusted"] = learning_verifier_trusted
         if (
             identity.get("verification_status") == "VERIFIED"
             and (not strategy_used or verified_final_action_tool != strategy_used[-1])
@@ -276,6 +285,8 @@ class SQLiteExperienceMemory(ExperienceMemory):
             identity["verification_status"] = "UNVERIFIED"
             identity["verification_scope"] = "ACTION_UNVERIFIED"
             identity["security_impact_verified"] = None
+            identity["learning_verifier_type"] = ""
+            identity["learning_verifier_trusted"] = False
         return RetrievedExperience(
             experience_id=str(payload.get("task_id", "")),
             relevance=0.0,

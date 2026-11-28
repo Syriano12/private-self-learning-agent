@@ -14,10 +14,12 @@ from private_agent.core.learning import LearningEngine, SQLiteLearningMemory
 from private_agent.core.knowledge import KnowledgeAttestor, KnowledgeClaim, KnowledgeEvidence, KnowledgeSource, sha256_hex
 from private_agent.core.llm import LLMProvider, LLMResponse
 from private_agent.core.memory import ExperienceQuery, SQLiteExperienceMemory
+from private_agent.core.observation import Observation
 from private_agent.core.orchestrator import Orchestrator
 from private_agent.core.planner import Planner
 from private_agent.core.recovery import RecoveryManager
 from private_agent.core.reflection import ReflectionEngine, SQLiteReflectionMemory
+from private_agent.core.verification import GenericVerifier, VerificationResult, VerifierRegistry, WebResearchVerifier
 from private_agent.observability import ObservabilityMonitor
 from private_agent.security import SecurityController
 from private_agent.storage import Store
@@ -30,6 +32,7 @@ OPERATOR_PASSWORD = "recovery-learning-operator-password-123"
 KNOWLEDGE_KEY = b"recovery-learning-test-attestation-key-32"
 SUPPORT_GOAL = "Please research local artifact alpha and verify a recovery result"
 FUTURE_GOAL = "Please research local artifact alpha for a future verified recovery"
+TRUSTED_LOCAL_VERIFIER_NAMES = frozenset({"local_fixture_verifier"})
 
 
 class LocalDeterministicProvider(LLMProvider):
@@ -78,6 +81,7 @@ class LocalDeterministicProvider(LLMProvider):
                         "objective": "run a benign local prerequisite",
                         "tool": "safe_probe",
                         "input": {"value": "local-check"},
+                        "verifier": "local_fixture_verifier",
                         "reason": "registered benign deterministic prerequisite",
                         "depends_on": [],
                         "success_criteria": {"required_fields": ["result"]},
@@ -87,6 +91,7 @@ class LocalDeterministicProvider(LLMProvider):
                         "objective": "verify the local recovery result with the alternative",
                         "tool": "tool_b",
                         "input": {},
+                        "verifier": "local_fixture_verifier",
                         "reason": "registered alternative selected after INVALID_OUTPUT",
                         "depends_on": ["safe-prerequisite"],
                         "input_bindings": {
@@ -121,6 +126,7 @@ class LocalDeterministicProvider(LLMProvider):
                     "objective": "run a benign local prerequisite",
                     "tool": "safe_probe",
                     "input": {"value": "local-check"},
+                    "verifier": "local_fixture_verifier",
                     "reason": "registered benign deterministic prerequisite",
                     "depends_on": [],
                     "success_criteria": {"required_fields": ["result"]},
@@ -133,6 +139,7 @@ class LocalDeterministicProvider(LLMProvider):
                 "objective": "verify the local recovery result",
                 "tool": selected,
                 "input": {} if has_prerequisite else {"value": "alpha"},
+                "verifier": "local_fixture_verifier",
                 "reason": "deterministic local plan using registered tools only",
                 "depends_on": ["safe-prerequisite"] if has_prerequisite else [],
                 **(
@@ -215,6 +222,34 @@ class LocalTool:
         return ToolResult.success({"result": f"verified-local:{self.name}:{inputs['value']}:task={context.task_id}"})
 
 
+class LocalFixtureVerifier:
+    """Separate local oracle for the test-only tool output contract."""
+
+    name = "local_fixture_verifier"
+
+    def verify(self, observation: Observation, criteria: dict[str, Any]) -> VerificationResult:
+        output = observation.observed_output
+        result = output.get("result") if isinstance(output, dict) else None
+        expected_prefix = f"verified-local:{observation.tool_name}:"
+        required_fields = criteria.get("required_fields", [])
+        if observation.execution_status != "success":
+            return VerificationResult("FAILED", "Local fixture execution did not succeed")
+        if not isinstance(result, str) or not result.startswith(expected_prefix):
+            return VerificationResult("FAILED", "Output failed the independent local fixture check")
+        if any(not isinstance(output, dict) or field not in output for field in required_fields):
+            return VerificationResult("FAILED", "Output did not satisfy required fixture fields")
+        return VerificationResult(
+            "VERIFIED",
+            "Independent local fixture verifier confirmed the registered tool output contract",
+            evidence=[{"type": "local_fixture_contract", "tool_name": observation.tool_name}],
+            details={"fixture_contract": "verified-local:<tool>:<value>:task=<id>"},
+        )
+
+
+def _trusted_learning_memory(store: Store) -> SQLiteLearningMemory:
+    return SQLiteLearningMemory(store, trusted_verifier_names=set(TRUSTED_LOCAL_VERIFIER_NAMES))
+
+
 def _build_components(
     database: Path,
     calls: dict[str, list[dict[str, Any]]],
@@ -230,10 +265,15 @@ def _build_components(
     for name in ("tool_a", "tool_b", "safe_probe"):
         tools.register(LocalTool(name, calls))
     planner = Planner(provider)
+    verifiers = VerifierRegistry(
+        [GenericVerifier(), WebResearchVerifier(), LocalFixtureVerifier()],
+        trusted_for_learning=set(TRUSTED_LOCAL_VERIFIER_NAMES),
+    )
     orchestrator = Orchestrator(
         store,
         tools,
         planner=planner,
+        verifiers=verifiers,
         security_controller=security,
         observability=monitor,
         recovery_manager=RecoveryManager(max_recovery_attempts=2, max_attempts_per_step=1),
@@ -430,7 +470,7 @@ def test_conversation_approval_restart_and_future_verified_recovery_learning(tmp
         idempotency_key="recovery-support-one",
         initialize_owner=True,
     )
-    assert SQLiteLearningMemory(store).list() == []
+    assert _trusted_learning_memory(store).list() == []
     store.close()
 
     # The second independently created task supplies the second verified support record.
@@ -441,7 +481,7 @@ def test_conversation_approval_restart_and_future_verified_recovery_learning(tmp
         initialize_owner=False,
     )
     assert first_id != second_id
-    strategies = SQLiteLearningMemory(store).list()
+    strategies = _trusted_learning_memory(store).list()
     assert len(strategies) == 1
     learned = strategies[0]
     assert learned.status == "active"
@@ -456,7 +496,7 @@ def test_conversation_approval_restart_and_future_verified_recovery_learning(tmp
 
     # A fresh process and SQLite connection must retrieve and revalidate the durable strategy.
     store = Store(database)
-    memory = SQLiteLearningMemory(store)
+    memory = _trusted_learning_memory(store)
     restored = memory.get(strategy_id)
     assert restored is not None and restored.to_dict() == learned.to_dict()
     future_retrieval = memory.retrieve_relevant(
@@ -550,7 +590,7 @@ def test_memory_retrieval_isolated_between_task_owners(tmp_path: Path) -> None:
     )
     owner_a_id = store.task_owner_user_id(owner_task_one)
     assert owner_a_id and store.task_owner_user_id(owner_task_two) == owner_a_id
-    strategies = SQLiteLearningMemory(store).list()
+    strategies = _trusted_learning_memory(store).list()
     assert len(strategies) == 1
     assert set(strategies[0].supporting_experience_ids) == {owner_task_one, owner_task_two}
     store.close()
@@ -654,7 +694,7 @@ def test_memory_retrieval_isolated_between_task_owners(tmp_path: Path) -> None:
         assert SQLiteReflectionMemory(store).list_relevant(
             {"goal": owner_b_goal, "task_id": task_b_id}
         ) == []
-        assert SQLiteLearningMemory(store).retrieve_relevant(
+        assert _trusted_learning_memory(store).retrieve_relevant(
             {
                 "goal": owner_b_goal,
                 "task_type": "general",
@@ -718,7 +758,7 @@ def test_unowned_api_task_and_direct_planner_cannot_retrieve_or_write_owner_lear
     )
     owner_a_id = store.task_owner_user_id(owner_task_one)
     assert owner_a_id and store.task_owner_user_id(owner_task_two) == owner_a_id
-    strategies = SQLiteLearningMemory(store).list()
+    strategies = _trusted_learning_memory(store).list()
     assert len(strategies) == 1
     strategy = strategies[0]
     store.close()
@@ -726,7 +766,7 @@ def test_unowned_api_task_and_direct_planner_cannot_retrieve_or_write_owner_lear
     provider = LocalDeterministicProvider()
     store, service, orchestrator = _build_components(database, calls, provider)
     try:
-        memory = SQLiteLearningMemory(store)
+        memory = _trusted_learning_memory(store)
         owner_plan = orchestrator.planner.create(
             FUTURE_GOAL,
             orchestrator.tools,
@@ -795,7 +835,7 @@ def test_unowned_api_task_and_direct_planner_cannot_retrieve_or_write_owner_lear
     try:
         assert store.task_owner_user_id(unowned_task_id) is None
         assert store.get_experience(unowned_task_id) is None
-        memory = SQLiteLearningMemory(store)
+        memory = _trusted_learning_memory(store)
         assert memory.retrieve_relevant(
             {"goal": FUTURE_GOAL, "task_type": "general", "tools": ["tool_a", "tool_b"], "task_id": unowned_task_id}
         ) == []
@@ -844,7 +884,7 @@ def test_execution_unknown_worker_does_not_persist_learning_and_owner_positive_c
         idempotency_key="unknown-owner-support-two",
         initialize_owner=False,
     )
-    strategy = SQLiteLearningMemory(store).list()[0]
+    strategy = _trusted_learning_memory(store).list()[0]
     owner = next(user for user in AuthManager(store).list_users() if user.role == "OWNER")
     operator_b = AuthManager(store).create_user(
         "operator-unknown-learning@example.com",
@@ -876,7 +916,7 @@ def test_execution_unknown_worker_does_not_persist_learning_and_owner_positive_c
             assert state is not None and state["status"] == "EXECUTION_UNKNOWN"
             assert store.task_queue_record(unknown_task_id)["queue_status"] == "EXECUTION_UNKNOWN"
             assert store.get_experience(unknown_task_id) is None
-            assert [item.strategy_id for item in SQLiteLearningMemory(store).list()] == [strategy.strategy_id]
+            assert [item.strategy_id for item in _trusted_learning_memory(store).list()] == [strategy.strategy_id]
     finally:
         store.close()
 
@@ -891,7 +931,7 @@ def test_execution_unknown_worker_does_not_persist_learning_and_owner_positive_c
         assert SQLiteReflectionMemory(store).list_relevant(
             {"goal": FUTURE_GOAL, "task_type": "general", "task_id": unknown_task_id}
         ) == []
-        assert [item.strategy_id for item in SQLiteLearningMemory(store).list()] == [strategy.strategy_id]
+        assert [item.strategy_id for item in _trusted_learning_memory(store).list()] == [strategy.strategy_id]
     finally:
         store.close()
 
@@ -989,13 +1029,13 @@ def test_conflicting_execution_unknown_status_fails_closed_after_reopen(tmp_path
             reflection_memory,
             min_supporting_experiences=2,
         ).reflect(query)
-        learned = LearningEngine(SQLiteLearningMemory(store)).learn(insights)
+        learned = LearningEngine(_trusted_learning_memory(store)).learn(insights)
         assert insights == []
         assert learned == []
         assert reflection_memory.list_relevant(
             {"goal": goal, "task_type": "research", "task_id": task_ids[0]}
         ) == []
-        assert SQLiteLearningMemory(store).list() == []
+        assert _trusted_learning_memory(store).list() == []
     finally:
         store.close()
 
@@ -1066,13 +1106,13 @@ def test_execution_unknown_experiences_cannot_generate_failure_patterns_after_re
             reflection_memory,
             min_supporting_experiences=2,
         ).reflect(query)
-        learned = LearningEngine(SQLiteLearningMemory(store)).learn(insights)
+        learned = LearningEngine(_trusted_learning_memory(store)).learn(insights)
         assert insights == []
         assert learned == []
         assert reflection_memory.list_relevant(
             {"goal": goal, "task_type": "research", "task_id": task_ids[0]}
         ) == []
-        assert SQLiteLearningMemory(store).list() == []
+        assert _trusted_learning_memory(store).list() == []
     finally:
         store.close()
 

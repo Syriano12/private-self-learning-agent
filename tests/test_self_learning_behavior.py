@@ -110,5 +110,5 @@ def test_unreviewed_legacy_knowledge_is_not_reused_by_future_tasks(tmp_path: Pat
         )
         assert second["prior_knowledge_used"] == [], "legacy knowledge must not enter planning context"
         assert planner.calls[-1][0] == []
-        assert planner.calls[-1][1], "the separate experience-memory path must still retrieve prior work"
+        assert planner.calls[-1][1] == [], "unlinked operational history must not enter planner context"
         assert second["verification"]["verified"] is True
