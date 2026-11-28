@@ -1,0 +1,74 @@
+{
+  "goal_spec": {
+    "normalized_goal": "Calculate the total irrigation water for three days for two garden beds, 'شمس' (2 liters/day) and 'قمر' (1 liter/day), and then sum the totals using the synthetic tools.",
+    "intent": "To demonstrate planning capability by using synthetic tools to perform a multi-step calculation involving individual calculations and a summation.",
+    "deliverables": [
+      "Total irrigation for 'شمس'",
+      "Total irrigation for 'قمر'",
+      "Combined total irrigation for both beds"
+    ],
+    "constraints": [
+      "Max 3 steps",
+      "Use only listed synthetic tools"
+    ],
+    "success_criteria": [
+      "The plan accurately calculates the total liters for 'شمس' (6 liters)",
+      "The plan accurately calculates the total liters for 'قمر' (3 liters)",
+      "The plan accurately calculates the combined total (9 liters)",
+      "The plan uses only the 'synthetic_bed_total' and 'synthetic_add_totals' tools",
+      "The plan does not exceed 3 steps"
+    ],
+    "missing_information": [],
+    "clarification_required": false,
+    "clarification_question": "",
+    "priority": 3,
+    "risk_level": "LOW"
+  },
+  "plan": {
+    "goal": "Calculate the combined total irrigation for beds 'شمس' and 'قمر' over three days using synthetic tools.",
+    "rationale": "The objective requires calculating individual bed totals first, then combining them. The 'synthetic_bed_total' tool is used for individual bed calculations, and 'synthetic_add_totals' is used for combining the results. This approach adheres to the 'max_steps: 3' constraint.",
+    "steps": [
+      {
+        "id": "calculate_shams_total",
+        "objective": "Calculate total liters for 'شمس' bed for 3 days at 2 liters/day.",
+        "tool": "synthetic_bed_total",
+        "input": {},
+        "reason": "To determine the irrigation required for 'شمس' as per the goal.",
+        "depends_on": [],
+        "priority": 1,
+        "input_bindings": {
+          "bed_name": {"source_step_id": "", "output_key": ""},
+          "days": {"source_step_id": "", "output_key": ""},
+          "liters_per_day": {"source_step_id": "", "output_key": ""}
+        }
+      },
+      {
+        "id": "calculate_qamar_total",
+        "objective": "Calculate total liters for 'قمر' bed for 3 days at 1 liter/day.",
+        "tool": "synthetic_bed_total",
+        "input": {},
+        "reason": "To determine the irrigation required for 'قمر' as per the goal.",
+        "depends_on": [],
+        "priority": 1,
+        "input_bindings": {
+          "bed_name": {"source_step_id": "", "output_key": ""},
+          "days": {"source_step_id": "", "output_key": ""},
+          "liters_per_day": {"source_step_id": "", "output_key": ""}
+        }
+      },
+      {
+        "id": "add_both_totals",
+        "objective": "Add the total liters from 'شمس' and 'قمر' beds.",
+        "tool": "synthetic_add_totals",
+        "input": {},
+        "reason": "To get the combined total irrigation for both beds as the final result.",
+        "depends_on": ["calculate_shams_total", "calculate_qamar_total"],
+        "priority": 2,
+        "input_bindings": {
+          "first_total": {"source_step_id": "calculate_shams_total", "output_key": "total_liters"},
+          "second_total": {"source_step_id": "calculate_qamar_total", "output_key": "total_liters"}
+        }
+      }
+    ]
+  }
+}

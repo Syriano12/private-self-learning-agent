@@ -209,8 +209,8 @@ def test_orchestrator_isolates_context_and_orders_forward_dependency_with_repeat
     tools = make_registry(repeat, later)
     plan = Planner().validate(make_raw_plan(), goal="prove verified dependency handling", tools=tools)
 
-    # Planner currently accepts a forward reference; execution must still order it safely.
-    assert [step.id for step in plan.steps] == ["source", "consumer", "later"]
+    # Planner normalizes forward references into stable dependency order before execution.
+    assert [step.id for step in plan.steps] == ["source", "later", "consumer"]
     agent = Orchestrator(
         store,
         tools,

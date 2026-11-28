@@ -345,6 +345,8 @@ def test_followup_is_consumed_after_verified_action_then_replanned_and_reauthori
     assert "Then run the network step" in planner.calls[1]
     persisted = TaskState.from_dict(store.get_task_state(created["task_id"]))
     assert persisted.plan_version == 2
+    assert persisted.goal == "complete the first safe action"
+    assert "Then run the network step" in persisted.plan["goal"]
     first_step = persisted.plan["steps"][0]
     first_key = action_fingerprint(
         plan_version=persisted.plan_version,

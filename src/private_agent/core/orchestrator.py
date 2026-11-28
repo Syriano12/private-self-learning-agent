@@ -9,11 +9,12 @@ from typing import Any
 
 from private_agent.core.diagnosis import FailureDiagnoser, FailureDiagnosis
 from private_agent.core.execution import ExecutionContext, GenericExecutor, StepResult
-from private_agent.core.experience import ExperienceAction, ExperienceRecord
+from private_agent.core.experience import ExperienceAction, ExperienceRecord, sanitize_value
 from private_agent.core.learning import LearningEngine, LearningMemory, SQLiteLearningMemory
 from private_agent.core.memory import ExperienceMemory, ExperienceQuery, SQLiteExperienceMemory
 from private_agent.core.observation import Observation, StepOutcome
 from private_agent.core.planner import CapabilityUnavailableError, PlanStep, Planner, PlanValidationError, TaskPlan
+from private_agent.core.intelligence import GoalSpec, IntelligenceContractError
 from private_agent.core.planning_provenance import (
     DETERMINISTIC_ROUTE,
     PLANNING_MODES,
@@ -418,6 +419,8 @@ class Orchestrator:
             for item in pending
             if isinstance(item, dict) and str(item.get("content", "")).strip()
         ]
+        # Keep state.goal as the immutable task identity; the current plan and
+        # its GoalSpec carry the effective goal including these user messages.
         effective_goal = state.goal
         if followups:
             effective_goal += "\n\nUser follow-up messages:\n" + "\n".join(
@@ -502,6 +505,7 @@ class Orchestrator:
                             for target, binding in step.input_bindings.items()
                         },
                         specialist_assignment=dict(step.specialist_assignment),
+                        priority=step.priority,
                     )
                 )
             merged_steps = [step for step, _, _ in previous_completed] + new_steps
@@ -516,6 +520,7 @@ class Orchestrator:
                 steps=merged_steps,
                 rationale=f"{proposed.rationale}; previously verified actions retained",
                 planning_mode=proposed.planning_mode,
+                goal_spec=proposed.goal_spec,
             )
         except Exception as exc:
             blocked = self._block_conversation_replan(state, "conversation_replan_failed")
@@ -812,7 +817,15 @@ class Orchestrator:
         terminal_status = "FAILED"
         verified_previous_results: dict[str, StepResult] = {}
 
-        self.store.save_event(task_id, "plan_created", {"goal": goal, "steps": [step.__dict__ for step in current_plan.steps]})
+        self.store.save_event(
+            task_id,
+            "plan_created",
+            sanitize_value({
+                "goal": goal,
+                "goal_spec": current_plan.goal_spec.to_dict() if current_plan.goal_spec is not None else None,
+                "steps": [step.__dict__ for step in current_plan.steps],
+            }),
+        )
         max_rounds = 1 + self.recovery.max_recovery_attempts + MAX_CONVERSATION_REPLANS
         while rounds < max_rounds:
             rounds += 1
@@ -820,7 +833,7 @@ class Orchestrator:
                 self.store.save_event(
                     task_id,
                     "recovery_round_started",
-                    {"round": rounds, "plan": self._plan_payload(current_plan)},
+                    sanitize_value({"round": rounds, "plan": self._plan_payload(current_plan)}),
                 )
             recovery_requested = False
             latest_outcomes = {}
@@ -1062,7 +1075,8 @@ class Orchestrator:
                     metadata={"strategy": decision.strategy},
                 )
                 try:
-                    current_plan = self._apply_decision(current_plan, step, decision, diagnosis, experience)
+                    previous_plan = current_plan
+                    current_plan = self._apply_decision(previous_plan, step, decision, diagnosis, experience)
                 except ReplanError as exc:
                     self.recovery.update_last(outcome="BLOCKED", verification_status=outcome.verification_status)
                     terminal_status = "BLOCKED"
@@ -1071,8 +1085,9 @@ class Orchestrator:
                     recovery_requested = False
                     break
 
-                state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
-                verified_previous_results.clear()
+                verified_previous_results = self._persist_replanned_plan_preserving_verified_actions(
+                    state, previous_plan, current_plan
+                )
                 self._emit_observability(
                     "PLAN_UPDATED",
                     task_id=task_id,
@@ -1641,7 +1656,11 @@ class Orchestrator:
             self._save_checkpoint(state, "APPROVAL_REVALIDATED")
             return True, []
         pending_plan = TaskPlan(
-            plan.goal, pending_steps, plan.rationale, planning_mode=plan.planning_mode,
+            plan.goal,
+            pending_steps,
+            plan.rationale,
+            planning_mode=plan.planning_mode,
+            goal_spec=plan.goal_spec,
         )
         decisions = self.security.preflight_plan(
             state.task_id,
@@ -2049,13 +2068,15 @@ class Orchestrator:
                     metadata={"strategy": decision.strategy, "resumed": True},
                 )
                 try:
-                    current_plan = self._apply_decision(current_plan, step, decision, diagnosis, experience)
+                    previous_plan = current_plan
+                    current_plan = self._apply_decision(previous_plan, step, decision, diagnosis, experience)
                 except ReplanError as exc:
                     terminal_status = "BLOCKED"
                     errors.append(str(exc))
                     break
-                state.set_plan(self._plan_payload(current_plan), version=state.plan_version + 1)
-                verified_previous_results.clear()
+                verified_previous_results = self._persist_replanned_plan_preserving_verified_actions(
+                    state, previous_plan, current_plan
+                )
                 self._emit_observability(
                     "PLAN_UPDATED",
                     task_id=state.task_id,
@@ -2247,11 +2268,14 @@ class Orchestrator:
     def _plan_from_payload(self, payload: dict[str, Any]) -> TaskPlan:
         if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
             raise StateIntegrityError("persisted_plan_missing")
-        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output", "input_bindings", "specialist_assignment"}
+        allowed = {"id", "objective", "tool", "input", "reason", "depends_on", "verifier", "success_criteria", "status", "output", "input_bindings", "specialist_assignment", "priority"}
         steps = []
         for raw in payload["steps"]:
             if not isinstance(raw, dict) or not set(raw).issubset(allowed):
                 raise StateIntegrityError("persisted_plan_step_invalid")
+            priority = raw.get("priority", 50)
+            if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 100:
+                raise StateIntegrityError("persisted_plan_step_priority_invalid")
             steps.append(
                 PlanStep(
                     id=raw["id"], objective=raw["objective"], tool=raw["tool"], input=dict(raw.get("input", {})),
@@ -2259,6 +2283,7 @@ class Orchestrator:
                     success_criteria=dict(raw.get("success_criteria", {})), status=raw.get("status", "pending"), output=dict(raw.get("output", {})),
                     input_bindings={key: dict(value) for key, value in raw.get("input_bindings", {}).items()},
                     specialist_assignment=dict(raw.get("specialist_assignment", {})),
+                    priority=priority,
                 )
             )
         if not steps:
@@ -2266,9 +2291,16 @@ class Orchestrator:
         planning_mode = payload.get("planning_mode", UNKNOWN)
         if not isinstance(planning_mode, str) or planning_mode not in PLANNING_MODES:
             raise StateIntegrityError("persisted_plan_planning_mode_invalid")
+        goal_spec = None
+        if payload.get("goal_spec") is not None:
+            try:
+                goal_spec = GoalSpec.from_serialized(payload["goal_spec"])
+            except IntelligenceContractError as exc:
+                raise StateIntegrityError("persisted_goal_spec_invalid") from exc
         return TaskPlan(
             str(payload.get("goal", "")), steps, str(payload.get("rationale", "")),
             planning_mode=planning_mode,
+            goal_spec=goal_spec,
         )
 
     def _experience_from_state(self, state: TaskState, plan: TaskPlan) -> ExperienceRecord:
@@ -2504,6 +2536,103 @@ class Orchestrator:
             raise StateIntegrityError(f"invalid_plan_dependencies:{error}")
         return ordered
 
+    def _persist_replanned_plan_preserving_verified_actions(
+        self,
+        state: TaskState,
+        previous_plan: TaskPlan,
+        next_plan: TaskPlan,
+    ) -> dict[str, StepResult]:
+        """Advance the plan version without replaying unchanged verified steps."""
+        completed_before = list(state.completed_actions)
+        old_current_keys = {state.action_key_for_step(step) for step in previous_plan.steps}
+        next_by_id = {step.id: step for step in next_plan.steps}
+        candidates: dict[str, tuple[str, PlanStep, dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
+
+        def equivalent(left: PlanStep, right: PlanStep) -> bool:
+            left_assignment = {
+                key: value for key, value in left.specialist_assignment.items() if key != "assignment_id"
+            }
+            right_assignment = {
+                key: value for key, value in right.specialist_assignment.items() if key != "assignment_id"
+            }
+            return left_assignment == right_assignment and all(
+                getattr(left, name) == getattr(right, name)
+                for name in (
+                    "id",
+                    "objective",
+                    "tool",
+                    "input",
+                    "reason",
+                    "depends_on",
+                    "verifier",
+                    "success_criteria",
+                    "input_bindings",
+                )
+            )
+
+        for old_step in previous_plan.steps:
+            old_key = state.action_key_for_step(old_step)
+            if old_key not in completed_before:
+                continue
+            new_step = next_by_id.get(old_step.id)
+            record = state.action_records.get(old_key)
+            if (
+                new_step is None
+                or not isinstance(record, dict)
+                or self._verified_result_from_action_record(state, old_step) is None
+                or not equivalent(old_step, new_step)
+            ):
+                continue
+            observation = state.observations.get(old_key)
+            verification = state.verification_results.get(old_key)
+            if not isinstance(observation, dict) or not isinstance(verification, dict):
+                continue
+            candidates[old_step.id] = (old_key, new_step, dict(record), dict(observation), dict(verification))
+
+        reusable_ids = set(candidates)
+        while True:
+            invalid = {
+                step_id
+                for step_id in reusable_ids
+                if any(dependency not in reusable_ids for dependency in candidates[step_id][1].depends_on)
+            }
+            if not invalid:
+                break
+            reusable_ids.difference_update(invalid)
+
+        state.set_plan(self._plan_payload(next_plan), version=state.plan_version + 1)
+        remapped_keys: list[str] = []
+        for step in next_plan.steps:
+            if step.id not in reusable_ids:
+                continue
+            old_key, new_step, record, observation, verification = candidates[step.id]
+            new_key = state.action_key_for_step(new_step)
+            # Keep plan_version/planning_mode as execution provenance; only the
+            # action key is rebound to this current plan version.
+            record["action_key"] = new_key
+            record["input_fingerprint"] = new_key
+            state.action_records[new_key] = record
+            state.observations[new_key] = observation
+            state.verification_results[new_key] = verification
+            if old_key != new_key:
+                state.action_records.pop(old_key, None)
+                state.observations.pop(old_key, None)
+                state.verification_results.pop(old_key, None)
+            remapped_keys.append(new_key)
+
+        state.completed_actions = [key for key in completed_before if key not in old_current_keys] + remapped_keys
+        completed_now = set(state.completed_actions)
+        state.pending_actions = [
+            state.action_key_for_step(step)
+            for step in next_plan.steps
+            if state.action_key_for_step(step) not in completed_now
+        ]
+        return {
+            step.id: result
+            for step in self._ordered_plan_steps(next_plan)
+            if (result := self._verified_result_from_action_record(state, step)) is not None
+        }
+
     def _verified_result_from_action_record(self, state: TaskState, step: PlanStep) -> StepResult | None:
         key = state.action_key_for_step(step)
         record = state.action_records.get(key)
@@ -2684,7 +2813,7 @@ class Orchestrator:
         self.store.save_event(
             experience.task_id,
             "plan_replanned",
-            {"strategy": decision.strategy, "plan": self._plan_payload(next_plan)},
+            sanitize_value({"strategy": decision.strategy, "plan": self._plan_payload(next_plan)}),
             step_id=step.id,
         )
         return next_plan
@@ -2721,6 +2850,7 @@ class Orchestrator:
             "goal": plan.goal,
             "rationale": plan.rationale,
             "planning_mode": plan.planning_mode if plan.planning_mode in PLANNING_MODES else UNKNOWN,
+            **({"goal_spec": plan.goal_spec.to_dict()} if plan.goal_spec is not None else {}),
             "steps": [step.__dict__ for step in plan.steps],
         }
 
