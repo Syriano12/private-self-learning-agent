@@ -146,9 +146,11 @@ def test_registry_excludes_network_or_privileged_tools_from_local_specialists() 
     registry = SpecialistRegistry.for_local_repository_tools(tools)
     visible = registry.available_for_planning(tools)
 
-    assert len(visible) == 1
-    assert visible[0]["specialist_id"] == "local_repository_analyst"
-    assert visible[0]["tool_names"] == ["read_repository_file"]
+    assert {item["specialist_id"] for item in visible} == {
+        "local_repository_analyst",
+        "repository_reader",
+    }
+    assert all(item["tool_names"] == ["read_repository_file"] for item in visible)
 
     source_less_tools = ToolRegistry()
 

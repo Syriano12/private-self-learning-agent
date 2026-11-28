@@ -27,6 +27,11 @@ from private_agent.core.recovery import RecoveryDecision, RecoveryManager
 from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
 from private_agent.core.specialists import SpecialistRegistry
+from private_agent.core.specialist_coordination import (
+    SpecialistCoordinator,
+    SpecialistCoordinationError,
+    SpecialistResult,
+)
 from private_agent.core.task_state import (
     MAX_CLARIFICATION_REQUESTS,
     MAX_TASK_GOAL_LENGTH,
@@ -82,6 +87,9 @@ class Orchestrator:
         self.approved_permissions = approved_permissions or {"public_read"}
         self.planner = planner or Planner()
         self.specialist_registry = specialist_registry
+        self.specialist_coordinator = (
+            SpecialistCoordinator(specialist_registry) if specialist_registry is not None else None
+        )
         if isinstance(self.planner, Planner) and specialist_registry is not None:
             self.planner.specialists = specialist_registry
         self.security = security_controller or SecurityController(store=store)
@@ -212,6 +220,7 @@ class Orchestrator:
                 inputs=step.input,
                 input_bindings=step.input_bindings,
                 resolved_inputs=resolved_input,
+                task_id=state.task_id,
             )
             if execution_binding is None:
                 return None
@@ -345,6 +354,210 @@ class Orchestrator:
         result.planning_mode = provenance["planning_mode"]
         result.plan_version = provenance["plan_version"]
 
+    def _persist_specialist_work_order(
+        self,
+        state: TaskState,
+        step: PlanStep,
+        step_result: StepResult,
+    ) -> dict[str, Any] | None:
+        if not step.specialist_assignment:
+            return None
+        raw = step_result.metadata.get("specialist_work_order_provenance")
+        if raw is None:
+            if step_result.status == "success":
+                raise SpecialistCoordinationError("specialist_work_order_provenance_missing")
+            return None
+        if self.specialist_coordinator is None:
+            raise SpecialistCoordinationError("specialist_coordinator_unavailable")
+        provenance = SpecialistCoordinator.validate_work_order_for_step(
+            raw,
+            task_id=state.task_id,
+            plan_version=state.plan_version,
+            step=step,
+        )
+        self.specialist_coordinator.record_work_order(state, provenance)
+        return provenance
+
+    def _specialist_work_order_matches_current_context(
+        self,
+        state: TaskState,
+        step: PlanStep,
+        result: SpecialistResult,
+        provenance: dict[str, Any],
+        steps_by_id: dict[str, PlanStep],
+    ) -> bool:
+        registry = self.specialist_registry
+        coordinator = self.specialist_coordinator
+        if registry is None or coordinator is None:
+            return False
+        try:
+            tool = self.tools.get(step.tool)
+            if not registry.validate_assignment(
+                step.specialist_assignment,
+                tool=tool,
+                objective=step.objective,
+                inputs=step.input,
+                input_bindings=step.input_bindings,
+                task_id=state.task_id,
+            ):
+                return False
+            resolved_inputs = dict(step.input)
+            previous_results: dict[str, StepResult] = {}
+            verified_result_ids: set[str] = set()
+            for target, binding in step.input_bindings.items():
+                source_step = steps_by_id.get(binding["source_step_id"])
+                if source_step is None:
+                    return False
+                source_result = self._verified_result_from_action_record(state, source_step)
+                if (
+                    source_result is None
+                    or not isinstance(source_result.output, dict)
+                    or binding["output_key"] not in source_result.output
+                ):
+                    return False
+                previous_results[source_step.id] = source_result
+                verified_result_ids.add(source_step.id)
+                resolved_inputs[target] = source_result.output[binding["output_key"]]
+            execution_context = ExecutionContext(
+                task_id=state.task_id,
+                previous_results=previous_results,
+                verified_result_ids=verified_result_ids,
+                metadata={"plan_version": result.plan_version},
+            )
+            expected = coordinator.prepare_work_order(
+                step,
+                task_id=state.task_id,
+                plan_version=result.plan_version,
+                tool=tool,
+                resolved_inputs=resolved_inputs,
+                execution_context=execution_context,
+            )
+            return expected.provenance() == provenance
+        except Exception:
+            # A missing or drifted server policy, tool contract, or dependency is never trusted.
+            return False
+
+    def _specialist_synthesis(
+        self,
+        state: TaskState,
+        plan: TaskPlan,
+    ) -> dict[str, Any] | None:
+        raw_results = state.context.get("specialist_results", {})
+        raw_work_orders = state.context.get("specialist_work_orders", {})
+        if not isinstance(raw_results, dict) or not raw_results:
+            return None
+        steps_by_id = {step.id: step for step in plan.steps}
+        blocked = {
+            "task_id": state.task_id,
+            "status": "BLOCKED",
+            "items": [],
+            "conflicts": [],
+            "reason": "specialist_policy_or_input_provenance_drift",
+        }
+        if self.specialist_coordinator is None or self.specialist_registry is None:
+            for raw_result in raw_results.values():
+                result = SpecialistResult.from_dict(raw_result)
+                step = steps_by_id.get(result.source_step_id)
+                if result.status == "VERIFIED" and step is not None and step.specialist_assignment:
+                    return blocked
+            return None
+        backed: list[tuple[SpecialistResult, dict[str, Any]]] = []
+        for work_order_id, raw_result in raw_results.items():
+            result = SpecialistResult.from_dict(raw_result)
+            if result.status != "VERIFIED" or result.verified is not True:
+                continue
+            step = steps_by_id.get(result.source_step_id)
+            provenance = raw_work_orders.get(work_order_id) if isinstance(raw_work_orders, dict) else None
+            if step is None or not step.specialist_assignment or not isinstance(provenance, dict):
+                continue
+            try:
+                provenance = SpecialistCoordinator.validate_work_order_for_step(
+                    provenance,
+                    task_id=state.task_id,
+                    plan_version=result.plan_version,
+                    step=step,
+                )
+            except SpecialistCoordinationError:
+                continue
+            if not self._specialist_work_order_matches_current_context(
+                state,
+                step,
+                result,
+                provenance,
+                steps_by_id,
+            ):
+                return blocked
+            step_result = self._verified_result_from_action_record(state, step)
+            action_record = state.action_records.get(state.action_key_for_step(step))
+            verification = action_record.get("verification") if isinstance(action_record, dict) else None
+            if (
+                step_result is None
+                or not SpecialistCoordinator.result_matches_verified_record(
+                    result,
+                    provenance,
+                    step_result=step_result,
+                    verification=verification,
+                )
+            ):
+                continue
+            backed.append((result, step_result.output))
+        return SpecialistCoordinator.synthesize_verified(backed, task_id=state.task_id)
+
+    def _replan_on_specialist_conflict(
+        self,
+        state: TaskState,
+        current_plan: TaskPlan,
+        step: PlanStep,
+        synthesis: dict[str, Any],
+        experience: ExperienceRecord,
+    ) -> tuple[TaskPlan | None, dict[str, StepResult] | None, str | None]:
+        conflicts = synthesis.get("conflicts")
+        if synthesis.get("status") != "CONFLICT" or not isinstance(conflicts, list) or not conflicts:
+            return current_plan, None, None
+        diagnosis = FailureDiagnosis(
+            "VERIFICATION_FAILED",
+            "Independently verified specialist claims conflict",
+            evidence=[{"type": "specialist_claim_conflict", "value": conflicts}],
+            failed_step=step.id,
+            tool_name=step.tool,
+            recoverable=True,
+            suggested_recovery="REPLAN",
+            details={"code": "specialist_result_conflict", "conflicts": conflicts},
+        )
+        decision = self.recovery.choose(
+            step,
+            diagnosis,
+            available_tools=self.tools.describe(),
+            allow_replan=True,
+        )
+        if decision.strategy == "ABORT":
+            return None, None, decision.reason
+        attempt = self.recovery.record(
+            decision,
+            diagnosis,
+            tool_name=step.tool,
+            inputs=step.input,
+        )
+        try:
+            next_plan = self._apply_decision(current_plan, step, decision, diagnosis, experience)
+            verified_results = self._persist_replanned_plan_preserving_verified_actions(
+                state,
+                current_plan,
+                next_plan,
+            )
+        except ReplanError as exc:
+            self.recovery.update_last(outcome="BLOCKED", verification_status="VERIFIED")
+            return None, None, str(exc)
+        state.recovery_state = {
+            "decision": decision.to_dict(),
+            "diagnosis": diagnosis.to_dict(),
+            "round": attempt.attempt_number,
+        }
+        state.checkpoint("AFTER_RECOVERY", status="READY", phase="AFTER_RECOVERY", step_id=step.id, successful=True)
+        self._save_checkpoint(state, "AFTER_RECOVERY")
+        self.recovery.update_last(outcome="replanned", verification_status="VERIFIED")
+        return next_plan, verified_results, None
+
     def _block_conversation_replan(self, state: TaskState, reason: str) -> dict[str, Any]:
         result = {
             "task_id": state.task_id,
@@ -432,7 +645,14 @@ class Orchestrator:
                 f"- {content}" for content in followups
             )
         try:
-            proposed = self._create_plan(effective_goal, prior, retrieved, reflection_context, learned_context)
+            proposed = self._create_plan(
+                effective_goal,
+                prior,
+                retrieved,
+                reflection_context,
+                learned_context,
+                task_id=state.task_id,
+            )
             if not proposed.steps:
                 raise ValueError("conversation_plan_empty")
             previous_completed: list[tuple[PlanStep, str, dict[str, Any]]] = []
@@ -870,7 +1090,11 @@ class Orchestrator:
                 latest_outcomes = self._verified_outcomes_for_plan(state, current_plan)
                 terminal_status = "COMPLETED"
                 break
-            execution_metadata = {"attempt": rounds, "goal": current_plan.goal}
+            execution_metadata = {
+                "attempt": rounds,
+                "goal": current_plan.goal,
+                "plan_version": state.plan_version,
+            }
             provenance = state.context.get("program_analysis_provenance")
             if state.context.get("task_kind") == "bug_bounty" and isinstance(provenance, dict):
                 execution_metadata["program_analysis_provenance"] = provenance
@@ -935,6 +1159,24 @@ class Orchestrator:
                     metadata={"tool_name": step.tool, "round": rounds},
                 )
                 step_result = self._execute_one(step, step_context)
+                work_order_provenance = None
+                try:
+                    work_order_provenance = self._persist_specialist_work_order(state, step, step_result)
+                except SpecialistCoordinationError as exc:
+                    self.store.save_event(
+                        task_id,
+                        "specialist_work_order_rejected",
+                        {"reason": str(exc)},
+                        step_id=step.id,
+                    )
+                    step_result = StepResult.blocked(
+                        step.id,
+                        step.tool,
+                        "specialist_work_order_invalid",
+                        "The specialist result lacked trusted same-task provenance",
+                        details={"reason": str(exc)},
+                        metadata={"task_id": task_id, "tool_name": step.tool},
+                    )
                 self._bind_step_result_provenance(step_result, state)
                 all_step_results.append(step_result)
                 state.mark_action(
@@ -967,6 +1209,19 @@ class Orchestrator:
                 state.checkpoint("AFTER_OBSERVATION", status="VERIFYING", phase="AFTER_OBSERVATION", step_id=step.id)
                 self._save_checkpoint(state, "AFTER_OBSERVATION")
                 state.verification_results[key] = outcome.verification
+                if work_order_provenance is not None:
+                    if self.specialist_coordinator is None:
+                        raise StateIntegrityError("specialist_coordinator_unavailable")
+                    specialist_result = SpecialistCoordinator.result_from_execution(
+                        work_order_provenance,
+                        step_result=step_result,
+                        verification=outcome.verification,
+                        expected_task_id=task_id,
+                        expected_plan_version=state.plan_version,
+                        expected_step_id=step.id,
+                        expected_assignment=step.specialist_assignment,
+                    )
+                    self.specialist_coordinator.record_result(state, specialist_result)
                 if diagnosis:
                     diagnoses.append(diagnosis.to_dict())
                 if step_result.error:
@@ -1021,6 +1276,33 @@ class Orchestrator:
                     if conversation_updated:
                         security_decisions = updated_decisions
                         latest_outcomes = self._verified_outcomes_for_plan(state, current_plan)
+                        recovery_requested = True
+                        break
+                    synthesis = self._specialist_synthesis(state, current_plan)
+                    if synthesis is not None and synthesis.get("status") == "BLOCKED":
+                        return self._resume_blocked(state, "persisted_specialist_policy_or_input_provenance_drift")
+                    if synthesis is not None:
+                        state.context["specialist_synthesis"] = synthesis
+                        state.touch()
+                        self._save_checkpoint(state, "AFTER_VERIFICATION")
+                    if synthesis is not None and synthesis.get("status") == "CONFLICT":
+                        try:
+                            replanned, preserved_results, conflict_error = self._replan_on_specialist_conflict(
+                                state,
+                                current_plan,
+                                step,
+                                synthesis,
+                                experience,
+                            )
+                        except ReplanError as exc:
+                            replanned, preserved_results, conflict_error = None, None, str(exc)
+                        if conflict_error is not None or replanned is None:
+                            terminal_status = "FAILED"
+                            errors.append(conflict_error or "specialist_conflict_replan_failed")
+                            break
+                        current_plan = replanned
+                        verified_previous_results = preserved_results or {}
+                        terminal_status = "FAILED"
                         recovery_requested = True
                         break
                     continue
@@ -1182,6 +1464,12 @@ class Orchestrator:
             "experience": experience.to_dict(),
             "final_status": terminal_status,
         }
+        specialist_synthesis = self._specialist_synthesis(state, current_plan)
+        if specialist_synthesis is not None and specialist_synthesis.get("status") == "BLOCKED":
+            return self._resume_blocked(state, "persisted_specialist_policy_or_input_provenance_drift")
+        if specialist_synthesis is not None and specialist_synthesis.get("items"):
+            state.context["specialist_synthesis"] = specialist_synthesis
+            result["specialist_synthesis"] = specialist_synthesis
         state.result = result
         state.context["attempts"] = rounds
         if terminal_status == "COMPLETED":
@@ -1458,6 +1746,15 @@ class Orchestrator:
                     metadata={"terminal_state": True},
                 )
             return state.result or self._resume_failure(task_id, "terminal_state_missing_result", state=state)
+
+        if state.context.get("specialist_results"):
+            try:
+                persisted_plan = self._plan_from_payload(state.plan)
+                persisted_synthesis = self._specialist_synthesis(state, persisted_plan)
+            except (StateIntegrityError, SpecialistCoordinationError, ValueError, TypeError, KeyError):
+                return self._resume_blocked(state, "persisted_specialist_policy_or_input_provenance_drift")
+            if persisted_synthesis is not None and persisted_synthesis.get("status") == "BLOCKED":
+                return self._resume_blocked(state, "persisted_specialist_policy_or_input_provenance_drift")
 
         def valid_persisted_action_record(key: str, record: Any) -> bool:
             if not isinstance(key, str) or not isinstance(record, dict):
@@ -1879,7 +2176,11 @@ class Orchestrator:
                 task_id=state.task_id,
                 previous_results={},
                 approved_permissions=set(self.approved_permissions),
-                metadata={"attempt": rounds, "goal": current_plan.goal},
+                metadata={
+                    "attempt": rounds,
+                    "goal": current_plan.goal,
+                    "plan_version": state.plan_version,
+                },
                 security_controller=self.security,
                 approval_ids=state.approval_ids,
                 observability=self.observability,
@@ -1894,10 +2195,15 @@ class Orchestrator:
                     step_id=step.id,
                     metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
                 )
+                work_order_provenance = None
                 if record.get("status") == "OBSERVING" and isinstance(record.get("output"), dict):
                     step_result = self._step_result_from_dict(record["output"])
                     if step_result is None:
                         return self._resume_blocked(state, "persisted_execution_result_corrupted")
+                    try:
+                        work_order_provenance = self._persist_specialist_work_order(state, step, step_result)
+                    except SpecialistCoordinationError:
+                        return self._resume_blocked(state, "persisted_specialist_work_order_untrusted")
                 else:
                     step_context = self._isolated_execution_context(context, verified_previous_results)
                     approval_block = self._preflight_bound_step(
@@ -1947,6 +2253,23 @@ class Orchestrator:
                         metadata={"tool_name": step.tool, "round": rounds, "resumed": True},
                     )
                     step_result = self._execute_one(step, step_context)
+                    try:
+                        work_order_provenance = self._persist_specialist_work_order(state, step, step_result)
+                    except SpecialistCoordinationError as exc:
+                        self.store.save_event(
+                            state.task_id,
+                            "specialist_work_order_rejected",
+                            {"reason": str(exc), "resumed": True},
+                            step_id=step.id,
+                        )
+                        step_result = StepResult.blocked(
+                            step.id,
+                            step.tool,
+                            "specialist_work_order_invalid",
+                            "The specialist result lacked trusted same-task provenance",
+                            details={"reason": str(exc)},
+                            metadata={"task_id": state.task_id, "tool_name": step.tool},
+                        )
                     self._bind_step_result_provenance(step_result, state)
                     state.mark_action(
                         key,
@@ -1973,6 +2296,22 @@ class Orchestrator:
                 state.observations[key] = outcome.observation.to_dict()
                 self._save_checkpoint_after(state, "AFTER_OBSERVATION", step.id, status="VERIFYING")
                 state.verification_results[key] = outcome.verification
+                if work_order_provenance is not None:
+                    if self.specialist_coordinator is None:
+                        return self._resume_blocked(state, "specialist_coordinator_unavailable")
+                    try:
+                        specialist_result = SpecialistCoordinator.result_from_execution(
+                            work_order_provenance,
+                            step_result=step_result,
+                            verification=outcome.verification,
+                            expected_task_id=state.task_id,
+                            expected_plan_version=state.plan_version,
+                            expected_step_id=step.id,
+                            expected_assignment=step.specialist_assignment,
+                        )
+                        self.specialist_coordinator.record_result(state, specialist_result)
+                    except SpecialistCoordinationError:
+                        return self._resume_blocked(state, "specialist_result_provenance_untrusted")
                 if diagnosis:
                     diagnoses.append(diagnosis.to_dict())
                 if step_result.error:
@@ -2033,6 +2372,33 @@ class Orchestrator:
                         outcome_by_step = {item.step_id: item for item in all_outcomes}
                         outcome_by_step.update(latest)
                         all_outcomes = list(outcome_by_step.values())
+                        recovery_requested = True
+                        break
+                    synthesis = self._specialist_synthesis(state, current_plan)
+                    if synthesis is not None and synthesis.get("status") == "BLOCKED":
+                        return self._resume_blocked(state, "persisted_specialist_policy_or_input_provenance_drift")
+                    if synthesis is not None:
+                        state.context["specialist_synthesis"] = synthesis
+                        state.touch()
+                        self._save_checkpoint(state, "AFTER_VERIFICATION")
+                    if synthesis is not None and synthesis.get("status") == "CONFLICT":
+                        try:
+                            replanned, preserved_results, conflict_error = self._replan_on_specialist_conflict(
+                                state,
+                                current_plan,
+                                step,
+                                synthesis,
+                                experience,
+                            )
+                        except ReplanError as exc:
+                            replanned, preserved_results, conflict_error = None, None, str(exc)
+                        if conflict_error is not None or replanned is None:
+                            terminal_status = "FAILED"
+                            errors.append(conflict_error or "specialist_conflict_replan_failed")
+                            break
+                        current_plan = replanned
+                        verified_previous_results = preserved_results or {}
+                        terminal_status = "FAILED"
                         recovery_requested = True
                         break
                     continue
@@ -2163,6 +2529,12 @@ class Orchestrator:
             "experience": experience.to_dict(),
             "final_status": terminal_status,
         }
+        specialist_synthesis = self._specialist_synthesis(state, current_plan)
+        if specialist_synthesis is not None and specialist_synthesis.get("status") == "BLOCKED":
+            return self._resume_blocked(state, "persisted_specialist_policy_or_input_provenance_drift")
+        if specialist_synthesis is not None and specialist_synthesis.get("items"):
+            state.context["specialist_synthesis"] = specialist_synthesis
+            result["specialist_synthesis"] = specialist_synthesis
         state.result = result
         state.context["attempts"] = rounds
         if terminal_status == "COMPLETED":
@@ -2983,6 +3355,7 @@ class Orchestrator:
             executed_history=[action.to_dict() for action in experience.actions],
             constraints={"max_steps": self.planner.max_steps},
             permissions=permissions,
+            task_id=experience.task_id,
             retrieved_experiences=recovery_retrieved,
             reflection_insights=recovery_reflections,
             learned_strategies=recovery_learning,
@@ -2997,6 +3370,7 @@ class Orchestrator:
                 inputs=step.input,
                 tools=self.tools,
                 permissions=permissions,
+                task_id=experience.task_id,
             )
         elif decision.strategy in {"RETRY", "CHANGE_PARAMETERS", "RETRY_WITH_MODIFIED_INPUT"}:
             inputs = decision.modified_input or step.input
@@ -3007,6 +3381,7 @@ class Orchestrator:
                 inputs=inputs,
                 tools=self.tools,
                 permissions=permissions,
+                task_id=experience.task_id,
             )
         elif decision.strategy == "REPLAN":
             next_plan = self.replanner.replan(replan_request, self.tools, replacement_tool=decision.replacement_tool)

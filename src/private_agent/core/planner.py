@@ -276,6 +276,7 @@ class Planner:
             permissions=permissions,
             planning_context=planning_context,
             phase="initial",
+            task_id=task_id,
         )
 
     def create_from_context(
@@ -287,6 +288,7 @@ class Planner:
         planning_context: dict[str, Any],
         phase: str = "initial",
         fallback_goal_spec: GoalSpec | None = None,
+        task_id: str = "",
     ) -> TaskPlan:
         """Generate one structured proposal, then validate it against live server registries."""
         if self.intelligence_engine is None:
@@ -324,7 +326,7 @@ class Planner:
                 planning_mode=PROVIDER_VALIDATED,
                 goal_spec=proposal.goal_spec,
             )
-        plan = self.validate(proposal.plan, goal=goal, tools=tools, permissions=permissions)
+        plan = self.validate(proposal.plan, goal=goal, tools=tools, permissions=permissions, task_id=task_id)
         plan.goal_spec = proposal.goal_spec
         plan.planning_mode = PROVIDER_VALIDATED
         return plan
@@ -447,6 +449,7 @@ class Planner:
         goal: str,
         tools: ToolRegistry,
         permissions: dict[str, str] | None = None,
+        task_id: str = "",
     ) -> TaskPlan:
         errors: list[str] = []
         unavailable_tools: list[str] = []
@@ -617,6 +620,7 @@ class Planner:
                             objective=objective,
                             inputs=step_input,
                             input_bindings=normalized_bindings,
+                            task_id=task_id,
                         )
                     except Exception as exc:
                         reason = str(exc) if isinstance(exc, ValueError) else "specialist_assignment_invalid"

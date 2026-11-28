@@ -185,6 +185,9 @@ class GenericExecutor:
         self.security_controller = security_controller
         self.lease_store = lease_store
         self.specialist_registry = specialist_registry
+        self.specialist_coordinator = (
+            SpecialistCoordinator(specialist_registry) if specialist_registry is not None else None
+        )
 
     def execute_plan(
         self,
@@ -252,6 +255,7 @@ class GenericExecutor:
         execution_context = context or ExecutionContext(security_controller=self.security_controller)
         started = monotonic()
         base_metadata = {"task_id": execution_context.task_id, "tool_name": step.tool}
+        specialist_work_order = None
         observer = execution_context.observability
         if observer is not None:
             observer.emit(
@@ -279,6 +283,11 @@ class GenericExecutor:
                         "error_category": result.error.code if result.error else "",
                     },
                 )
+            if specialist_work_order is not None:
+                result.metadata = {
+                    **(result.metadata if isinstance(result.metadata, dict) else {}),
+                    "specialist_work_order_provenance": specialist_work_order.provenance(),
+                }
             return result
 
         trusted_controller = self.security_controller
@@ -327,6 +336,7 @@ class GenericExecutor:
                 objective=step.objective,
                 inputs=step.input,
                 input_bindings=step.input_bindings,
+                task_id=execution_context.task_id,
             )
         ):
             return finish(StepResult.blocked(
@@ -420,8 +430,10 @@ class GenericExecutor:
         action_kwargs: dict[str, Any] = {
             "goal": str(execution_context.metadata.get("goal", "")),
         }
+        specialist_work_order = None
+        tool_execution_context: Any = execution_context
         if step.specialist_assignment:
-            if self.specialist_registry is None:
+            if self.specialist_registry is None or self.specialist_coordinator is None:
                 return finish(StepResult.blocked(
                     step.id,
                     step.tool,
@@ -437,6 +449,7 @@ class GenericExecutor:
                 inputs=step.input,
                 input_bindings=step.input_bindings,
                 resolved_inputs=resolved_input,
+                task_id=execution_context.task_id,
             )
             if execution_binding is None:
                 return finish(StepResult.blocked(
@@ -448,6 +461,45 @@ class GenericExecutor:
                     metadata=self._timed(base_metadata, started),
                 ))
             action_kwargs["specialist_binding"] = execution_binding
+            try:
+                plan_version = execution_context.metadata.get("plan_version")
+                specialist_work_order = self.specialist_coordinator.prepare_work_order(
+                    step,
+                    task_id=execution_context.task_id,
+                    plan_version=plan_version,
+                    tool=tool,
+                    resolved_inputs=resolved_input,
+                    execution_context=execution_context,
+                )
+                tool_execution_context = SpecialistToolExecutionContext(
+                    task_id=execution_context.task_id,
+                    work_order=specialist_work_order.tool_payload(),
+                )
+                provenance_records = execution_context.metadata.setdefault(
+                    "specialist_work_order_provenance", {}
+                )
+                if not isinstance(provenance_records, dict):
+                    raise SpecialistCoordinationError("specialist_work_order_store_invalid")
+                provenance_records[step.id] = specialist_work_order.provenance()
+                if self.lease_store is not None and execution_context.task_id:
+                    try:
+                        self.lease_store.save_event(
+                            execution_context.task_id,
+                            "specialist_work_order_prepared",
+                            specialist_work_order.provenance(),
+                            step_id=step.id,
+                        )
+                    except Exception as exc:
+                        raise SpecialistCoordinationError("specialist_work_order_persistence_failed") from exc
+            except (SpecialistCoordinationError, TypeError, ValueError):
+                return finish(StepResult.blocked(
+                    step.id,
+                    step.tool,
+                    "specialist_work_order_invalid",
+                    "A bounded same-task specialist work order could not be validated",
+                    details={"step_id": step.id},
+                    metadata=self._timed(base_metadata, started),
+                ))
         security_action = trusted_controller.action_for_tool(
             execution_context.task_id,
             step.id,
@@ -546,7 +598,7 @@ class GenericExecutor:
                     authorization=security_decision,
                     operation=operation,
                 )
-            return tool.execute(resolved_input, execution_context)
+            return tool.execute(resolved_input, tool_execution_context)
 
         operation_binding = trusted_controller._bind_operation(
             security_action,
@@ -744,3 +796,8 @@ class GenericExecutor:
     @staticmethod
     def _timed(metadata: dict[str, Any], started: float) -> dict[str, Any]:
         return {**metadata, "duration_ms": round((monotonic() - started) * 1000, 3)}
+from private_agent.core.specialist_coordination import (
+    SpecialistCoordinator,
+    SpecialistCoordinationError,
+    SpecialistToolExecutionContext,
+)

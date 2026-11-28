@@ -15,6 +15,7 @@ from private_agent.core.planning_provenance import (
 )
 
 from private_agent.core.experience import sanitize_value
+from private_agent.core.specialist_coordination import SpecialistCoordinationError, SpecialistCoordinator
 
 
 STATE_VERSION = 2
@@ -548,6 +549,14 @@ class TaskState:
             raise StateIntegrityError("task_clarification_request_missing")
         if not self.task_id or not self.goal:
             raise StateIntegrityError("task_identity_required")
+        try:
+            SpecialistCoordinator.validate_state_results(
+                self.context.get("specialist_results"),
+                task_id=self.task_id,
+                work_orders=self.context.get("specialist_work_orders"),
+            )
+        except SpecialistCoordinationError as exc:
+            raise StateIntegrityError(str(exc)) from exc
         if not isinstance(self.plan, dict):
             raise StateIntegrityError("plan_must_be_object")
         if _contains_redacted(self.plan):
