@@ -8,9 +8,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from private_agent.api import AgentAPIService, create_app
+from private_agent.api import APIError, AgentAPIService, AuthenticatedPrincipal, create_app
+from private_agent.auth import ROLE_OPERATOR
 from private_agent.core.orchestrator import Orchestrator, TaskInterrupted
 from private_agent.core.planner import PlanStep, TaskPlan
+from private_agent.core.specialists import SpecialistProfile, SpecialistRegistry
+from private_agent.core.task_state import TaskState, action_fingerprint, plan_fingerprint
 from private_agent.observability import ObservabilityMonitor
 from private_agent.bugbounty.remote_worker import RemoteWorkerProtocol
 from private_agent.security import SecurityController
@@ -288,6 +291,183 @@ def test_task_get_is_safe_and_unknown_task_is_404(tmp_path: Path) -> None:
     unknown = client.get("/api/v1/tasks/not-a-real-task", headers=auth_headers())
     assert unknown.status_code == 404
     assert unknown.json()["error_code"] == "task_not_found"
+    store.close()
+
+
+def _set_specialist_plan(
+    service: AgentAPIService,
+    store: Store,
+    task_id: str,
+    tool: APITestTool,
+    registry: SpecialistRegistry,
+    *,
+    plan_version: int,
+    specialist_id: str = "local_repository_analyst",
+    step_id: str = "read-current",
+    raw_value: str = "synthetic-secret-input",
+) -> dict:
+    service.orchestrator.specialist_registry = registry
+    queue = store.task_queue_record(task_id)
+    if queue is not None and queue.get("queue_status") != "LEASED":
+        claim = store.claim_next_task(f"specialist-test-{task_id}", lease_ttl_seconds=600)
+        assert claim is not None and claim["task_id"] == task_id
+        queue = store.task_queue_record(task_id)
+    assert queue is not None and queue.get("queue_status") == "LEASED"
+    with store.lease_context(task_id, str(queue["lease_id"]), str(queue["worker_id"])):
+        state = TaskState.from_dict(store.get_task_state(task_id))
+        objective = "Read a bounded synthetic file"
+        inputs = {"value": raw_value}
+        assignment = registry.create_assignment(
+            specialist_id,
+            tool=tool,
+            objective=objective,
+            inputs=inputs,
+            input_bindings={},
+        )
+        state.set_plan(
+            {
+                "goal": state.goal,
+                "rationale": "Synthetic specialist transparency test",
+                "planning_mode": "UNKNOWN",
+                "steps": [{
+                    "id": step_id,
+                    "objective": objective,
+                    "tool": tool.name,
+                    "input": inputs,
+                    "input_bindings": {},
+                    "specialist_assignment": assignment,
+                }],
+            },
+            version=plan_version,
+        )
+        store.save_task_state(state, "SPECIALIST_TRANSPARENCY_TEST")
+    return assignment
+
+
+def _specialist_test_registry(tool: APITestTool, *, second_profile: bool = False) -> SpecialistRegistry:
+    registry = SpecialistRegistry()
+    for specialist_id in (["local_repository_analyst", "repository_reviewer"] if second_profile else ["local_repository_analyst"]):
+        registry.register(SpecialistProfile(
+            specialist_id=specialist_id,
+            version=3,
+            tool_names=frozenset({tool.name}),
+            granted_capabilities=frozenset({"READ_WORKSPACE"}),
+        ))
+    return registry
+
+
+def test_task_specialist_snapshot_is_verified_current_plan_and_masks_inputs_and_digests(tmp_path: Path) -> None:
+    tool = APITestTool("read_repository_file", capabilities=["READ_WORKSPACE"])
+    service, store, _ = make_service(tmp_path, tool)
+    client = client_for(service)
+    _, task_id = create_low_task(client, key="specialist-snapshot")
+    registry = _specialist_test_registry(tool)
+    _set_specialist_plan(service, store, task_id, tool, registry, plan_version=4)
+
+    response = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers())
+    assert response.status_code == 200, response.text
+    snapshot = response.json()["specialist_assignment_snapshot"]
+    assert snapshot == {
+        "task_id": task_id,
+        "plan_version": 4,
+        "status": "AVAILABLE",
+        "provenance": "SERVER_CURRENT_PLAN",
+        "reason": None,
+        "assignments": [{
+            "step_id": "read-current",
+            "specialist_id": "local_repository_analyst",
+            "profile_version": 3,
+            "tool_name": "read_repository_file",
+            "capabilities": ["READ_WORKSPACE"],
+            "status": "ASSIGNED",
+            "reason": None,
+        }],
+    }
+    assert "synthetic-secret-input" not in response.text
+    assert "objective_digest" not in response.text
+    assert "input_digest" not in response.text
+    assert "capability_digest" not in response.text
+    assert "tool_contract_digest" not in response.text
+    assert "input_bindings_digest" not in response.text
+
+    state = TaskState.from_dict(store.get_task_state(task_id))
+    step = state.plan["steps"][0]
+    action_id = action_fingerprint(
+        plan_version=state.plan_version,
+        step_id=step["id"],
+        tool=step["tool"],
+        inputs=step["input"],
+        specialist_assignment=step["specialist_assignment"],
+    )
+    state.action_records[action_id] = {"status": "FUTURE_UNRECOGNIZED_STATUS"}
+    unknown_status = service.task_state_response(state).specialist_assignment_snapshot
+    assert unknown_status.assignments[0].status == "UNKNOWN"
+    store.close()
+
+
+def test_task_specialist_snapshot_hides_untrusted_assignment_and_unauthorized_capability(tmp_path: Path) -> None:
+    tool = APITestTool("read_repository_file", capabilities=["READ_WORKSPACE"])
+    service, store, _ = make_service(tmp_path, tool)
+    client = client_for(service)
+    _, task_id = create_low_task(client, key="specialist-untrusted")
+    registry = _specialist_test_registry(tool)
+    assignment = _set_specialist_plan(service, store, task_id, tool, registry, plan_version=1)
+    assignment["effective_capabilities"] = ["READ_WORKSPACE", "SYSTEM_COMMAND"]
+    state = TaskState.from_dict(store.get_task_state(task_id))
+    state.plan["steps"][0]["specialist_assignment"] = assignment
+    state.plan_fingerprint = plan_fingerprint(state.plan)
+    state.touch()
+    response = service.task_state_response(state)
+    snapshot = response.specialist_assignment_snapshot
+    assert snapshot.status == "UNAVAILABLE"
+    assert snapshot.reason == "assignment_not_verifiable"
+    assert snapshot.assignments == []
+    assert "SYSTEM_COMMAND" not in response.model_dump_json()
+    assert "synthetic-secret-input" not in response.model_dump_json()
+    store.close()
+
+
+def test_task_specialist_snapshot_tracks_replanned_assignment_and_is_owner_scoped(tmp_path: Path) -> None:
+    tool = APITestTool("read_repository_file", capabilities=["READ_WORKSPACE"])
+    service, store, _ = make_service(tmp_path, tool)
+    owner = service.auth_manager.initialize_owner(
+        service.auth_manager.owner_email, "owner-password-for-specialist-tests-123"
+    )
+    operator = service.auth_manager.create_user(
+        "specialist-owner@example.test", "operator-password-for-specialist-tests-123",
+        ROLE_OPERATOR, actor_user_id=owner.user_id,
+    )
+    other_operator = service.auth_manager.create_user(
+        "specialist-other@example.test", "other-password-for-specialist-tests-123",
+        ROLE_OPERATOR, actor_user_id=owner.user_id,
+    )
+    created = store.create_queued_task("owned specialist task", owner_user_id=operator.user_id)
+    task_id = str(created["task_id"])
+    registry = _specialist_test_registry(tool, second_profile=True)
+    _set_specialist_plan(service, store, task_id, tool, registry, plan_version=1, step_id="old-step")
+    first = service.get_task(task_id, principal=AuthenticatedPrincipal(
+        subject=operator.user_id, user_id=operator.user_id, email=operator.email, role=ROLE_OPERATOR,
+    ))
+    assert first.specialist_assignment_snapshot.plan_version == 1
+    assert first.specialist_assignment_snapshot.assignments[0].specialist_id == "local_repository_analyst"
+
+    _set_specialist_plan(
+        service, store, task_id, tool, registry, plan_version=2,
+        specialist_id="repository_reviewer", step_id="new-step", raw_value="new synthetic input",
+    )
+    current = service.get_task(task_id, principal=AuthenticatedPrincipal(
+        subject=operator.user_id, user_id=operator.user_id, email=operator.email, role=ROLE_OPERATOR,
+    ))
+    snapshot = current.specialist_assignment_snapshot
+    assert snapshot.task_id == task_id
+    assert snapshot.plan_version == current.plan_version == 2
+    assert [(item.step_id, item.specialist_id) for item in snapshot.assignments] == [("new-step", "repository_reviewer")]
+    with pytest.raises(APIError) as denied:
+        service.get_task(task_id, principal=AuthenticatedPrincipal(
+            subject=other_operator.user_id, user_id=other_operator.user_id,
+            email=other_operator.email, role=ROLE_OPERATOR,
+        ))
+    assert denied.value.status_code == 404
     store.close()
 
 
