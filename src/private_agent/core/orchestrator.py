@@ -28,12 +28,14 @@ from private_agent.core.replanning import ReplanError, ReplanRequest, Replanner
 from private_agent.core.reflection import ReflectionEngine, ReflectionMemory, SQLiteReflectionMemory
 from private_agent.core.specialists import SpecialistRegistry
 from private_agent.core.task_state import (
+    MAX_CLARIFICATION_REQUESTS,
     MAX_TASK_GOAL_LENGTH,
     StateIntegrityError,
     TaskState,
     TaskStopReasonCode,
     TERMINAL_STATUSES,
     action_fingerprint,
+    utc_now,
 )
 from private_agent.core.verification import VerificationResult, VerifierRegistry
 from private_agent.observability import ObservabilityMonitor
@@ -599,6 +601,8 @@ class Orchestrator:
         task_id: str | None = None,
         approval_ids: dict[str, str] | None = None,
         task_context: dict[str, Any] | None = None,
+        clarification_answers: list[dict[str, Any]] | None = None,
+        clarification_message_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         if task_id:
             existing_state = self.store.get_task_state(task_id)
@@ -613,6 +617,8 @@ class Orchestrator:
             raise ValueError("goal_too_long")
         task_id = task_id or str(uuid.uuid4())
         approval_ids = approval_ids or {}
+        clarification_answers = list(clarification_answers or [])
+        clarification_message_ids = [str(value) for value in (clarification_message_ids or [])]
         self.recovery.attempts.clear()
         state = TaskState.create(task_id, goal)
         if task_context is not None:
@@ -623,6 +629,12 @@ class Orchestrator:
         self._checkpoint(state, "TASK_CREATED", phase="TASK_CREATED", successful=True)
         state.checkpoint("TASK_PLANNING", status="PLANNING", phase="PLANNING", successful=True)
         self._save_checkpoint(state, "TASK_PLANNING")
+        planning_clarification_answers = self._clarification_answer_context(
+            task_id,
+            state.context.get("clarifications", []),
+            clarification_answers,
+            clarification_message_ids,
+        )
         # Legacy knowledge rows are advisory and have no source-bound trust
         # record. Only signed, fresh typed claims may enter planning context.
         prior = self.store.search_knowledge_claims(goal, task_id=task_id)
@@ -707,7 +719,13 @@ class Orchestrator:
                 )
             else:
                 initial_plan = self._create_plan(
-                    goal, prior, retrieved_payload, reflection_context, learned_context, task_id=task_id,
+                    goal,
+                    prior,
+                    retrieved_payload,
+                    reflection_context,
+                    learned_context,
+                    task_id=task_id,
+                    clarification_answers=planning_clarification_answers,
                 )
         except CapabilityUnavailableError as exc:
             registered_names = [str(metadata["name"]) for metadata in self.tools.available()]
@@ -733,6 +751,12 @@ class Orchestrator:
                 metadata={"error_category": type(exc).__name__},
             )
             raise
+        if initial_plan.goal_spec is not None and initial_plan.goal_spec.clarification_required:
+            return self._request_clarification(
+                state,
+                initial_plan.goal_spec,
+                consume_message_ids=clarification_message_ids,
+            )
         self._emit_observability(
             "PLAN_CREATED",
             task_id=task_id,
@@ -752,7 +776,7 @@ class Orchestrator:
         )
         state.set_plan(self._plan_payload(initial_plan), version=1)
         state.checkpoint("PLAN_CREATED", status="READY", phase="PLAN_CREATED", successful=True)
-        self._save_checkpoint(state, "PLAN_CREATED")
+        self._save_checkpoint(state, "PLAN_CREATED", consume_message_ids=clarification_message_ids)
         security_decisions: list[PolicyDecision] = []
         if self.security is not None:
             security_decisions = self.security.preflight_plan(
@@ -2426,6 +2450,110 @@ class Orchestrator:
             policy_version=decision.policy_version,
         )
 
+    @staticmethod
+    def _clarification_answer_context(
+        task_id: str,
+        saved_clarifications: Any,
+        answers: list[dict[str, Any]],
+        message_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        if not answers and not message_ids:
+            return []
+        if not isinstance(saved_clarifications, list) or len(answers) != len(message_ids) or not answers:
+            raise StateIntegrityError("clarification_answer_set_invalid")
+        seen_messages: set[str] = set()
+        records = {
+            (str(item.get("request_id")), str(item.get("answer_message_id"))): item
+            for item in saved_clarifications
+            if isinstance(item, dict) and item.get("status") == "ANSWERED"
+        }
+        output: list[dict[str, Any]] = []
+        for answer in answers:
+            if not isinstance(answer, dict):
+                raise StateIntegrityError("clarification_answer_invalid")
+            message_id = answer.get("message_id")
+            clarification_id = answer.get("clarification_id")
+            content = answer.get("content")
+            if (
+                answer.get("task_id") != task_id
+                or not isinstance(message_id, str)
+                or message_id not in message_ids
+                or message_id in seen_messages
+                or not isinstance(clarification_id, str)
+                or not isinstance(content, str)
+                or not content.strip()
+                or len(content) > 4000
+            ):
+                raise StateIntegrityError("clarification_answer_binding_invalid")
+            record = records.get((clarification_id, message_id))
+            if record is None:
+                raise StateIntegrityError("clarification_answer_binding_invalid")
+            seen_messages.add(message_id)
+            output.append({
+                "clarification_id": clarification_id,
+                "question": str(record["question"]),
+                "missing_information": list(record["missing_information"]),
+                "answer": content.strip(),
+            })
+        if seen_messages != set(message_ids):
+            raise StateIntegrityError("clarification_answer_set_invalid")
+        return output
+
+    def _request_clarification(
+        self,
+        state: TaskState,
+        goal_spec: GoalSpec,
+        *,
+        consume_message_ids: list[str],
+    ) -> dict[str, Any]:
+        if not goal_spec.clarification_required or not goal_spec.missing_information:
+            raise StateIntegrityError("clarification_goal_spec_invalid")
+        if state.action_records or state.completed_actions or state.observations:
+            raise StateIntegrityError("clarification_after_execution_forbidden")
+        history = state.context.get("clarifications", [])
+        if not isinstance(history, list) or len(history) >= MAX_CLARIFICATION_REQUESTS:
+            raise StateIntegrityError("clarification_history_limit")
+        if any(isinstance(item, dict) and item.get("status") == "PENDING" for item in history):
+            raise StateIntegrityError("clarification_already_pending")
+        clarification = {
+            "request_id": str(uuid.uuid4()),
+            "question": goal_spec.clarification_question,
+            "missing_information": list(goal_spec.missing_information),
+            "status": "PENDING",
+            "answer_message_id": "",
+            "created_at": utc_now(),
+            "answered_at": "",
+        }
+        state.context["clarifications"] = [*history, clarification]
+        state.context["goal_spec"] = goal_spec.to_dict()
+        state.recovery_state = {"reason": "clarification_required"}
+        state.result = {
+            "task_id": state.task_id,
+            "goal": state.goal,
+            "goal_spec": goal_spec.to_dict(),
+            "final_status": "WAITING_CLARIFICATION",
+            "clarification": {
+                "clarification_id": clarification["request_id"],
+                "question": clarification["question"],
+                "missing_information": clarification["missing_information"],
+            },
+            "verification": {"verified": False, "status": "WAITING_CLARIFICATION"},
+        }
+        state.checkpoint(
+            "CLARIFICATION_REQUIRED",
+            status="WAITING_CLARIFICATION",
+            phase="WAITING_CLARIFICATION",
+            successful=False,
+        )
+        state.set_stop_reason(TaskStopReasonCode.CLARIFICATION_REQUIRED)
+        self._save_checkpoint(state, "CLARIFICATION_REQUIRED", consume_message_ids=consume_message_ids)
+        self.store.save_event(
+            state.task_id,
+            "clarification_requested",
+            {"clarification_id": clarification["request_id"], "missing_information_count": len(goal_spec.missing_information)},
+        )
+        return dict(state.result)
+
     def _create_plan(
         self,
         goal: str,
@@ -2434,6 +2562,7 @@ class Orchestrator:
         reflection_insights: list[dict[str, Any]],
         learned_strategies: list[dict[str, Any]],
         task_id: str = "",
+        clarification_answers: list[dict[str, Any]] | None = None,
     ) -> TaskPlan:
         parameters = inspect.signature(self.planner.create).parameters
         kwargs: dict[str, Any] = {}
@@ -2445,6 +2574,8 @@ class Orchestrator:
             kwargs["reflection_insights"] = reflection_insights
         if "learned_strategies" in parameters:
             kwargs["learned_strategies"] = learned_strategies
+        if "clarification_answers" in parameters:
+            kwargs["clarification_answers"] = list(clarification_answers or [])
         if "task_id" in parameters:
             kwargs["task_id"] = task_id
         return self.planner.create(goal, self.tools, prior, **kwargs)

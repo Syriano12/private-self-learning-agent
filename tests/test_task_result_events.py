@@ -690,3 +690,59 @@ def test_cross_type_writes_from_two_sqlite_connections_allocate_distinct_sequenc
     store.db.rollback()
     second.close()
     store.close()
+
+
+def test_schema_20_migration_preserves_result_events_and_reply_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 20)
+    service, store, _ = make_service(tmp_path, APITestTool("safe"))
+    owner_user_id, _ = _owner_and_principal(store, suffix="schema21")
+    task_id = _make_owned_task(store, owner_user_id, "preserve immutable event references")
+    assert BackgroundWorker(service.orchestrator, worker_id="schema20-worker").run_once()["status"] == "COMPLETED"
+    claim = store.claim_next_task_assistant_reply_event("schema20-reply-worker", task_id=task_id)
+    assert claim is not None
+    store.save_task_assistant_reply(
+        str(claim["event_id"]), worker_id="schema20-reply-worker", reply_code="VERIFIED_A",
+        content=render_reply_for_event(claim, "VERIFIED_A"), generation_mode="DETERMINISTIC_FALLBACK",
+    )
+    claimed_task_id = _make_owned_task(store, owner_user_id, "preserve an active event claim")
+    assert BackgroundWorker(service.orchestrator, worker_id="schema20-claim-worker").run_once()["status"] == "COMPLETED"
+    active_claim = store.claim_next_task_assistant_reply_event(
+        "schema20-open-claim-worker", task_id=claimed_task_id
+    )
+    assert active_claim is not None
+    path = store.path
+    before_events = (
+        store.task_result_events(task_id, owner_user_id=owner_user_id)
+        + store.task_result_events(claimed_task_id, owner_user_id=owner_user_id)
+    )
+    before_replies = store.task_assistant_replies(task_id, owner_user_id=owner_user_id)
+    before_claims = [dict(row) for row in store.db.execute(
+        "SELECT event_id, task_id, owner_user_id FROM task_assistant_reply_claims WHERE task_id = ?",
+        (claimed_task_id,),
+    ).fetchall()]
+    assert before_events and before_replies and before_claims
+    store.close()
+
+    monkeypatch.setattr(storage_module, "CURRENT_SCHEMA_VERSION", 21)
+    migrated = Store(path)
+    after_events = (
+        migrated.task_result_events(task_id, owner_user_id=owner_user_id)
+        + migrated.task_result_events(claimed_task_id, owner_user_id=owner_user_id)
+    )
+    assert after_events == before_events
+    assert migrated.task_assistant_replies(task_id, owner_user_id=owner_user_id) == before_replies
+    after_claims = [dict(row) for row in migrated.db.execute(
+        "SELECT event_id, task_id, owner_user_id FROM task_assistant_reply_claims WHERE task_id = ?",
+        (claimed_task_id,),
+    ).fetchall()]
+    assert after_claims == before_claims
+    assert migrated.db.execute("PRAGMA foreign_key_check").fetchall() == []
+    schema_sql = str(migrated.db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_result_events'"
+    ).fetchone()["sql"])
+    assert "'WAITING_CLARIFICATION'" in schema_sql
+    verification_constraint = schema_sql.split("verification_status TEXT NOT NULL CHECK", 1)[1].split(")", 1)[0]
+    assert "'WAITING_CLARIFICATION'" not in verification_constraint
+    migrated.close()

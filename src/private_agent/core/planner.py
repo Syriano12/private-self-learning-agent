@@ -160,6 +160,7 @@ class Planner:
         retrieved_experiences: list[dict[str, Any]] | None = None,
         reflection_insights: list[dict[str, Any]] | None = None,
         learned_strategies: list[dict[str, Any]] | None = None,
+        clarification_answers: list[dict[str, Any]] | None = None,
         task_id: str = "",
     ) -> TaskPlan:
         if not goal.strip():
@@ -267,6 +268,8 @@ class Planner:
             "learned_strategies": planning_advisories,
             "constraints": constraints or {"max_steps": self.max_steps},
         }
+        if clarification_answers:
+            planning_context["clarification_answers"] = clarification_answers
         return self.create_from_context(
             goal,
             tools,
@@ -311,6 +314,16 @@ class Planner:
             )
         except IntelligenceContractError as exc:
             raise PlanValidationError([str(exc)]) from exc
+        if proposal.goal_spec.clarification_required:
+            if proposal.plan.get("goal") != goal or not proposal.goal_spec.missing_information:
+                raise PlanValidationError(["clarification_proposal_invalid"])
+            return TaskPlan(
+                goal=goal,
+                steps=[],
+                rationale="Clarification is required before any executable plan can be accepted",
+                planning_mode=PROVIDER_VALIDATED,
+                goal_spec=proposal.goal_spec,
+            )
         plan = self.validate(proposal.plan, goal=goal, tools=tools, permissions=permissions)
         plan.goal_spec = proposal.goal_spec
         plan.planning_mode = PROVIDER_VALIDATED

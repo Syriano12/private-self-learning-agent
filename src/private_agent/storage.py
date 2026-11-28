@@ -328,7 +328,7 @@ class KnowledgeItem:
     dependencies: str = "[]"
 
 
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 21
 MAX_TASK_MESSAGE_LENGTH = MAX_TASK_GOAL_LENGTH
 MAX_TASK_CONVERSATION_MESSAGES = 32
 MAX_TASK_CONVERSATION_CHARS = 16_000
@@ -503,6 +503,30 @@ _MIGRATION_TABLE_COLUMNS: dict[int, dict[str, dict[str, str]]] = {
     18: {
         "task_result_events": {
             "planning_mode": "TEXT", "plan_version": "INTEGER",
+        },
+    },
+    19: {
+        "task_queue": {
+            "task_id": "TEXT", "queue_status": "TEXT", "attempt_count": "INTEGER", "max_attempts": "INTEGER",
+            "available_at": "TEXT", "lease_id": "TEXT", "worker_id": "TEXT", "lease_acquired_at": "TEXT",
+            "lease_expires_at": "TEXT", "last_started_at": "TEXT", "last_finished_at": "TEXT",
+            "last_error_code": "TEXT", "last_error_message": "TEXT", "created_at": "TEXT", "updated_at": "TEXT",
+        },
+        "task_messages": {"clarification_id": "TEXT"},
+    },
+    20: {
+        "task_messages": {"clarification_id": "TEXT", "message_kind": "TEXT"},
+    },
+    21: {
+        "task_result_events": {
+            "event_id": "TEXT", "task_id": "TEXT", "owner_user_id": "TEXT", "sequence": "INTEGER",
+            "role": "TEXT", "message_kind": "TEXT", "task_status": "TEXT", "verification_status": "TEXT",
+            "result_available": "INTEGER", "verified_action_count": "INTEGER", "failed_action_count": "INTEGER",
+            "blocked_action_count": "INTEGER", "pending_action_count": "INTEGER",
+            "approval_pending_count": "INTEGER", "approval_approved_count": "INTEGER",
+            "approval_denied_count": "INTEGER", "approval_expired_count": "INTEGER",
+            "approval_cancelled_count": "INTEGER", "result_digest": "TEXT", "transition_fingerprint": "TEXT",
+            "created_at": "TEXT", "planning_mode": "TEXT", "plan_version": "INTEGER",
         },
     },
 }
@@ -881,6 +905,23 @@ class Store:
             )
         if version == 18:
             return (("table", "task_result_events"),)
+        if version == 19:
+            return (
+                ("table", "task_queue"),
+                ("index", "idx_task_queue_claim"),
+                ("index", "idx_task_queue_lease"),
+                ("table", "task_messages"),
+            )
+        if version == 21:
+            return (
+                ("table", "task_result_events"),
+                ("index", "idx_task_result_events_task_sequence"),
+                ("trigger", "task_result_events_owner_matches_task"),
+                ("trigger", "task_result_events_no_update"),
+                ("trigger", "task_result_events_no_delete"),
+                ("trigger", "task_result_events_sequence_counter_guard"),
+                ("trigger", "task_result_events_sequence_cross_type_guard"),
+            )
         return ()
 
     def _assert_migration_objects(
@@ -955,7 +996,6 @@ class Store:
                     "remote_worker_nonces": ("PRIMARY KEY (WORKER_ID, NONCE)",),
                     "task_messages": (
                         "CHECK (ROLE = 'USER')",
-                        "CHECK (MESSAGE_KIND IN ('INITIAL', 'FOLLOW_UP'))",
                         "CHECK (STATUS IN ('PENDING', 'CONSUMED'))",
                         "UNIQUE (TASK_ID, SEQUENCE)",
                         "FOREIGN KEY (TASK_ID) REFERENCES TASK_STATES(TASK_ID)",
@@ -994,6 +1034,21 @@ class Store:
                     required_fragments += (
                         "CHECK (PLANNING_MODE IN ('UNKNOWN', 'PROVIDER_VALIDATED', 'DETERMINISTIC_FALLBACK', 'DETERMINISTIC_ROUTE', 'DETERMINISTIC_REPLAN'))",
                         "CHECK (PLAN_VERSION >= 0)",
+                    )
+                if version >= 19 and name == "task_queue":
+                    required_fragments += ("'WAITING_CLARIFICATION'",)
+                if version >= 21 and name == "task_result_events":
+                    required_fragments += ("'WAITING_CLARIFICATION'",)
+                compact_table_sql = "".join(table_sql.split())
+                if name == "task_messages" and not any(
+                    fragment in compact_table_sql
+                    for fragment in (
+                        "CHECK(MESSAGE_KINDIN('INITIAL','FOLLOW_UP'))",
+                        "CHECK(MESSAGE_KINDIN('INITIAL','FOLLOW_UP','CLARIFICATION_ANSWER'))",
+                    )
+                ):
+                    raise UnsupportedSchemaVersion(
+                        f"inconsistent_schema_version:{version}:missing_constraint:{name}"
                     )
                 for fragment in required_fragments:
                     if fragment not in table_sql:
@@ -1290,7 +1345,7 @@ class Store:
                 # 13 has already been validated, and strict combined validation
                 # runs immediately after the additive migration.
                 reconcile_schema13 = version == 14 and 13 in versions
-                if existing_objects is not None and version not in {10, 11, 18} and not reconcile_schema13:
+                if existing_objects is not None and version not in {10, 11, 18, 19, 21} and not reconcile_schema13:
                     self._assert_migration_objects(version)
                 self._apply_migration(version)
                 self._assert_migration_objects(version)
@@ -1993,6 +2048,235 @@ class Store:
                 )
             self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (18, now()))
             return
+        if version == 19:
+            columns = {
+                str(item["name"])
+                for item in self.db.execute("PRAGMA table_info(task_messages)").fetchall()
+            }
+            if "clarification_id" not in columns:
+                self.db.execute(
+                    "ALTER TABLE task_messages ADD COLUMN clarification_id TEXT NOT NULL DEFAULT '' "
+                    "CHECK (length(clarification_id) <= 64)"
+                )
+            self.db.execute("ALTER TABLE task_queue RENAME TO task_queue_v18")
+            self.db.execute("""CREATE TABLE task_queue (
+              task_id TEXT PRIMARY KEY,
+              queue_status TEXT NOT NULL CHECK (queue_status IN (
+                'QUEUED', 'LEASED', 'WAITING_APPROVAL', 'WAITING_CLARIFICATION', 'RETRY_WAIT',
+                'EXECUTION_UNKNOWN', 'COMPLETED', 'FAILED', 'BLOCKED'
+              )),
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+              max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts >= 1),
+              available_at TEXT NOT NULL,
+              lease_id TEXT NOT NULL DEFAULT '',
+              worker_id TEXT NOT NULL DEFAULT '',
+              lease_acquired_at TEXT NOT NULL DEFAULT '',
+              lease_expires_at TEXT NOT NULL DEFAULT '',
+              last_started_at TEXT NOT NULL DEFAULT '',
+              last_finished_at TEXT NOT NULL DEFAULT '',
+              last_error_code TEXT NOT NULL DEFAULT '',
+              last_error_message TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+            self.db.execute(
+                "INSERT INTO task_queue SELECT task_id, queue_status, attempt_count, max_attempts, available_at, "
+                "lease_id, worker_id, lease_acquired_at, lease_expires_at, last_started_at, last_finished_at, "
+                "last_error_code, last_error_message, created_at, updated_at FROM task_queue_v18"
+            )
+            self.db.execute("DROP TABLE task_queue_v18")
+            self.db.execute(
+                "CREATE INDEX idx_task_queue_claim ON task_queue(queue_status, available_at, created_at, task_id)"
+            )
+            self.db.execute("CREATE INDEX idx_task_queue_lease ON task_queue(queue_status, lease_expires_at)")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (19, now()))
+            return
+        if version == 20:
+            # Rebuild the immutable conversation message table so clarification
+            # answers are a first-class message kind without weakening existing
+            # sequence, ownership, idempotency, or foreign-key constraints.
+            for trigger_name in (
+                "task_messages_sequence_counter_guard",
+                "task_messages_sequence_cross_type_guard",
+                "task_messages_sequence_immutable",
+                "task_result_events_sequence_cross_type_guard",
+            ):
+                self.db.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            self.db.execute("ALTER TABLE task_messages RENAME TO task_messages_v19")
+            self.db.execute("""CREATE TABLE task_messages (
+              message_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL CHECK (sequence >= 1),
+              role TEXT NOT NULL CHECK (role = 'USER'),
+              message_kind TEXT NOT NULL CHECK (
+                message_kind IN ('INITIAL', 'FOLLOW_UP', 'CLARIFICATION_ANSWER')
+              ),
+              content TEXT NOT NULL CHECK (length(trim(content)) > 0),
+              status TEXT NOT NULL CHECK (status IN ('PENDING', 'CONSUMED')),
+              idempotency_key TEXT,
+              request_fingerprint TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              consumed_at TEXT NOT NULL DEFAULT '',
+              consumed_checkpoint TEXT NOT NULL DEFAULT '',
+              clarification_id TEXT NOT NULL DEFAULT '' CHECK (length(clarification_id) <= 64),
+              UNIQUE (task_id, sequence),
+              UNIQUE (task_id, idempotency_key),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id)
+            )""")
+            old_columns = {
+                str(item["name"])
+                for item in self.db.execute("PRAGMA table_info(task_messages_v19)").fetchall()
+            }
+            clarification_expr = "clarification_id" if "clarification_id" in old_columns else "''"
+            self.db.execute(
+                "INSERT INTO task_messages (message_id, task_id, sequence, role, message_kind, content, "
+                "status, idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint, "
+                "clarification_id) SELECT message_id, task_id, sequence, role, message_kind, content, status, "
+                f"idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint, {clarification_expr} "
+                "FROM task_messages_v19"
+            )
+            self.db.execute("DROP TABLE task_messages_v19")
+            self.db.execute(
+                "CREATE INDEX idx_task_messages_task_sequence ON task_messages(task_id, sequence)"
+            )
+            self.db.execute(
+                "CREATE INDEX idx_task_messages_pending ON task_messages(task_id, status, sequence)"
+            )
+            self.db.execute("""CREATE TRIGGER task_messages_sequence_counter_guard
+              BEFORE INSERT ON task_messages
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_conversation_sequences
+                WHERE task_id = NEW.task_id AND last_sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_messages_sequence_not_allocated');
+              END""")
+            self.db.execute("""CREATE TRIGGER task_messages_sequence_cross_type_guard
+              BEFORE INSERT ON task_messages
+              WHEN EXISTS (
+                SELECT 1 FROM task_result_events
+                WHERE task_id = NEW.task_id AND sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_duplicate');
+              END""")
+            self.db.execute("""CREATE TRIGGER task_messages_sequence_immutable
+              BEFORE UPDATE OF sequence ON task_messages BEGIN
+                SELECT RAISE(ABORT, 'task_messages_sequence_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER task_result_events_sequence_cross_type_guard
+              BEFORE INSERT ON task_result_events
+              WHEN EXISTS (
+                SELECT 1 FROM task_messages
+                WHERE task_id = NEW.task_id AND sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_duplicate');
+              END""")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (20, now()))
+            return
+        if version == 21:
+            # Rebuild the immutable result-event table to admit clarification waits.
+            # Defer FKs only for this transaction so assistant replies and claims
+            # continue referencing the same event IDs across the table replacement.
+            self.db.execute("PRAGMA defer_foreign_keys = ON")
+            self.db.execute(
+                "CREATE TEMP TABLE task_result_events_v20 AS SELECT * FROM task_result_events"
+            )
+            for trigger_name in (
+                "task_result_events_owner_matches_task",
+                "task_result_events_no_update",
+                "task_result_events_no_delete",
+                "task_result_events_sequence_counter_guard",
+                "task_result_events_sequence_cross_type_guard",
+            ):
+                self.db.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            self.db.execute("DROP TABLE task_result_events")
+            self.db.execute("""CREATE TABLE task_result_events (
+              event_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              owner_user_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL CHECK (sequence >= 1),
+              role TEXT NOT NULL CHECK (role = 'SYSTEM'),
+              message_kind TEXT NOT NULL CHECK (message_kind = 'RESULT'),
+              task_status TEXT NOT NULL CHECK (task_status IN (
+                'CREATED', 'QUEUED', 'PLANNING', 'READY', 'EXECUTING', 'EXECUTION_UNKNOWN',
+                'OBSERVING', 'VERIFYING', 'WAITING_APPROVAL', 'WAITING_CLARIFICATION',
+                'BLOCKED', 'FAILED', 'COMPLETED'
+              )),
+              verification_status TEXT NOT NULL CHECK (verification_status IN (
+                'VERIFIED', 'UNVERIFIED', 'EXECUTION_UNKNOWN', 'FAILED',
+                'WAITING_APPROVAL', 'BLOCKED', 'IN_PROGRESS'
+              )),
+              result_available INTEGER NOT NULL CHECK (result_available IN (0, 1)),
+              verified_action_count INTEGER NOT NULL CHECK (verified_action_count >= 0),
+              failed_action_count INTEGER NOT NULL CHECK (failed_action_count >= 0),
+              blocked_action_count INTEGER NOT NULL CHECK (blocked_action_count >= 0),
+              pending_action_count INTEGER NOT NULL CHECK (pending_action_count >= 0),
+              approval_pending_count INTEGER NOT NULL CHECK (approval_pending_count >= 0),
+              approval_approved_count INTEGER NOT NULL CHECK (approval_approved_count >= 0),
+              approval_denied_count INTEGER NOT NULL CHECK (approval_denied_count >= 0),
+              approval_expired_count INTEGER NOT NULL CHECK (approval_expired_count >= 0),
+              approval_cancelled_count INTEGER NOT NULL CHECK (approval_cancelled_count >= 0),
+              result_digest TEXT NOT NULL,
+              transition_fingerprint TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              planning_mode TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (planning_mode IN ('UNKNOWN', 'PROVIDER_VALIDATED', 'DETERMINISTIC_FALLBACK', 'DETERMINISTIC_ROUTE', 'DETERMINISTIC_REPLAN')),
+              plan_version INTEGER NOT NULL DEFAULT 0 CHECK (plan_version >= 0),
+              UNIQUE (task_id, sequence),
+              UNIQUE (task_id, transition_fingerprint),
+              FOREIGN KEY (task_id) REFERENCES task_states(task_id),
+              FOREIGN KEY (owner_user_id) REFERENCES auth_users(user_id)
+            )""")
+            self.db.execute("""INSERT INTO task_result_events (
+              event_id, task_id, owner_user_id, sequence, role, message_kind, task_status,
+              verification_status, result_available, verified_action_count, failed_action_count,
+              blocked_action_count, pending_action_count, approval_pending_count, approval_approved_count,
+              approval_denied_count, approval_expired_count, approval_cancelled_count, result_digest,
+              transition_fingerprint, created_at, planning_mode, plan_version
+            ) SELECT event_id, task_id, owner_user_id, sequence, role, message_kind, task_status,
+              verification_status, result_available, verified_action_count, failed_action_count,
+              blocked_action_count, pending_action_count, approval_pending_count, approval_approved_count,
+              approval_denied_count, approval_expired_count, approval_cancelled_count, result_digest,
+              transition_fingerprint, created_at, planning_mode, plan_version
+              FROM task_result_events_v20""")
+            self.db.execute("DROP TABLE task_result_events_v20")
+            self.db.execute(
+                "CREATE INDEX idx_task_result_events_task_sequence ON task_result_events(task_id, sequence)"
+            )
+            self.db.execute("""CREATE TRIGGER task_result_events_owner_matches_task
+              BEFORE INSERT ON task_result_events
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_owners WHERE task_id = NEW.task_id AND user_id = NEW.owner_user_id
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_owner_mismatch');
+              END""")
+            self.db.execute("""CREATE TRIGGER task_result_events_no_update
+              BEFORE UPDATE ON task_result_events BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER task_result_events_no_delete
+              BEFORE DELETE ON task_result_events BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_immutable');
+              END""")
+            self.db.execute("""CREATE TRIGGER task_result_events_sequence_counter_guard
+              BEFORE INSERT ON task_result_events
+              WHEN NOT EXISTS (
+                SELECT 1 FROM task_conversation_sequences
+                WHERE task_id = NEW.task_id AND last_sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_result_events_sequence_not_allocated');
+              END""")
+            self.db.execute("""CREATE TRIGGER task_result_events_sequence_cross_type_guard
+              BEFORE INSERT ON task_result_events
+              WHEN EXISTS (
+                SELECT 1 FROM task_messages
+                WHERE task_id = NEW.task_id AND sequence = NEW.sequence
+              ) BEGIN
+                SELECT RAISE(ABORT, 'task_conversation_sequence_duplicate');
+              END""")
+            if self.db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise UnsupportedSchemaVersion("inconsistent_schema_version:21:foreign_key_check")
+            self.db.execute("INSERT OR IGNORE INTO task_state_schema(schema_version, applied_at) VALUES (?, ?)", (21, now()))
+            return
         raise UnsupportedSchemaVersion(f"unknown_migration:{version}")
 
     def latest_owner_policy_version(self) -> int:
@@ -2297,6 +2581,8 @@ class Store:
             verification_status = "WAITING_APPROVAL"
         elif status == "BLOCKED":
             verification_status = "BLOCKED"
+        elif status == "WAITING_CLARIFICATION":
+            verification_status = "IN_PROGRESS"
         else:
             verification_status = "IN_PROGRESS"
         action_records = payload.get("action_records")
@@ -2417,18 +2703,31 @@ class Store:
         payload = state.to_dict() if hasattr(state, "to_dict") else dict(state)
         with self._lease_write(str(payload["task_id"])):
             message_ids = tuple(dict.fromkeys(str(item) for item in consume_message_ids))
-            if message_ids or checkpoint_type == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED":
-                task_id = str(payload["task_id"])
-                self._assert_verified_conversation_checkpoint_in_transaction(task_id, checkpoint_type=checkpoint_type)
             if message_ids:
                 task_id = str(payload["task_id"])
                 placeholders = ",".join("?" for _ in message_ids)
                 rows = self.db.execute(
-                    f"SELECT message_id FROM task_messages WHERE task_id = ? AND status = 'PENDING' AND message_id IN ({placeholders})",
+                    f"SELECT message_id, message_kind FROM task_messages WHERE task_id = ? AND status = 'PENDING' AND message_id IN ({placeholders})",
                     (task_id, *message_ids),
                 ).fetchall()
                 if len(rows) != len(message_ids):
                     raise ValueError("conversation_message_not_pending")
+                kinds = {str(row["message_kind"]) for row in rows}
+                if kinds == {"CLARIFICATION_ANSWER"}:
+                    self._assert_clarification_answer_checkpoint_in_transaction(
+                        task_id,
+                        message_ids,
+                        checkpoint_type=checkpoint_type,
+                        payload=payload,
+                    )
+                elif "CLARIFICATION_ANSWER" in kinds:
+                    raise ValueError("conversation_message_kind_mixed")
+                else:
+                    self._assert_verified_conversation_checkpoint_in_transaction(task_id, checkpoint_type=checkpoint_type)
+            elif checkpoint_type == "BUG_BOUNTY_FOLLOWUP_ACKNOWLEDGED":
+                self._assert_verified_conversation_checkpoint_in_transaction(
+                    str(payload["task_id"]), checkpoint_type=checkpoint_type
+                )
             self._persist_task_state_in_transaction(payload, checkpoint_type, task_status=task_status)
             if message_ids:
                 stamp = now()
@@ -2440,6 +2739,47 @@ class Store:
                 )
                 if cursor.rowcount != len(message_ids):
                     raise ValueError("conversation_message_not_pending")
+
+    def _assert_clarification_answer_checkpoint_in_transaction(
+        self,
+        task_id: str,
+        message_ids: tuple[str, ...],
+        *,
+        checkpoint_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Consume answers only when the same task durably accepted a plan or asked the next question."""
+        from private_agent.core.task_state import StateIntegrityError, TaskState
+
+        if checkpoint_type not in {"PLAN_CREATED", "CLARIFICATION_REQUIRED"}:
+            raise ValueError("clarification_answer_checkpoint_invalid")
+        try:
+            state = TaskState.from_dict(payload)
+        except (StateIntegrityError, TypeError, ValueError, KeyError) as exc:
+            raise ValueError("clarification_checkpoint_state_untrusted") from exc
+        if state.task_id != task_id:
+            raise ValueError("clarification_checkpoint_task_mismatch")
+        if checkpoint_type == "PLAN_CREATED":
+            if state.status != "READY" or not state.plan or state.plan_version < 1:
+                raise ValueError("clarification_plan_checkpoint_required")
+        elif state.status != "WAITING_CLARIFICATION":
+            raise ValueError("clarification_next_question_checkpoint_required")
+        records = {
+            (str(item.get("request_id")), str(item.get("answer_message_id")))
+            for item in state.context.get("clarifications", [])
+            if isinstance(item, dict) and item.get("status") == "ANSWERED"
+        }
+        rows = self.db.execute(
+            f"SELECT message_id, clarification_id FROM task_messages "
+            f"WHERE task_id = ? AND status = 'PENDING' AND message_kind = 'CLARIFICATION_ANSWER' "
+            f"AND message_id IN ({','.join('?' for _ in message_ids)})",
+            (task_id, *message_ids),
+        ).fetchall()
+        if len(rows) != len(message_ids) or any(
+            (str(row["clarification_id"] or ""), str(row["message_id"])) not in records
+            for row in rows
+        ):
+            raise ValueError("clarification_answer_binding_mismatch")
 
     def _assert_verified_conversation_checkpoint_in_transaction(
         self, task_id: str, *, checkpoint_type: str | None = None
@@ -2644,7 +2984,7 @@ class Store:
         with self._db_lock:
             if owner_user_id is None:
                 rows = self.db.execute(
-                    "SELECT message_id, task_id, sequence, role, message_kind, content, status, "
+                    "SELECT message_id, task_id, sequence, role, message_kind, content, status, clarification_id, "
                     "created_at, consumed_at, consumed_checkpoint FROM task_messages "
                     "WHERE task_id = ? ORDER BY sequence",
                     (str(task_id),),
@@ -2652,7 +2992,7 @@ class Store:
             else:
                 rows = self.db.execute(
                     "SELECT m.message_id, m.task_id, m.sequence, m.role, m.message_kind, m.content, "
-                    "m.status, m.created_at, m.consumed_at, m.consumed_checkpoint "
+                    "m.status, m.clarification_id, m.created_at, m.consumed_at, m.consumed_checkpoint "
                     "FROM task_messages AS m JOIN task_owners AS o ON o.task_id = m.task_id "
                     "WHERE m.task_id = ? AND o.user_id = ? ORDER BY m.sequence",
                     (str(task_id), str(owner_user_id)),
@@ -2718,7 +3058,7 @@ class Store:
         query = (
             "SELECT * FROM ("
             "SELECT 'USER_MESSAGE' AS item_type, m.message_id AS item_id, m.sequence, m.task_id, "
-            "m.role, m.message_kind, m.content, m.status, m.created_at, m.consumed_at, "
+            "m.role, m.message_kind, m.content, m.status, m.clarification_id, m.created_at, m.consumed_at, "
             "m.consumed_checkpoint, NULL AS task_status, NULL AS verification_status, "
             "NULL AS result_available, NULL AS verified_action_count, NULL AS failed_action_count, "
             "NULL AS blocked_action_count, NULL AS pending_action_count, NULL AS approval_pending_count, "
@@ -2727,7 +3067,7 @@ class Store:
             "NULL AS planning_mode, NULL AS plan_version "
             "FROM task_messages AS m WHERE m.task_id = ?" + message_owner + " UNION ALL "
             "SELECT 'SYSTEM_RESULT' AS item_type, e.event_id AS item_id, e.sequence, e.task_id, "
-            "e.role, e.message_kind, NULL AS content, NULL AS status, e.created_at, NULL AS consumed_at, "
+            "e.role, e.message_kind, NULL AS content, NULL AS status, NULL AS clarification_id, e.created_at, NULL AS consumed_at, "
             "NULL AS consumed_checkpoint, e.task_status, e.verification_status, e.result_available, "
             "e.verified_action_count, e.failed_action_count, e.blocked_action_count, e.pending_action_count, "
             "e.approval_pending_count, e.approval_approved_count, e.approval_denied_count, "
@@ -2754,6 +3094,7 @@ class Store:
                     "message_id": str(row["item_id"]), "task_id": task_id, "sequence": sequence,
                     "role": str(row["role"]), "message_kind": str(row["message_kind"]),
                     "content": str(row["content"]), "status": str(row["status"]),
+                    "clarification_id": str(row["clarification_id"] or ""),
                     "created_at": str(row["created_at"]), "consumed_at": str(row["consumed_at"]),
                     "consumed_checkpoint": str(row["consumed_checkpoint"]),
                 }
@@ -2999,6 +3340,8 @@ class Store:
                 raise ValueError("conversation_execution_unknown")
             if state.status in TERMINAL_STATUSES or queue_status in {"COMPLETED", "FAILED", "BLOCKED"}:
                 raise ValueError("conversation_terminal")
+            if state.status == "WAITING_CLARIFICATION":
+                raise ValueError("clarification_id_required")
             eligible = (
                 state.status == "QUEUED" and queue_status == "QUEUED"
             ) or (
@@ -3045,6 +3388,176 @@ class Store:
         finally:
             self._db_lock.release()
 
+    def answer_task_clarification(
+        self,
+        task_id: str,
+        clarification_id: str,
+        content: str,
+        *,
+        owner_user_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically bind one user answer to the current task question and requeue only that task."""
+        from private_agent.core.task_state import StateIntegrityError, TaskState
+
+        task_id = str(task_id)
+        if not isinstance(content, str):
+            raise ValueError("task_message_must_be_string")
+        content = content.strip()
+        if not content:
+            raise ValueError("task_message_required")
+        if len(content) > MAX_TASK_MESSAGE_LENGTH:
+            raise ValueError("task_message_too_long")
+        if not isinstance(clarification_id, str) or not clarification_id or len(clarification_id) > 64:
+            raise ValueError("clarification_id_invalid")
+        if owner_user_id is not None and (
+            not isinstance(owner_user_id, str) or not owner_user_id.strip() or len(owner_user_id) > 256
+        ):
+            raise ValueError("task_owner_invalid")
+        if idempotency_key is not None and not request_fingerprint:
+            raise ValueError("message_request_fingerprint_required")
+
+        self._db_lock.acquire()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            owner = self.db.execute("SELECT user_id FROM task_owners WHERE task_id = ?", (task_id,)).fetchone()
+            if owner_user_id is not None and (owner is None or str(owner["user_id"]) != owner_user_id):
+                raise KeyError("task_not_found")
+            task_row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (task_id,)).fetchone()
+            queue_row = self.db.execute("SELECT queue_status FROM task_queue WHERE task_id = ?", (task_id,)).fetchone()
+            if task_row is None or queue_row is None:
+                raise KeyError("task_not_found")
+            try:
+                state = TaskState.from_dict(json.loads(str(task_row["state_json"])))
+            except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("task_state_untrusted") from exc
+            if state.task_id != task_id:
+                raise ValueError("task_state_binding_mismatch")
+
+            if idempotency_key is not None:
+                existing = self.db.execute(
+                    "SELECT * FROM task_messages WHERE task_id = ? AND idempotency_key = ?",
+                    (task_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["request_fingerprint"]) != str(request_fingerprint)
+                        or str(existing["clarification_id"] or "") != clarification_id
+                    ):
+                        raise ValueError("message_idempotency_conflict")
+                    result = dict(existing)
+                    result["replayed"] = True
+                    self.db.commit()
+                    return result
+
+            if state.status != "WAITING_CLARIFICATION" or str(queue_row["queue_status"]) != "WAITING_CLARIFICATION":
+                raise ValueError("clarification_not_current")
+            clarifications = state.context.get("clarifications")
+            if not isinstance(clarifications, list):
+                raise ValueError("task_clarification_state_invalid")
+            current = [
+                item for item in clarifications
+                if isinstance(item, dict) and item.get("request_id") == clarification_id and item.get("status") == "PENDING"
+            ]
+            if len(current) != 1:
+                raise ValueError("clarification_not_current")
+            totals = self.db.execute(
+                "SELECT COUNT(*) AS message_count, COALESCE(SUM(length(content)), 0) AS total_chars "
+                "FROM task_messages WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if int(totals["message_count"] or 0) >= MAX_TASK_CONVERSATION_MESSAGES:
+                raise ValueError("conversation_message_limit")
+            if int(totals["total_chars"] or 0) + len(content) > MAX_TASK_CONVERSATION_CHARS:
+                raise ValueError("conversation_size_limit")
+
+            stamp = now()
+            message_id = str(uuid.uuid4())
+            sequence = self._allocate_task_conversation_sequence_in_transaction(task_id)
+            self.db.execute(
+                """INSERT INTO task_messages
+                (message_id, task_id, sequence, role, message_kind, content, status, clarification_id,
+                 idempotency_key, request_fingerprint, created_at, consumed_at, consumed_checkpoint)
+                VALUES (?, ?, ?, 'USER', 'CLARIFICATION_ANSWER', ?, 'PENDING', ?, ?, ?, ?, '', '')""",
+                (
+                    message_id, task_id, sequence, content, clarification_id,
+                    idempotency_key, str(request_fingerprint or ""), stamp,
+                ),
+            )
+            current[0]["status"] = "ANSWERED"
+            current[0]["answer_message_id"] = message_id
+            current[0]["answered_at"] = stamp
+            state.result = {}
+            state.recovery_state = {}
+            state.checkpoint(
+                "CLARIFICATION_ANSWER_RECEIVED",
+                status="QUEUED",
+                phase="QUEUED",
+                successful=False,
+            )
+            state.validate()
+            updated = self.db.execute(
+                """UPDATE task_queue
+                   SET queue_status = 'QUEUED', attempt_count = 0, available_at = ?,
+                       lease_id = '', worker_id = '', lease_acquired_at = '', lease_expires_at = '',
+                       last_error_code = '', last_error_message = '', updated_at = ?
+                 WHERE task_id = ? AND queue_status = 'WAITING_CLARIFICATION'""",
+                (stamp, stamp, task_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("clarification_queue_state_mismatch")
+            self._persist_task_state_in_transaction(
+                state.to_dict(),
+                "CLARIFICATION_ANSWER_RECEIVED",
+                task_status="QUEUED",
+                enforce_lease=False,
+            )
+            result = dict(self.db.execute("SELECT * FROM task_messages WHERE message_id = ?", (message_id,)).fetchone())
+            result["replayed"] = False
+            self.db.commit()
+            return result
+        except Exception:
+            self.db.rollback()
+            raise
+        finally:
+            self._db_lock.release()
+
+    def pending_clarification_answers_for_worker(self, task_id: str) -> list[dict[str, Any]]:
+        """Return only task-bound, still-pending answers that match saved answered-question records."""
+        if not self.has_active_lease_context(task_id):
+            raise QueueLeaseLost("clarification_worker_lease_required")
+        from private_agent.core.task_state import StateIntegrityError, TaskState
+
+        with self._db_lock:
+            self._assert_active_lease(str(task_id))
+            row = self.db.execute("SELECT state_json FROM task_states WHERE task_id = ?", (str(task_id),)).fetchone()
+            if row is None:
+                raise ValueError("task_state_missing")
+            try:
+                state = TaskState.from_dict(json.loads(str(row["state_json"])))
+            except (StateIntegrityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("task_state_untrusted") from exc
+            rows = self.db.execute(
+                """SELECT message_id, task_id, clarification_id, content, created_at
+                   FROM task_messages
+                   WHERE task_id = ? AND message_kind = 'CLARIFICATION_ANSWER' AND status = 'PENDING'
+                   ORDER BY sequence""",
+                (str(task_id),),
+            ).fetchall()
+            saved = {
+                (str(item.get("request_id")), str(item.get("answer_message_id")))
+                for item in state.context.get("clarifications", [])
+                if isinstance(item, dict) and item.get("status") == "ANSWERED"
+            }
+            result: list[dict[str, Any]] = []
+            for item in rows:
+                bound = (str(item["clarification_id"] or ""), str(item["message_id"]))
+                if bound not in saved:
+                    raise ValueError("clarification_answer_binding_mismatch")
+                result.append(dict(item))
+        return result
+
     def pending_task_messages_for_worker(self, task_id: str) -> list[dict[str, Any]]:
         """Read pending follow-ups only under the active worker lease at a verified checkpoint."""
         if not self.has_active_lease_context(task_id):
@@ -3066,6 +3579,7 @@ class Store:
             "FAILED": "FAILED",
             "BLOCKED": "BLOCKED",
             "WAITING_APPROVAL": "WAITING_APPROVAL",
+            "WAITING_CLARIFICATION": "WAITING_CLARIFICATION",
             "EXECUTION_UNKNOWN": "EXECUTION_UNKNOWN",
         }.get(status, "FAILED")
 
@@ -3100,6 +3614,9 @@ class Store:
                 # before the worker manages to release its lease.
                 queue_status = "WAITING_APPROVAL"
                 error_code = "lease_expired_waiting_approval"
+            elif state.status == "WAITING_CLARIFICATION":
+                queue_status = "WAITING_CLARIFICATION"
+                error_code = "lease_expired_waiting_clarification"
             else:
                 state.recovery_state = {
                     **state.recovery_state,
@@ -3321,7 +3838,7 @@ class Store:
         state_status: str | None = None,
     ) -> dict[str, Any]:
         """Fence and close a claim, optionally persisting a worker failure state."""
-        allowed = {"WAITING_APPROVAL", "EXECUTION_UNKNOWN", "COMPLETED", "FAILED", "BLOCKED"}
+        allowed = {"WAITING_APPROVAL", "WAITING_CLARIFICATION", "EXECUTION_UNKNOWN", "COMPLETED", "FAILED", "BLOCKED"}
         if queue_status not in allowed:
             raise ValueError(f"invalid_queue_finish_status:{queue_status}")
         task_id = str(claim["task_id"])
