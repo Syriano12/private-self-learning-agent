@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, Depends, FastAPI, Header, HTTPException, Path as APIPath, Query, Request, status
@@ -47,6 +47,7 @@ from private_agent.core.task_state import (
     TaskState,
     TaskStopReason,
     TaskStopReasonCode,
+    action_fingerprint,
 )
 from private_agent.auth import (
     ACTIVE,
@@ -747,6 +748,7 @@ class TaskStateResponse(APIModel):
     verification_status: str
     checkpoint: CheckpointResponse
     approvals: list[ApprovalResponse]
+    specialist_assignment_snapshot: "SpecialistAssignmentSnapshotResponse"
     created_at: str
     updated_at: str
     queue_status: str = ""
@@ -754,6 +756,25 @@ class TaskStateResponse(APIModel):
     api_version: str = API_VERSION
     schema_version: int = API_SCHEMA_VERSION
     request_id: str = ""
+
+
+class SpecialistAssignmentResponse(APIModel):
+    step_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,128}$")
+    specialist_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    profile_version: int = Field(ge=1)
+    tool_name: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")
+    capabilities: list[Literal["READ_WORKSPACE"]]
+    status: Literal["ASSIGNED", "EXECUTING", "OBSERVING", "VERIFIED", "FAILED", "BLOCKED", "EXECUTION_UNKNOWN", "UNKNOWN"]
+    reason: TaskStopReasonCode | None = None
+
+
+class SpecialistAssignmentSnapshotResponse(APIModel):
+    task_id: str
+    plan_version: int = Field(ge=0)
+    status: Literal["AVAILABLE", "NONE", "UNAVAILABLE"]
+    provenance: Literal["SERVER_CURRENT_PLAN"] = "SERVER_CURRENT_PLAN"
+    reason: Literal["assignment_not_verifiable"] | None = None
+    assignments: list[SpecialistAssignmentResponse] = Field(default_factory=list)
 
 
 class EventResponse(APIModel):
@@ -1798,6 +1819,114 @@ class AgentAPIService:
             idempotent_replay=replay,
         )
 
+    def _specialist_assignment_snapshot(self, state: TaskState) -> SpecialistAssignmentSnapshotResponse:
+        plan_version = state.plan_version if state.plan else 0
+        base = {"task_id": state.task_id, "plan_version": plan_version}
+        if not state.plan:
+            return SpecialistAssignmentSnapshotResponse(**base, status="NONE")
+
+        steps = state.plan.get("steps", [])
+        if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+            return SpecialistAssignmentSnapshotResponse(
+                **base, status="UNAVAILABLE", reason="assignment_not_verifiable"
+            )
+        if not steps:
+            return SpecialistAssignmentSnapshotResponse(**base, status="NONE")
+
+        candidates = [step for step in steps if "specialist_assignment" in step]
+        if not candidates:
+            return SpecialistAssignmentSnapshotResponse(**base, status="NONE")
+
+        registry = getattr(self.orchestrator, "specialist_registry", None)
+        if registry is None:
+            return SpecialistAssignmentSnapshotResponse(
+                **base, status="UNAVAILABLE", reason="assignment_not_verifiable"
+            )
+
+        assignments: list[SpecialistAssignmentResponse] = []
+        public_capabilities = {"READ_WORKSPACE"}
+        public_action_statuses = {
+            "ASSIGNED", "EXECUTING", "OBSERVING", "VERIFIED", "FAILED",
+            "BLOCKED", "EXECUTION_UNKNOWN",
+        }
+        for step in candidates:
+            raw_assignment = step.get("specialist_assignment")
+            step_id = step.get("id")
+            tool_name = step.get("tool")
+            objective = step.get("objective")
+            inputs = step.get("input")
+            bindings = step.get("input_bindings", {})
+            if (
+                not isinstance(raw_assignment, dict)
+                or not isinstance(step_id, str)
+                or not isinstance(tool_name, str)
+                or not isinstance(objective, str)
+                or not isinstance(inputs, dict)
+                or not isinstance(bindings, dict)
+            ):
+                return SpecialistAssignmentSnapshotResponse(
+                    **base, status="UNAVAILABLE", reason="assignment_not_verifiable"
+                )
+            try:
+                tool = self.orchestrator.tools.get(tool_name)
+                trusted = registry.validate_assignment(
+                    raw_assignment,
+                    tool=tool,
+                    objective=objective,
+                    inputs=inputs,
+                    input_bindings=bindings,
+                )
+            except Exception:
+                trusted = False
+            capabilities = raw_assignment.get("effective_capabilities")
+            if (
+                not trusted
+                or not isinstance(capabilities, list)
+                or not capabilities
+                or not set(capabilities).issubset(public_capabilities)
+            ):
+                return SpecialistAssignmentSnapshotResponse(
+                    **base, status="UNAVAILABLE", reason="assignment_not_verifiable"
+                )
+
+            action_id = action_fingerprint(
+                plan_version=state.plan_version,
+                step_id=step_id,
+                tool=tool_name,
+                inputs=inputs,
+                specialist_assignment=raw_assignment,
+            )
+            record = state.action_records.get(action_id, {})
+            raw_status = record.get("status") if isinstance(record, dict) else None
+            if raw_status is None or raw_status == "NOT_STARTED":
+                assignment_status = "ASSIGNED"
+            elif raw_status in public_action_statuses:
+                assignment_status = raw_status
+            else:
+                assignment_status = "UNKNOWN"
+            reason = None
+            if (
+                state.stop_reason is not None
+                and state.stop_reason.step_id == step_id
+                and (state.stop_reason.action_id is None or state.stop_reason.action_id == action_id)
+            ):
+                reason = state.stop_reason.code
+            assignments.append(
+                SpecialistAssignmentResponse(
+                    step_id=step_id,
+                    specialist_id=raw_assignment["specialist_id"],
+                    profile_version=raw_assignment["profile_version"],
+                    tool_name=tool_name,
+                    capabilities=capabilities,
+                    status=assignment_status,
+                    reason=reason,
+                )
+            )
+
+        return SpecialistAssignmentSnapshotResponse(
+            **base, status="AVAILABLE", assignments=assignments
+        )
+
     def task_state_response(self, state: TaskState, *, request_id: str = "") -> TaskStateResponse:
         checkpoint = self.store.latest_task_checkpoint(state.task_id) or {}
         queue = self.store.task_queue_record(state.task_id) or {}
@@ -1844,6 +1973,7 @@ class AgentAPIService:
                 sequence=int(checkpoint.get("sequence", 0)),
             ),
             approvals=approvals,
+            specialist_assignment_snapshot=self._specialist_assignment_snapshot(state),
             created_at=state.created_at,
             updated_at=state.updated_at,
             queue_status=str(queue.get("queue_status", "")),
